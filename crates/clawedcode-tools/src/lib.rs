@@ -515,16 +515,46 @@ pub fn builtin_tools() -> Vec<ToolSpec> {
             name: "shell",
             description: "Run local commands inside the working directory",
             needs_approval: true,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The shell command to execute"
+                    }
+                },
+                "required": ["command"]
+            }),
         },
         ToolSpec {
             name: "read_file",
             description: "Read the contents of a file under the working directory",
             needs_approval: false,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path to the file to read"
+                    }
+                },
+                "required": ["path"]
+            }),
         },
         ToolSpec {
             name: "apply_patch",
             description: "Apply structured file edits",
             needs_approval: true,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "patch": {
+                        "type": "string",
+                        "description": "The patch content in structured format"
+                    }
+                },
+                "required": ["patch"]
+            }),
         },
     ]
 }
@@ -534,6 +564,7 @@ pub struct ToolSpec {
     pub name: &'static str,
     pub description: &'static str,
     pub needs_approval: bool,
+    pub input_schema: serde_json::Value,
 }
 
 #[cfg(test)]

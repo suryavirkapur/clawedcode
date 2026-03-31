@@ -57,6 +57,19 @@ pub struct ToolUseRecord {
     pub is_error: bool,
 }
 
+#[derive(Debug, Clone)]
+struct TurnResult {
+    text: String,
+    thinking: String,
+    has_tool_use: bool,
+    tools_executed: usize,
+    tool_use_records: Vec<ToolUseRecord>,
+}
+
+/// Approval callback used in headless mode.
+/// Returns `true` if the tool call is approved, `false` to deny.
+pub type ApprovalFn = Box<dyn Fn(&str, &str, &serde_json::Value) -> bool + Send + Sync>;
+
 impl Runtime {
     pub fn new(
         config: AppConfig,
@@ -122,52 +135,73 @@ impl Runtime {
             system_prompt_name: self.system_prompt.name.to_string(),
             system_prompt_body: self.system_prompt.body.to_string(),
             prompt: session.last_user_text().unwrap_or_default().to_string(),
+            messages: session
+                .messages
+                .iter()
+                .map(|m| clawedcode_api::ProviderMessage {
+                    role: match m.role {
+                        Role::User => clawedcode_api::ProviderRole::User,
+                        Role::Assistant => clawedcode_api::ProviderRole::Assistant,
+                        Role::System => clawedcode_api::ProviderRole::User,
+                        Role::Tool => clawedcode_api::ProviderRole::Assistant,
+                    },
+                    content: m
+                        .content_blocks
+                        .iter()
+                        .map(|b| match b {
+                            crate::content::ContentBlock::Text { text } => {
+                                clawedcode_api::ProviderContentBlock::Text { text: text.clone() }
+                            }
+                            crate::content::ContentBlock::ToolUse { id, name, input } => {
+                                clawedcode_api::ProviderContentBlock::ToolUse {
+                                    id: id.clone(),
+                                    name: name.clone(),
+                                    input: input.clone(),
+                                }
+                            }
+                            crate::content::ContentBlock::ToolResult {
+                                tool_use_id,
+                                content,
+                                is_error,
+                            } => clawedcode_api::ProviderContentBlock::ToolResult {
+                                tool_use_id: tool_use_id.clone(),
+                                content: content.clone(),
+                                is_error: *is_error,
+                            },
+                            crate::content::ContentBlock::Thinking { thinking } => {
+                                clawedcode_api::ProviderContentBlock::Thinking {
+                                    thinking: thinking.clone(),
+                                }
+                            }
+                        })
+                        .collect(),
+                })
+                .collect(),
             tools: self.tools.clone(),
             skill_count: self.compatibility.skills.len(),
             mcp_servers: self.compatibility.mcp_servers.clone(),
         }
     }
 
-    /// Non-streaming submit: wraps the streaming path by collecting the stream.
-    pub fn submit(&self, session: &mut Session, prompt: &str) -> RuntimeOutput {
-        session.push(Role::User, prompt);
+    fn max_turns(&self) -> usize {
+        self.config.runtime.max_turns as usize
+    }
 
-        let request = self.build_request(session);
-
-        // `submit()` is sync but the provider stream is async and may require a Tokio runtime.
-        // In the CLI we are already inside a multi-thread runtime; in tests/TUI we may not be.
-        let rt_output = match tokio::runtime::Handle::try_current() {
+    fn run_in_runtime<F, T>(&self, f: F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        match tokio::runtime::Handle::try_current() {
             Ok(handle) => match handle.runtime_flavor() {
-                tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(|| {
-                    handle.block_on(async {
-                        let stream = self.provider.stream(&request);
-                        self.submit_stream_internal(session, stream, &mut |_| {})
-                            .await
-                    })
-                }),
-                tokio::runtime::RuntimeFlavor::CurrentThread => {
-                    // `block_in_place` isn't supported on the current-thread runtime.
-                    // Fall back to spinning up a dedicated runtime for the blocking call.
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("failed to build tokio runtime");
-                    rt.block_on(async {
-                        let stream = self.provider.stream(&request);
-                        self.submit_stream_internal(session, stream, &mut |_| {})
-                            .await
-                    })
+                tokio::runtime::RuntimeFlavor::MultiThread => {
+                    tokio::task::block_in_place(|| handle.block_on(f))
                 }
                 _ => {
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
                         .expect("failed to build tokio runtime");
-                    rt.block_on(async {
-                        let stream = self.provider.stream(&request);
-                        self.submit_stream_internal(session, stream, &mut |_| {})
-                            .await
-                    })
+                    rt.block_on(f)
                 }
             },
             Err(_) => {
@@ -175,13 +209,43 @@ impl Runtime {
                     .enable_all()
                     .build()
                     .expect("failed to build tokio runtime");
-                rt.block_on(async {
-                    let stream = self.provider.stream(&request);
-                    self.submit_stream_internal(session, stream, &mut |_| {})
-                        .await
-                })
+                rt.block_on(f)
             }
-        };
+        }
+    }
+
+    /// Non-streaming submit: wraps the streaming path by collecting the stream.
+    /// Loops across provider turns until no ToolUse or max_turns.
+    pub fn submit(&self, session: &mut Session, prompt: &str) -> RuntimeOutput {
+        session.push(Role::User, prompt);
+        let rt_output = self.run_in_runtime(async { self.submit_loop(session, &mut |_| {}).await });
+
+        RuntimeOutput {
+            session_id: rt_output.session_id,
+            system_prompt: rt_output.system_prompt,
+            response: rt_output.response.clone(),
+            tool_count: rt_output.tool_count,
+            skill_count: rt_output.skill_count,
+            mcp_server_count: rt_output.mcp_server_count,
+            tools_executed: rt_output.tools_executed,
+        }
+    }
+
+    /// Submit with an approval callback (for headless mode with --yes / stdin prompt).
+    pub fn submit_with_approval<A: ?Sized>(
+        &self,
+        session: &mut Session,
+        prompt: &str,
+        approval_fn: &A,
+    ) -> RuntimeOutput
+    where
+        A: Fn(&str, &str, &serde_json::Value) -> bool + Send + Sync,
+    {
+        session.push(Role::User, prompt);
+        let rt_output = self.run_in_runtime(async {
+            self.submit_loop_with_approval(session, &mut |_| {}, approval_fn)
+                .await
+        });
 
         RuntimeOutput {
             session_id: rt_output.session_id,
@@ -196,6 +260,7 @@ impl Runtime {
 
     /// Async streaming submit: consumes the provider stream, yields events to a callback,
     /// while persisting a structured transcript.
+    /// Loops across provider turns until no ToolUse or max_turns.
     pub async fn submit_stream<F>(
         &self,
         session: &mut Session,
@@ -206,21 +271,95 @@ impl Runtime {
         F: FnMut(&ApiEvent),
     {
         session.push(Role::User, prompt);
+        self.submit_loop(session, &mut on_event).await
+    }
 
-        let request = self.build_request(session);
-        let stream = self.provider.stream(&request);
-        self.submit_stream_internal(session, stream, &mut on_event)
+    /// Streaming submit with approval callback.
+    pub async fn submit_stream_with_approval<F, A>(
+        &self,
+        session: &mut Session,
+        prompt: &str,
+        mut on_event: F,
+        approval_fn: &A,
+    ) -> StreamingRuntimeOutput
+    where
+        F: FnMut(&ApiEvent),
+        A: Fn(&str, &str, &serde_json::Value) -> bool + Send + Sync,
+    {
+        session.push(Role::User, prompt);
+        self.submit_loop_with_approval(session, &mut on_event, approval_fn)
             .await
     }
 
-    async fn submit_stream_internal<F>(
+    /// Core tool-call loop: stream provider, execute tools, re-query until done.
+    async fn submit_loop<F>(
         &self,
         session: &mut Session,
-        stream: clawedcode_api::EventStream,
         on_event: &mut F,
     ) -> StreamingRuntimeOutput
     where
         F: FnMut(&ApiEvent),
+    {
+        self.submit_loop_with_approval(session, on_event, &|_, _, _| true)
+            .await
+    }
+
+    async fn submit_loop_with_approval<F, A: ?Sized>(
+        &self,
+        session: &mut Session,
+        on_event: &mut F,
+        approval_fn: &A,
+    ) -> StreamingRuntimeOutput
+    where
+        F: FnMut(&ApiEvent),
+        A: Fn(&str, &str, &serde_json::Value) -> bool + Send + Sync,
+    {
+        let mut total_text = String::new();
+        let mut total_thinking = String::new();
+        let mut all_tool_use_records: Vec<ToolUseRecord> = Vec::new();
+        let mut total_tools_executed = 0usize;
+
+        for _turn in 0..self.max_turns() {
+            let request = self.build_request(session);
+            let stream = self.provider.stream(&request);
+
+            let turn_result = self
+                .process_stream_turn(session, stream, on_event, approval_fn)
+                .await;
+
+            total_text.push_str(&turn_result.text);
+            total_thinking.push_str(&turn_result.thinking);
+            total_tools_executed += turn_result.tools_executed;
+            all_tool_use_records.extend(turn_result.tool_use_records);
+
+            if !turn_result.has_tool_use {
+                break;
+            }
+        }
+
+        StreamingRuntimeOutput {
+            session_id: session.id.to_string(),
+            system_prompt: self.system_prompt.name.to_string(),
+            response: total_text,
+            thinking: total_thinking,
+            tool_count: self.tools.len(),
+            skill_count: self.compatibility.skills.len(),
+            mcp_server_count: self.compatibility.mcp_servers.len(),
+            tools_executed: total_tools_executed,
+            tool_uses: all_tool_use_records,
+        }
+    }
+
+    async fn process_stream_turn<F, A: ?Sized>(
+        &self,
+        session: &mut Session,
+        stream: clawedcode_api::EventStream,
+        on_event: &mut F,
+        approval_fn: &A,
+    ) -> TurnResult
+    where
+        F: FnMut(&ApiEvent),
+        A: Fn(&str, &str, &serde_json::Value) -> bool + Send + Sync,
     {
         let mut text_accum = String::new();
         let mut thinking_accum = String::new();
@@ -271,7 +410,6 @@ impl Runtime {
             }
         }
 
-        // If no tool uses, break the loop
         if tool_uses.is_empty() {
             let mut blocks: Vec<ContentBlock> = Vec::new();
             if !thinking_accum.is_empty() {
@@ -287,20 +425,15 @@ impl Runtime {
                 session.push_blocks(Role::Assistant, blocks);
             }
 
-            return StreamingRuntimeOutput {
-                session_id: session.id.to_string(),
-                system_prompt: self.system_prompt.name.to_string(),
-                response: text_accum.clone(),
+            return TurnResult {
+                text: text_accum,
                 thinking: thinking_accum,
-                tool_count: self.tools.len(),
-                skill_count: self.compatibility.skills.len(),
-                mcp_server_count: self.compatibility.mcp_servers.len(),
+                has_tool_use: false,
                 tools_executed: 0,
-                tool_uses: tool_use_records,
+                tool_use_records,
             };
         }
 
-        // Persist assistant content for this turn, including tool_use blocks.
         let mut assistant_blocks: Vec<ContentBlock> = Vec::new();
         if !thinking_accum.is_empty() {
             assistant_blocks.push(ContentBlock::thinking(&thinking_accum));
@@ -324,11 +457,16 @@ impl Runtime {
         }
         session.push_blocks(Role::Assistant, assistant_blocks);
 
-        // Execute tool calls.
         let mut tools_executed = 0usize;
         let mut result_blocks: Vec<ContentBlock> = Vec::new();
         for (tool_use_id, tool_name, input) in &tool_uses {
-            let result = self.execute_tool(tool_use_id, tool_name, input.clone(), &session.cwd);
+            let result = self.execute_tool_with_approval(
+                tool_use_id,
+                tool_name,
+                input.clone(),
+                &session.cwd,
+                approval_fn,
+            );
             if let ContentBlock::ToolResult {
                 is_error, content, ..
             } = &result
@@ -342,19 +480,14 @@ impl Runtime {
             tools_executed += 1;
         }
 
-        // Append tool results as a Tool message
         session.push_blocks(Role::Tool, result_blocks);
 
-        StreamingRuntimeOutput {
-            session_id: session.id.to_string(),
-            system_prompt: self.system_prompt.name.to_string(),
-            response: text_accum,
+        TurnResult {
+            text: text_accum,
             thinking: thinking_accum,
-            tool_count: self.tools.len(),
-            skill_count: self.compatibility.skills.len(),
-            mcp_server_count: self.compatibility.mcp_servers.len(),
+            has_tool_use: true,
             tools_executed,
-            tool_uses: tool_use_records,
+            tool_use_records,
         }
     }
 
@@ -365,6 +498,20 @@ impl Runtime {
         input: serde_json::Value,
         cwd: &PathBuf,
     ) -> ContentBlock {
+        self.execute_tool_with_approval(tool_use_id, tool_name, input, cwd, &|_, _, _| true)
+    }
+
+    fn execute_tool_with_approval<A: ?Sized>(
+        &self,
+        tool_use_id: &str,
+        tool_name: &str,
+        input: serde_json::Value,
+        cwd: &PathBuf,
+        approval_fn: &A,
+    ) -> ContentBlock
+    where
+        A: Fn(&str, &str, &serde_json::Value) -> bool + Send + Sync,
+    {
         let tool = match self.tool_instances.get(tool_name) {
             Some(t) => t,
             None => {
@@ -385,6 +532,12 @@ impl Runtime {
                 ),
             ),
             PermissionDecision::Ask => {
+                if !approval_fn(tool_use_id, tool_name, &input) {
+                    return ContentBlock::tool_error(
+                        tool_use_id,
+                        format!("Tool '{tool_name}' denied by user"),
+                    );
+                }
                 let result = tool.execute(input, cwd);
                 if result.is_error {
                     ContentBlock::tool_error(tool_use_id, result.content)
@@ -426,7 +579,7 @@ impl RuntimeOutput {
 mod tests {
     use super::*;
     use crate::config::AppConfig;
-    use clawedcode_api::MockProvider;
+    use clawedcode_api::{MockProvider, MockToolProvider};
 
     fn make_runtime() -> Runtime {
         let config = AppConfig::default();
@@ -447,6 +600,28 @@ mod tests {
             compat,
             PermissionMode::Default,
             Box::new(MockProvider),
+        )
+    }
+
+    fn make_tool_runtime() -> Runtime {
+        let config = AppConfig::default();
+        let prompt_spec = PromptSpec {
+            name: "test",
+            summary: "test",
+            body: "You are a test assistant. Use tools when needed.",
+        };
+        let compat = CompatibilitySnapshot {
+            settings_files: vec![],
+            settings: serde_json::Value::Null,
+            skills: vec![],
+            mcp_servers: std::collections::BTreeMap::new(),
+        };
+        Runtime::with_provider(
+            config,
+            prompt_spec,
+            compat,
+            PermissionMode::Bypass,
+            Box::new(MockToolProvider),
         )
     }
 
@@ -666,6 +841,72 @@ mod tests {
         } else {
             panic!("expected ToolResult block");
         }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tool_call_loop_executes_tool_then_returns_final_response() {
+        let runtime = make_tool_runtime();
+        let dir = std::env::temp_dir().join(format!("clawed_tool_loop_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            r#"[workspace]
+members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode-api", "crates/clawedcode-tools", "crates/clawedcode-mcp", "crates/clawedcode-tui"]
+"#,
+        )
+        .unwrap();
+
+        let mut session = runtime.start_session(dir.clone());
+        let output = runtime.submit(&mut session, "read Cargo.toml and summarize it");
+
+        assert!(
+            output.tools_executed > 0,
+            "expected at least one tool to be executed, got {}",
+            output.tools_executed
+        );
+
+        assert!(
+            output.response.contains("clawedcode"),
+            "expected final response to reference cargo workspace, got: {}",
+            output.response
+        );
+
+        let tool_msgs: Vec<_> = session
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .collect();
+        assert!(
+            !tool_msgs.is_empty(),
+            "expected tool result messages in session"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tool_result_is_persisted_in_session() {
+        let runtime = make_tool_runtime();
+        let dir =
+            std::env::temp_dir().join(format!("clawed_tool_persist_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"test\"\n").unwrap();
+
+        let mut session = runtime.start_session(dir.clone());
+        let _output = runtime.submit(&mut session, "read Cargo.toml");
+
+        let has_tool_result = session.messages.iter().any(|m| {
+            m.role == Role::Tool
+                && m.content_blocks
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+        });
+        assert!(
+            has_tool_result,
+            "expected tool result to be persisted in session"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -17,6 +17,8 @@ pub struct CompletionRequest {
     pub system_prompt_name: String,
     pub system_prompt_body: String,
     pub prompt: String,
+    /// Structured conversation history. Providers may prefer this over `prompt`.
+    pub messages: Vec<ProviderMessage>,
     pub tools: Vec<ToolSpec>,
     pub skill_count: usize,
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
@@ -29,6 +31,44 @@ pub struct CompletionResponse {
     pub tool_count: usize,
     pub skill_count: usize,
     pub mcp_server_count: usize,
+}
+
+// --- Conversation message model (provider-facing) ---
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderRole {
+    User,
+    Assistant,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProviderMessage {
+    pub role: ProviderRole,
+    pub content: Vec<ProviderContentBlock>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProviderContentBlock {
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        #[serde(default)]
+        input: serde_json::Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        #[serde(default)]
+        is_error: bool,
+    },
+    Thinking {
+        thinking: String,
+    },
 }
 
 // --- Streaming event model ---
@@ -204,6 +244,27 @@ impl Provider for MockProvider {
 }
 
 fn mock_complete_response(request: &CompletionRequest) -> CompletionResponse {
+    if wants_read_cargo_toml(&request.prompt) {
+        if let Some(tool_content) = first_tool_result_content(&request.messages) {
+            let response = mock_summarize_cargo_toml(&tool_content);
+            return CompletionResponse {
+                system_prompt: request.system_prompt_name.clone(),
+                response,
+                tool_count: request.tools.len(),
+                skill_count: request.skill_count,
+                mcp_server_count: request.mcp_servers.len(),
+            };
+        }
+
+        return CompletionResponse {
+            system_prompt: request.system_prompt_name.clone(),
+            response: "I'll read Cargo.toml first.".to_string(),
+            tool_count: request.tools.len(),
+            skill_count: request.skill_count,
+            mcp_server_count: request.mcp_servers.len(),
+        };
+    }
+
     let response = format!(
         "Model: {}\nPrompt pack: {}\nSystem prompt: {}\nTools: {}\nSkills discovered: {}\nMCP servers discovered: {}\n\nRequest queued for the execution loop.\n\nNext priorities:\n1. Parse instructions into an explicit task graph.\n2. Resolve tool approvals before execution.\n3. Stream structured updates into the terminal UI.",
         request.model,
@@ -229,6 +290,42 @@ fn mock_complete_response(request: &CompletionRequest) -> CompletionResponse {
 }
 
 fn mock_stream_events(request: &CompletionRequest) -> Vec<ApiEvent> {
+    if wants_read_cargo_toml(&request.prompt) {
+        if let Some(tool_content) = first_tool_result_content(&request.messages) {
+            return vec![
+                ApiEvent::ThinkingDelta {
+                    text: "I have the Cargo.toml contents; summarizing.".to_string(),
+                },
+                ApiEvent::MessageDelta {
+                    text: mock_summarize_cargo_toml(&tool_content),
+                },
+                ApiEvent::Usage {
+                    usage: UsageEvent {
+                        input_tokens: 220,
+                        output_tokens: 90,
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
+                    },
+                },
+                ApiEvent::Completed,
+            ];
+        }
+
+        return vec![
+            ApiEvent::ThinkingDelta {
+                text: "I should read Cargo.toml to answer this.".to_string(),
+            },
+            ApiEvent::ToolUse {
+                tool_use: ToolUseEvent {
+                    id: "tool_1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "Cargo.toml"}).to_string(),
+                },
+            },
+            ApiEvent::Completed,
+        ];
+    }
+
     let tool_names: Vec<&str> = request.tools.iter().map(|t| t.name.as_ref()).collect();
 
     vec![
@@ -268,6 +365,154 @@ fn mock_stream_events(request: &CompletionRequest) -> Vec<ApiEvent> {
         },
         ApiEvent::Completed,
     ]
+}
+
+fn wants_read_cargo_toml(prompt: &str) -> bool {
+    let p = prompt.to_ascii_lowercase();
+    p.contains("cargo.toml") && (p.contains("read") || p.contains("summarize"))
+}
+
+fn first_tool_result_content(messages: &[ProviderMessage]) -> Option<String> {
+    for m in messages {
+        for b in &m.content {
+            if let ProviderContentBlock::ToolResult { content, .. } = b {
+                return Some(content.clone());
+            }
+        }
+    }
+    None
+}
+
+fn mock_summarize_cargo_toml(contents: &str) -> String {
+    if contents.contains("[workspace]") {
+        let mut out = String::from("Cargo.toml defines a Rust workspace.\n");
+        if contents.contains("members") {
+            out.push_str("It declares workspace members; this repo is a multi-crate workspace.\n");
+        }
+        out.push_str("Key crates include: clawedcode (cli), clawedcode-core, clawedcode-api, clawedcode-tools, clawedcode-mcp, clawedcode-tui.");
+        out
+    } else {
+        "Cargo.toml does not look like a workspace manifest (no [workspace] section).".to_string()
+    }
+}
+
+// --- MockToolProvider: deterministic provider for tests that triggers a tool call ---
+
+/// A mock provider that, on the first call, emits a `read_file` ToolUse for
+/// `Cargo.toml`. On subsequent calls (i.e. after the runtime has appended a
+/// tool_result message), it returns a final text response that references the
+/// tool result.
+///
+/// Detection of "subsequent call" is done by checking whether the session
+/// already contains a `tool` role message (injected by the runtime after tool
+/// execution).
+#[derive(Debug, Default, Clone)]
+pub struct MockToolProvider;
+
+impl Provider for MockToolProvider {
+    fn complete(
+        &self,
+        request: &CompletionRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<CompletionResponse, ProviderError>> + Send + '_>> {
+        let response = mock_tool_complete_response(request);
+        Box::pin(async move { Ok(response) })
+    }
+
+    fn stream(&self, request: &CompletionRequest) -> EventStream {
+        let req = request.clone();
+        let (tx, rx) = mpsc::channel::<Result<ApiEvent, ProviderError>>(32);
+
+        tokio::spawn(async move {
+            let events = mock_tool_stream_events(&req);
+            for (idx, event) in events.into_iter().enumerate() {
+                if idx > 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                if tx.send(Ok(event)).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        Box::pin(futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        }))
+    }
+}
+
+fn mock_tool_complete_response(request: &CompletionRequest) -> CompletionResponse {
+    if has_tool_result_message(request) {
+        let response = "Based on the Cargo.toml file, this is a Rust workspace named 'clawedcode' with multiple crates including clawedcode-cli, clawedcode-core, clawedcode-api, clawedcode-tools, clawedcode-mcp, and clawedcode-tui.".to_string();
+        return CompletionResponse {
+            system_prompt: request.system_prompt_name.clone(),
+            response,
+            tool_count: request.tools.len(),
+            skill_count: request.skill_count,
+            mcp_server_count: request.mcp_servers.len(),
+        };
+    }
+
+    CompletionResponse {
+        system_prompt: request.system_prompt_name.clone(),
+        response: "I'll read the Cargo.toml file.".to_string(),
+        tool_count: request.tools.len(),
+        skill_count: request.skill_count,
+        mcp_server_count: request.mcp_servers.len(),
+    }
+}
+
+fn mock_tool_stream_events(request: &CompletionRequest) -> Vec<ApiEvent> {
+    if has_tool_result_message(request) {
+        return vec![
+            ApiEvent::ThinkingDelta {
+                text: "I have the file contents now.".to_string(),
+            },
+            ApiEvent::MessageDelta {
+                text: "Based on the Cargo.toml file, this is a Rust workspace named 'clawedcode' with multiple crates including clawedcode-cli, clawedcode-core, clawedcode-api, clawedcode-tools, clawedcode-mcp, and clawedcode-tui.".to_string(),
+            },
+            ApiEvent::Usage {
+                usage: UsageEvent {
+                    input_tokens: 200,
+                    output_tokens: 60,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+            },
+            ApiEvent::Completed,
+        ];
+    }
+
+    vec![
+        ApiEvent::ThinkingDelta {
+            text: "I should read the Cargo.toml file.".to_string(),
+        },
+        ApiEvent::ToolUse {
+            tool_use: ToolUseEvent {
+                id: "tool_1".to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": "Cargo.toml"}).to_string(),
+            },
+        },
+        ApiEvent::Usage {
+            usage: UsageEvent {
+                input_tokens: 100,
+                output_tokens: 30,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+        },
+        ApiEvent::Completed,
+    ]
+}
+
+/// Returns true if the conversation already contains tool result blocks,
+/// indicating this is a re-query after tool execution.
+fn has_tool_result_message(request: &CompletionRequest) -> bool {
+    request.messages.iter().any(|m| {
+        m.content
+            .iter()
+            .any(|b| matches!(b, ProviderContentBlock::ToolResult { .. }))
+    })
 }
 
 // --- Optional Anthropic provider (behind feature flag + env var) ---
@@ -317,6 +562,40 @@ pub mod anthropic_provider {
         }
     }
 
+    fn build_anthropic_tools(tools: &[ToolSpec]) -> serde_json::Value {
+        if tools.is_empty() {
+            return serde_json::Value::Null;
+        }
+        serde_json::Value::Array(
+            tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "input_schema": t.input_schema,
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    fn sanitize_messages_for_anthropic(messages: &[ProviderMessage]) -> Vec<ProviderMessage> {
+        messages
+            .iter()
+            .map(|m| ProviderMessage {
+                role: m.role.clone(),
+                content: m
+                    .content
+                    .iter()
+                    .filter(|b| !matches!(b, ProviderContentBlock::Thinking { .. }))
+                    .cloned()
+                    .collect(),
+            })
+            .filter(|m| !m.content.is_empty())
+            .collect()
+    }
+
     impl Provider for AnthropicProvider {
         fn complete(
             &self,
@@ -331,12 +610,24 @@ pub mod anthropic_provider {
             let retry = self.retry.clone();
             let timeout = self.timeout.clone();
             Box::pin(async move {
-                let body = serde_json::json!({
+                let tools = build_anthropic_tools(&req.tools);
+                let messages = sanitize_messages_for_anthropic(&req.messages);
+                let messages = if messages.is_empty() {
+                    serde_json::json!([{"role": "user", "content": req.prompt}])
+                } else {
+                    serde_json::to_value(messages).unwrap_or_else(
+                        |_| serde_json::json!([{"role": "user", "content": req.prompt}]),
+                    )
+                };
+                let mut body = serde_json::json!({
                     "model": req.model,
                     "max_tokens": 4096,
                     "system": req.system_prompt_body,
-                    "messages": [{"role": "user", "content": req.prompt}],
+                    "messages": messages,
                 });
+                if !tools.is_null() {
+                    body["tools"] = tools;
+                }
 
                 let mut last_err: Option<ProviderError> = None;
 
@@ -443,13 +734,25 @@ pub mod anthropic_provider {
             let (tx, rx) = mpsc::channel::<Result<ApiEvent, ProviderError>>(64);
 
             tokio::spawn(async move {
-                let body = serde_json::json!({
+                let tools = build_anthropic_tools(&req.tools);
+                let messages = sanitize_messages_for_anthropic(&req.messages);
+                let messages = if messages.is_empty() {
+                    serde_json::json!([{"role": "user", "content": req.prompt}])
+                } else {
+                    serde_json::to_value(messages).unwrap_or_else(
+                        |_| serde_json::json!([{"role": "user", "content": req.prompt}]),
+                    )
+                };
+                let mut body = serde_json::json!({
                     "model": req.model,
                     "max_tokens": 4096,
                     "system": req.system_prompt_body,
-                    "messages": [{"role": "user", "content": req.prompt}],
+                    "messages": messages,
                     "stream": true,
                 });
+                if !tools.is_null() {
+                    body["tools"] = tools;
+                }
 
                 let send_fut = client
                     .post(&endpoint)
@@ -495,6 +798,8 @@ pub mod anthropic_provider {
                 let mut bytes = resp.bytes_stream();
                 use futures_util::StreamExt;
 
+                let mut current_tool_use: Option<(String, String, String)> = None;
+
                 while let Some(chunk) = bytes.next().await {
                     let chunk = match chunk {
                         Ok(c) => c,
@@ -539,11 +844,38 @@ pub mod anthropic_provider {
                         let typ = event["type"].as_str().unwrap_or("");
                         match typ {
                             "content_block_start" => {
-                                if event["content_block"]["type"].as_str() == Some("text") {
+                                let cb_type = event["content_block"]["type"].as_str().unwrap_or("");
+                                if cb_type == "text" {
                                     if let Some(t) = event["content_block"]["text"].as_str() {
                                         if !t.is_empty() {
                                             let _ = tx
                                                 .send(Ok(ApiEvent::MessageDelta {
+                                                    text: t.to_string(),
+                                                }))
+                                                .await;
+                                        }
+                                    }
+                                } else if cb_type == "tool_use" {
+                                    let id = event["content_block"]["id"]
+                                        .as_str()
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let name = event["content_block"]["name"]
+                                        .as_str()
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let input = event["content_block"]["input"].clone();
+                                    let input_str = if input.is_null() {
+                                        String::new()
+                                    } else {
+                                        serde_json::to_string(&input).unwrap_or_default()
+                                    };
+                                    current_tool_use = Some((id, name, input_str));
+                                } else if cb_type == "thinking" {
+                                    if let Some(t) = event["content_block"]["thinking"].as_str() {
+                                        if !t.is_empty() {
+                                            let _ = tx
+                                                .send(Ok(ApiEvent::ThinkingDelta {
                                                     text: t.to_string(),
                                                 }))
                                                 .await;
@@ -572,7 +904,32 @@ pub mod anthropic_provider {
                                                 .await;
                                         }
                                     }
+                                    "input_json_delta" => {
+                                        if let Some(partial) =
+                                            event["delta"]["partial_json"].as_str()
+                                        {
+                                            if let Some((_id, _name, input_buf)) =
+                                                current_tool_use.as_mut()
+                                            {
+                                                input_buf.push_str(partial);
+                                            }
+                                        }
+                                    }
                                     _ => {}
+                                }
+                            }
+                            "content_block_stop" => {
+                                if let Some((id, name, input)) = current_tool_use.take() {
+                                    let input = if input.trim().is_empty() {
+                                        "{}".to_string()
+                                    } else {
+                                        input
+                                    };
+                                    let _ = tx
+                                        .send(Ok(ApiEvent::ToolUse {
+                                            tool_use: ToolUseEvent { id, name, input },
+                                        }))
+                                        .await;
                                 }
                             }
                             "message_delta" => {
@@ -688,6 +1045,7 @@ mod tests {
             system_prompt_name: "default".to_string(),
             system_prompt_body: "You are helpful.".to_string(),
             prompt: "hello".to_string(),
+            messages: vec![],
             tools: vec![],
             skill_count: 0,
             mcp_servers: BTreeMap::new(),
@@ -712,6 +1070,7 @@ mod tests {
             system_prompt_name: "default".to_string(),
             system_prompt_body: "You are helpful.".to_string(),
             prompt: "hello".to_string(),
+            messages: vec![],
             tools: vec![],
             skill_count: 0,
             mcp_servers: BTreeMap::new(),
@@ -746,6 +1105,7 @@ mod tests {
             system_prompt_name: "default".to_string(),
             system_prompt_body: "You are helpful.".to_string(),
             prompt: "hello".to_string(),
+            messages: vec![],
             tools: vec![],
             skill_count: 0,
             mcp_servers: BTreeMap::new(),
