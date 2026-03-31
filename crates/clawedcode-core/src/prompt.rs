@@ -12,17 +12,17 @@ pub fn builtin_prompts() -> Vec<PromptSpec> {
         PromptSpec {
             name: "core",
             summary: "Default coding assistant behavior",
-            body: include_str!("../../../prompts/core.md"),
+            body: include_str!("../prompts/core.md"),
         },
         PromptSpec {
             name: "review",
             summary: "Focus on defects, regressions, and missing tests",
-            body: include_str!("../../../prompts/review.md"),
+            body: include_str!("../prompts/review.md"),
         },
         PromptSpec {
             name: "planning",
             summary: "Bias toward explicit execution plans and checkpoints",
-            body: include_str!("../../../prompts/planning.md"),
+            body: include_str!("../prompts/planning.md"),
         },
     ]
 }
