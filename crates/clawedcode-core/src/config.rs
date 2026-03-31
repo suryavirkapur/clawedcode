@@ -70,17 +70,23 @@ impl AppConfig {
             .or_else(default_config_path);
 
         let Some(path) = path else {
-            return Ok(Self::default());
+            let mut config = Self::default();
+            apply_env_overrides(&mut config);
+            return Ok(config);
         };
 
         if !path.exists() {
-            return Ok(Self::default());
+            let mut config = Self::default();
+            apply_env_overrides(&mut config);
+            return Ok(config);
         }
 
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("failed to read config at {}", path.display()))?;
-        toml::from_str(&raw)
-            .with_context(|| format!("failed to parse config at {}", path.display()))
+        let mut config: Self = toml::from_str(&raw)
+            .with_context(|| format!("failed to parse config at {}", path.display()))?;
+        apply_env_overrides(&mut config);
+        Ok(config)
     }
 
     pub fn write_default(path: &Path) -> Result<()> {
@@ -94,6 +100,14 @@ impl AppConfig {
     }
 }
 
+fn apply_env_overrides(config: &mut AppConfig) {
+    if std::env::var("CLAWEDCODE_PROVIDER").unwrap_or_default() == "anthropic" {
+        if let Ok(model) = std::env::var("ANTHROPIC_MODEL") {
+            config.model = model;
+        }
+    }
+}
+
 pub fn default_data_dir() -> Option<PathBuf> {
     ProjectDirs::from("dev", "clawed", "clawedcode").map(|dirs| dirs.data_dir().to_path_buf())
 }
@@ -101,4 +115,22 @@ pub fn default_data_dir() -> Option<PathBuf> {
 pub fn default_config_path() -> Option<PathBuf> {
     ProjectDirs::from("dev", "clawed", "clawedcode")
         .map(|dirs| dirs.config_dir().join("config.toml"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppConfig;
+
+    #[test]
+    fn anthropic_model_override_applies_without_config_file() {
+        // SAFETY: tests here are single-threaded and restore env before exit.
+        unsafe { std::env::set_var("CLAWEDCODE_PROVIDER", "anthropic") };
+        unsafe { std::env::set_var("ANTHROPIC_MODEL", "qwen3.5:4b") };
+
+        let config = AppConfig::load(None).expect("config loads");
+        assert_eq!(config.model, "qwen3.5:4b");
+
+        unsafe { std::env::remove_var("ANTHROPIC_MODEL") };
+        unsafe { std::env::remove_var("CLAWEDCODE_PROVIDER") };
+    }
 }
