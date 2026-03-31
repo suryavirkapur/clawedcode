@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clawedcode_mcp::{McpServerConfig, discover_mcp_servers as parse_settings_mcp_servers};
+use clawedcode_mcp::{discover_mcp_servers as parse_settings_mcp_servers, McpServerConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{
@@ -174,7 +174,8 @@ fn expand_memory_file(path: &Path, stack: &mut Vec<PathBuf>, depth: usize) -> Re
         return Ok(String::new());
     }
 
-    let raw = fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     stack.push(canonical);
 
     let mut expanded = Vec::new();
@@ -286,6 +287,23 @@ fn parse_frontmatter(raw: &str) -> Option<SkillFrontmatter> {
 
 fn discover_mcp_servers(cwd: &Path, settings: &Value) -> Result<BTreeMap<String, McpServerConfig>> {
     let mut servers = parse_settings_mcp_servers(settings);
+
+    let mut ancestor_paths: Vec<PathBuf> = cwd.ancestors().map(PathBuf::from).collect();
+    ancestor_paths.reverse();
+    ancestor_paths.pop();
+
+    for ancestor in ancestor_paths {
+        let mcp_json_path = ancestor.join(".mcp.json");
+        if mcp_json_path.exists() {
+            let raw = fs::read_to_string(&mcp_json_path)
+                .with_context(|| format!("failed to read {}", mcp_json_path.display()))?;
+            let value: Value = serde_json::from_str(&raw)
+                .with_context(|| format!("failed to parse {}", mcp_json_path.display()))?;
+            if let Some(ancestor_servers) = value.get("mcpServers").and_then(parse_mcp_map) {
+                servers.extend(ancestor_servers);
+            }
+        }
+    }
 
     let mcp_json_path = cwd.join(".mcp.json");
     if mcp_json_path.exists() {
@@ -444,6 +462,110 @@ mod tests {
         let rule_idx = memory.find("rule memory").unwrap();
         assert!(user_idx < project_idx);
         assert!(project_idx < rule_idx);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn discover_mcp_servers_ancestor_precedence() {
+        let root = temp_dir("mcp_ancestor");
+        let level1 = root.join("level1");
+        let level2 = level1.join("level2");
+        let level3 = level2.join("level3");
+        fs::create_dir_all(&level3).unwrap();
+
+        fs::write(
+            level1.join(".mcp.json"),
+            r#"{"mcpServers": {"server1": {"type": "stdio", "command": "echo", "args": ["level1"]}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            level2.join(".mcp.json"),
+            r#"{"mcpServers": {"server1": {"type": "stdio", "command": "echo", "args": ["level2"]}, "server2": {"type": "stdio", "command": "echo", "args": ["level2"]}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            level3.join(".mcp.json"),
+            r#"{"mcpServers": {"server1": {"type": "stdio", "command": "echo", "args": ["level3"]}, "server3": {"type": "stdio", "command": "echo", "args": ["level3"]}}}"#,
+        )
+        .unwrap();
+
+        let servers = discover_mcp_servers(&level3, &Value::Null).unwrap();
+
+        assert_eq!(servers.len(), 3);
+        assert_eq!(
+            servers.get("server1").and_then(|s| s.command()),
+            Some("echo".to_string())
+        );
+        assert_eq!(
+            servers
+                .get("server1")
+                .and_then(|s| s.args().first().cloned()),
+            Some("level3".to_string())
+        );
+        assert_eq!(
+            servers
+                .get("server2")
+                .and_then(|s| s.args().first().cloned()),
+            Some("level2".to_string())
+        );
+        assert_eq!(
+            servers
+                .get("server3")
+                .and_then(|s| s.args().first().cloned()),
+            Some("level3".to_string())
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn discover_mcp_servers_settings_base() {
+        let root = temp_dir("mcp_settings");
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+
+        fs::write(
+            project.join(".mcp.json"),
+            r#"{"mcpServers": {"from_file": {"type": "stdio", "command": "echo", "args": ["file"]}}}"#,
+        )
+        .unwrap();
+
+        let settings: Value = serde_json::from_str(r#"{"mcpServers": {"from_settings": {"type": "stdio", "command": "echo", "args": ["settings"]}}}"#).unwrap();
+        let servers = discover_mcp_servers(&project, &settings).unwrap();
+
+        assert_eq!(servers.len(), 2);
+        assert!(servers.contains_key("from_settings"));
+        assert!(servers.contains_key("from_file"));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn discover_mcp_servers_cwd_overrides_ancestor() {
+        let root = temp_dir("mcp_override");
+        let parent = root.join("parent");
+        let child = parent.join("child");
+        fs::create_dir_all(&child).unwrap();
+
+        fs::write(
+            parent.join(".mcp.json"),
+            r#"{"mcpServers": {"server": {"type": "stdio", "command": "parent-cmd", "args": []}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            child.join(".mcp.json"),
+            r#"{"mcpServers": {"server": {"type": "stdio", "command": "child-cmd", "args": []}}}"#,
+        )
+        .unwrap();
+
+        let servers = discover_mcp_servers(&child, &Value::Null).unwrap();
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(
+            servers.get("server").and_then(|s| s.command()),
+            Some("child-cmd".to_string())
+        );
 
         fs::remove_dir_all(root).ok();
     }

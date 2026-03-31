@@ -42,6 +42,22 @@ pub enum McpServerConfig {
     },
 }
 
+impl McpServerConfig {
+    pub fn command(&self) -> Option<String> {
+        match self {
+            McpServerConfig::Stdio { command, .. } => Some(command.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn args(&self) -> &[String] {
+        match self {
+            McpServerConfig::Stdio { args, .. } => args,
+            _ => &[],
+        }
+    }
+}
+
 pub fn discover_mcp_servers(settings: &Value) -> BTreeMap<String, McpServerConfig> {
     settings
         .get("mcpServers")
