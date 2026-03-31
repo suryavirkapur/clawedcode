@@ -2,6 +2,11 @@ name: Release
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to upload assets to (e.g. v0.0.3). Leave empty to use the ref name.'
+        required: false
+        type: string
   push:
     tags:
       - 'v*'
@@ -37,6 +42,8 @@ jobs:
             target: aarch64-pc-windows-msvc
             name: aarch64-windows.exe
     runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
 
@@ -69,4 +76,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/clawedcode-${{ matrix.name }}
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
