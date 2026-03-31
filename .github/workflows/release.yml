@@ -50,13 +50,13 @@ jobs:
         with:
           tool: cross
 
+      - name: Build (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: cross build --release --target ${{ matrix.target }} -p clawedcode
+
       - name: Build
-        run: |
-          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
-            cross build --release --target ${{ matrix.target }} -p clawedcode
-          else
-            cargo build --release --target ${{ matrix.target }} -p clawedcode
-          fi
+        if: matrix.os != 'ubuntu-latest'
+        run: cargo build --release --target ${{ matrix.target }} -p clawedcode
 
       - name: Prepare artifact
         shell: bash
