@@ -1,0 +1,27 @@
+[package]
+name = "clawedcode-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "A coding agent shell focused on startup speed, terminal UX, and compatibility"
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+default-run = "clawedcode"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true
+clawedcode-api = { path = "../clawedcode-api" }
+clawedcode-core = { path = "../clawedcode-core" }
+clawedcode-mcp = { path = "../clawedcode-mcp" }
+clawedcode-tui = { path = "../clawedcode-tui" }
+clawedcode-tools = { path = "../clawedcode-tools" }
+
+[[bin]]
+name = "clawedcode"
+path = "src/main.rs"
