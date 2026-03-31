@@ -1,11 +1,12 @@
-const https = require('https');
-const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { Readable } = require('stream');
+const { pipeline } = require('stream/promises');
 
 const VERSION = require('./package.json').version;
 const REPO = 'suryavirkapur/clawedcode';
+const DOWNLOAD_TIMEOUT_MS = 120000;
 
 function getPlatform() {
   const platform = os.platform();
@@ -35,41 +36,44 @@ function getPlatform() {
 }
 
 function download(url, dest) {
-  return new Promise((resolve, reject) => {
-    const protocol = url.startsWith('https') ? https : http;
-    const tmpDest = `${dest}.tmp`;
-    const file = fs.createWriteStream(tmpDest);
+  const tmpDest = `${dest}.tmp`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
 
-    protocol.get(url, (response) => {
-      if (response.statusCode === 302 || response.statusCode === 301) {
-        file.close(() => {
-          fs.rmSync(tmpDest, { force: true });
-          download(response.headers.location, dest).then(resolve).catch(reject);
-        });
-        return;
-      }
-      if (response.statusCode !== 200) {
-        file.close(() => {
-          fs.rmSync(tmpDest, { force: true });
-          reject(new Error(`Failed to download: ${response.statusCode}`));
-        });
-        return;
-      }
-      response.pipe(file);
-      file.on('finish', () => {
-        file.close(() => {
-          fs.renameSync(tmpDest, dest);
-          fs.chmodSync(dest, 0o755);
-          resolve();
-        });
+  return (async () => {
+    try {
+      const response = await fetch(url, {
+        redirect: 'follow',
+        signal: controller.signal,
+        headers: {
+          'user-agent': `clawedcode-installer/${VERSION}`,
+        },
       });
-    }).on('error', (err) => {
-      file.close(() => {
-        fs.rmSync(tmpDest, { force: true });
-        reject(err);
-      });
-    });
-  });
+
+      if (!response.ok) {
+        throw new Error(`Failed to download: ${response.status} ${response.statusText}`);
+      }
+      if (!response.body) {
+        throw new Error('Download response did not include a body');
+      }
+
+      await pipeline(
+        Readable.fromWeb(response.body),
+        fs.createWriteStream(tmpDest),
+      );
+
+      fs.renameSync(tmpDest, dest);
+      fs.chmodSync(dest, 0o755);
+    } catch (err) {
+      fs.rmSync(tmpDest, { force: true });
+      if (err?.name === 'AbortError') {
+        throw new Error(`Download timed out after ${DOWNLOAD_TIMEOUT_MS / 1000}s`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timeout);
+    }
+  })();
 }
 
 async function main() {
