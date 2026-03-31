@@ -132,6 +132,14 @@ impl Session {
             .with_context(|| format!("invalid session ID format: {}", session_id))?;
         Self::load(base_dir, session_uuid)
     }
+
+    pub fn last_user_text(&self) -> Option<&str> {
+        self.messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User)
+            .and_then(|m| m.primary_text())
+    }
 }
 
 #[cfg(test)]

@@ -1,3 +1,3 @@
-pub mod bootstrap;
 pub mod app;
+pub mod bootstrap;
 pub mod cli;

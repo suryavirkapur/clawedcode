@@ -2,10 +2,10 @@ use crate::cli::{Cli, Command};
 use anyhow::{Context, Result};
 use clawedcode_core::{
     compat,
-    config::{default_config_path, AppConfig},
+    config::{AppConfig, default_config_path},
 };
 use std::{fs, path::PathBuf};
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Debug)]
 pub struct BootstrappedApp {
