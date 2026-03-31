@@ -6,7 +6,8 @@ use crate::{
     runtime::Runtime,
     session::{Role, Session},
 };
-use clawedcode_api::{ApiClient, ApiEvent, CompletionRequest};
+use clawedcode_api::ApiEvent;
+use futures_util::StreamExt;
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -75,29 +76,27 @@ impl TuiContext {
     pub fn submit_interactive(&mut self, prompt: &str, handler: &mut dyn TuiHandler) {
         self.session.push(Role::User, prompt);
 
-        let request = CompletionRequest {
-            model: self.runtime.config.model.clone(),
-            prompt_pack: self.runtime.config.prompts.default_prompt_pack.clone(),
-            system_prompt_name: self.runtime.system_prompt.name.to_string(),
-            system_prompt_body: self.runtime.system_prompt.body.to_string(),
-            prompt: self
-                .session
-                .last_user_text()
-                .unwrap_or_default()
-                .to_string(),
-            tools: self.runtime.tools.clone(),
-            skill_count: self.runtime.compatibility.skills.len(),
-            mcp_servers: self.runtime.compatibility.mcp_servers.clone(),
-        };
-
-        let events = self.runtime.api_client.stream(&request);
+        let request = self.runtime.build_request(&self.session);
 
         let mut text_accum = String::new();
         let mut thinking_accum = String::new();
         let mut tool_uses: Vec<(String, String, serde_json::Value)> = Vec::new();
 
-        for event in &events {
-            match event {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build tokio runtime");
+
+        let mut s = rt.block_on(async { self.runtime.provider.stream(&request) });
+        loop {
+            let next = rt.block_on(async { s.next().await });
+            let Some(next) = next else { break };
+            let event = match next {
+                Ok(e) => e,
+                Err(_) => break,
+            };
+
+            match &event {
                 ApiEvent::MessageDelta { text } => {
                     text_accum.push_str(text.as_str());
                     handler.on_event(&TuiEvent::MessageDelta { text: text.clone() });
@@ -117,6 +116,10 @@ impl TuiContext {
                     });
                 }
                 ApiEvent::ToolResult { .. } | ApiEvent::Usage { .. } | ApiEvent::Completed => {}
+            }
+
+            if matches!(event, ApiEvent::Completed) {
+                break;
             }
         }
 
@@ -166,7 +169,6 @@ impl TuiContext {
                     true
                 };
 
-                // If approval is needed and not granted immediately, defer tool execution to the UI.
                 if needs_approval && !approved_now {
                     continue;
                 }

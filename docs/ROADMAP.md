@@ -14,23 +14,22 @@ Already done:
 
 - [x] Rust workspace split into `cli`, `core`, `api`, `mcp`, `tools`, `tui`
 - [x] Basic CLI entrypoint and subcommand structure
+- [x] Staged bootstrap flow (mode resolution + config/compat/session init)
 - [x] Basic config loading
 - [x] Compatibility discovery for settings, skills, and MCP config
 - [x] Session persistence skeleton
 - [x] Built-in prompt registry
-- [x] Mock provider boundary in `clawedcode-api`
-- [x] Placeholder TUI shell
+- [x] Provider boundary in `clawedcode-api` with incremental streaming (`Provider` trait)
+- [x] Streaming runtime plumbing (CLI streams deltas; TUI consumes event stream)
+- [x] Permission engine scaffold (default/accept-edits/plan/bypass)
+- [x] Built-in tool execution (shell/read_file/apply_patch) with tool_result persistence
+- [x] Stateful REPL shell (basic TUI)
 - [x] Source-backed implementation spec
 
 Not done:
 
-- [ ] staged bootstrap flow
-- [ ] streaming provider runtime
-- [ ] real tool execution
-- [ ] permission engine
-- [ ] stateful REPL
 - [ ] MCP connections and discovery
-- [ ] session resume and compaction
+- [ ] Session compaction / context trimming
 - [ ] sub-agents
 - [ ] remote/direct-connect/ssh modes
 
@@ -89,12 +88,13 @@ Produces a persisted session transcript with enough structure to support:
 
 ### Deliverables
 
-- [ ] Provider trait with streaming and non-streaming paths
-- [ ] Request shaping from system prompt + session history + tools
-- [ ] Streaming event model
-- [ ] Retry and timeout envelope
-- [ ] Usage accounting scaffold
-- [ ] Model/provider abstraction
+- [x] Provider trait with streaming and non-streaming paths
+- [x] Initial request shaping (system prompt + latest user message + tools metadata)
+- [ ] Full session-history shaping (multi-turn transcript)
+- [x] Streaming event model
+- [x] Retry and timeout envelope (scaffold)
+- [x] Usage accounting scaffold
+- [x] Model/provider abstraction (env-selected provider)
 
 ### Exit Criteria
 
@@ -102,7 +102,16 @@ Produces a persisted session transcript with enough structure to support:
 cargo run -- run --prompt "explain ownership"
 ```
 
-Should stream a real provider response through the runtime, not synthesize a placeholder string.
+Should stream incremental deltas through the runtime (mock provider is acceptable for offline tests).
+
+Optional real-provider smoke test (not used in CI):
+
+```bash
+export CLAWEDCODE_PROVIDER=anthropic
+export ANTHROPIC_API_KEY=...
+export CLAWEDCODE_ANTHROPIC_ENDPOINT=https://api.anthropic.com/v1/messages
+cargo run -- run --prompt "hello"
+```
 
 ## Phase 4: Tool Registry, Permissions, And Execution
 

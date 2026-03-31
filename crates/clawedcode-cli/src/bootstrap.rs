@@ -34,6 +34,7 @@ pub struct RunMode {
     pub prompt: String,
     pub system_prompt: Option<String>,
     pub json: bool,
+    pub show_thinking: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -41,12 +42,14 @@ pub struct ResumeMode {
     pub session_id: String,
     pub prompt: Option<String>,
     pub json: bool,
+    pub show_thinking: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct ContinueMode {
     pub prompt: String,
     pub json: bool,
+    pub show_thinking: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -83,23 +86,33 @@ pub fn resolve_mode(cli: &Cli) -> Result<ExecutionMode> {
             prompt,
             system_prompt,
             json,
+            show_thinking,
         } => Ok(ExecutionMode::Run(RunMode {
             prompt,
             system_prompt,
             json,
+            show_thinking,
         })),
         Command::Resume {
             session_id,
             prompt,
             json,
+            show_thinking,
         } => Ok(ExecutionMode::Resume(ResumeMode {
             session_id,
             prompt,
             json,
+            show_thinking,
         })),
-        Command::Continue { prompt, json } => {
-            Ok(ExecutionMode::Continue(ContinueMode { prompt, json }))
-        }
+        Command::Continue {
+            prompt,
+            json,
+            show_thinking,
+        } => Ok(ExecutionMode::Continue(ContinueMode {
+            prompt,
+            json,
+            show_thinking,
+        })),
         Command::Config => Ok(ExecutionMode::Config),
         Command::Compat => Ok(ExecutionMode::Compat),
         Command::Headless => Err(anyhow::anyhow!("headless mode is not yet implemented")),
@@ -188,12 +201,14 @@ mod tests {
             prompt: "hello".to_string(),
             system_prompt: None,
             json: false,
+            show_thinking: false,
         });
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Run(_)));
         if let ExecutionMode::Run(run) = mode {
             assert_eq!(run.prompt, "hello");
             assert!(!run.json);
+            assert!(!run.show_thinking);
         }
     }
 
@@ -203,12 +218,14 @@ mod tests {
             session_id: "abc-123".to_string(),
             prompt: Some("continue".to_string()),
             json: false,
+            show_thinking: false,
         });
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Resume(_)));
         if let ExecutionMode::Resume(resume) = mode {
             assert_eq!(resume.session_id, "abc-123");
             assert_eq!(resume.prompt.as_deref(), Some("continue"));
+            assert!(!resume.show_thinking);
         }
     }
 
@@ -217,12 +234,14 @@ mod tests {
         let cli = make_cli(Command::Continue {
             prompt: "keep going".to_string(),
             json: true,
+            show_thinking: false,
         });
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Continue(_)));
         if let ExecutionMode::Continue(cont) = mode {
             assert_eq!(cont.prompt, "keep going");
             assert!(cont.json);
+            assert!(!cont.show_thinking);
         }
     }
 
