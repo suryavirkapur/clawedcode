@@ -23,10 +23,12 @@ jobs:
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             name: aarch64-linux
-          - os: macos-latest
+          # Use an Intel runner for x86_64 builds to avoid relying on cross-compilation.
+          - os: macos-13
             target: x86_64-apple-darwin
             name: x86_64-darwin
-          - os: macos-latest
+          # Use an Apple Silicon runner for aarch64 builds.
+          - os: macos-14
             target: aarch64-apple-darwin
             name: aarch64-darwin
           - os: windows-latest
@@ -52,11 +54,11 @@ jobs:
 
       - name: Build (Linux)
         if: matrix.os == 'ubuntu-latest'
-        run: cross build --release --target ${{ matrix.target }} -p clawedcode
+        run: cross build --locked --release --target ${{ matrix.target }} -p clawedcode
 
       - name: Build
         if: matrix.os != 'ubuntu-latest'
-        run: cargo build --release --target ${{ matrix.target }} -p clawedcode
+        run: cargo build --locked --release --target ${{ matrix.target }} -p clawedcode
 
       - name: Prepare artifact
         shell: bash
