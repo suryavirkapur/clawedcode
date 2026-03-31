@@ -277,6 +277,8 @@ mod tests {
             settings_files: vec![],
             settings: serde_json::Value::Null,
             skills: vec![],
+            memory_files: vec![],
+            memory: String::new(),
             mcp_servers: std::collections::BTreeMap::new(),
         };
         TuiContext::new(
