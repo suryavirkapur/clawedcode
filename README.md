@@ -1,6 +1,6 @@
 # ClawedCode
 
-ClawedCode is an educational Rust-native reimplementation of a coding agent shell, focused on startup speed, terminal UX, and compatibility research.
+ClawedCode is a fast Rust-native coding agent shell, aiming to be a 1:1 replacement for Claude Code.
 
 ## Install
 
@@ -26,33 +26,22 @@ Global install:
 npm install -g clawedcode
 ```
 
-This downloads a platform-specific `clawedcode-bin` from GitHub Releases on install (and also lazily on first run if needed).
+This downloads a platform-specific `clawedcode-bin` from GitHub Releases during install (and also lazily on first run if needed).
 
-## Current status
+## Usage
 
-This repository now has a clean Rust baseline with:
-
-- a real CLI entrypoint
-- compatibility discovery for existing config, skills, and MCP files
-- persisted config and session storage
-- a built-in system prompt registry
-- a starter runtime loop
-- a Ratatui shell for the interactive path
-
-## Commands
+Start the interactive REPL:
 
 ```bash
-cargo run -- config
-cargo run -- compat
-cargo run -- run --prompt "inspect this workspace"
-cargo run -- tui
+clawedcode
 ```
 
-## Layout
+Run a single prompt non-interactively:
 
-- `crates/`: Rust workspace crates (`clawedcode` CLI + core/libs)
-- `docs/`: architecture and implementation notes
+```bash
+clawedcode run --prompt "inspect this workspace"
+```
 
 ## Direction
 
-The implementation is intentionally small in the first pass. The next layer is the execution engine: model adapters, approval handling, transcript streaming, tool dispatch, and task orchestration.
+The focus is: terminal UX, compatibility research, and a clean Rust implementation of boot flow, provider streaming, tools/permissions, MCP, and agent orchestration.
