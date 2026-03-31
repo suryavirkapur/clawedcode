@@ -1,0 +1,6 @@
+/target
+clank-src/
+.env
+.env.*
+*.log
+.DS_Store
