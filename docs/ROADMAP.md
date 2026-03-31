@@ -28,7 +28,7 @@ Already done:
 
 Not done:
 
-- [ ] MCP connections and discovery
+- [ ] MCP resources/helper tools and non-stdio transports
 - [x] Session compaction / context trimming
 - [ ] sub-agents
 - [ ] remote/direct-connect/ssh modes
@@ -197,11 +197,11 @@ The app should restore useful context instead of only loading raw transcript tex
 
 ### Deliverables
 
-- [ ] Merge MCP config from settings and project files
+- [x] Merge MCP config from settings and project files
 - [ ] Connection state model
-- [ ] Stdio transport
+- [x] Stdio transport
 - [ ] HTTP/SSE transport
-- [ ] Tool discovery
+- [x] Tool discovery
 - [ ] Resource discovery
 - [ ] MCP-backed helper tools for resource listing/reading
 
@@ -213,6 +213,13 @@ cargo run -- run --prompt "list available MCP tools"
 ```
 
 The runtime should surface connected MCP tools and resources as part of the session.
+
+Current status:
+
+- stdio MCP servers are discovered from settings and ancestor `.mcp.json` files
+- MCP tools are surfaced into the runtime as namespaced tools
+- MCP stdio tool execution works end-to-end
+- resource discovery/helper tools and non-stdio transports are still pending
 
 ## Phase 8: Commands, Skills, And Dynamic Command Surface
 
