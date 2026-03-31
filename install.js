@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const VERSION = '0.0.1';
+const VERSION = require('./package.json').version;
 const REPO = 'suryavirkapur/clawedcode';
 
 function getPlatform() {
@@ -37,31 +37,49 @@ function getPlatform() {
 function download(url, dest) {
   return new Promise((resolve, reject) => {
     const protocol = url.startsWith('https') ? https : http;
-    const file = fs.createWriteStream(dest);
+    const tmpDest = `${dest}.tmp`;
+    const file = fs.createWriteStream(tmpDest);
 
     protocol.get(url, (response) => {
       if (response.statusCode === 302 || response.statusCode === 301) {
-        download(response.headers.location, dest).then(resolve).catch(reject);
+        file.close(() => {
+          fs.rmSync(tmpDest, { force: true });
+          download(response.headers.location, dest).then(resolve).catch(reject);
+        });
         return;
       }
       if (response.statusCode !== 200) {
-        reject(new Error(`Failed to download: ${response.statusCode}`));
+        file.close(() => {
+          fs.rmSync(tmpDest, { force: true });
+          reject(new Error(`Failed to download: ${response.statusCode}`));
+        });
         return;
       }
       response.pipe(file);
       file.on('finish', () => {
-        file.close();
-        fs.chmodSync(dest, 0o755);
-        resolve();
+        file.close(() => {
+          fs.renameSync(tmpDest, dest);
+          fs.chmodSync(dest, 0o755);
+          resolve();
+        });
       });
-    }).on('error', reject);
+    }).on('error', (err) => {
+      file.close(() => {
+        fs.rmSync(tmpDest, { force: true });
+        reject(err);
+      });
+    });
   });
 }
 
 async function main() {
+  if (process.env.CLAWEDCODE_SKIP_DOWNLOAD === '1') {
+    console.log('Skipping binary download (CLAWEDCODE_SKIP_DOWNLOAD=1)');
+    return;
+  }
+
   const { osName, target, ext } = getPlatform();
   const binName = `clawedcode-${target}-${osName}${ext}`;
-  const url = `https://github.com/${REPO}/releases/download/v${VERSION}/${binName}`;
   const binDir = path.join(__dirname, 'bin');
   const binPath = path.join(binDir, `clawedcode-bin${ext}`);
 
@@ -69,6 +87,19 @@ async function main() {
     fs.mkdirSync(binDir, { recursive: true });
   }
 
+  const assetDir = process.env.CLAWEDCODE_ASSET_DIR;
+  if (assetDir) {
+    const src = path.join(assetDir, binName);
+    if (!fs.existsSync(src)) {
+      throw new Error(`Asset not found: ${src}`);
+    }
+    fs.copyFileSync(src, binPath);
+    fs.chmodSync(binPath, 0o755);
+    console.log(`Installed from local assets: ${src}`);
+    return;
+  }
+
+  const url = `https://github.com/${REPO}/releases/download/v${VERSION}/${binName}`;
   console.log(`Downloading clawedcode ${VERSION} for ${target}-${osName}...`);
   await download(url, binPath);
   console.log(`Installed to ${binPath}`);

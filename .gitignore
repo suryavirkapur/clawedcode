@@ -4,3 +4,7 @@ clank-src/
 .env.*
 *.log
 .DS_Store
+node_modules/
+bin/clawedcode-bin*
+clawedcode-*.tgz
+.npm/

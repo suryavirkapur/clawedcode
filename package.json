@@ -2,6 +2,13 @@
   "name": "clawedcode",
   "version": "0.0.1",
   "description": "A coding agent shell focused on startup speed, terminal UX, and compatibility",
+  "files": [
+    "bin/",
+    "install.js",
+    "README.md",
+    "LICENSE",
+    "package.json"
+  ],
   "bin": {
     "clawedcode": "bin/clawedcode"
   },

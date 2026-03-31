@@ -2,6 +2,32 @@
 
 ClawedCode is an educational Rust-native reimplementation of a coding agent shell, focused on startup speed, terminal UX, and compatibility research.
 
+## Install
+
+### Cargo (Rust)
+
+From crates.io:
+
+```bash
+cargo install clawedcode
+```
+
+From source (this repo):
+
+```bash
+cargo install --path crates/clawedcode-cli
+```
+
+### npm (prebuilt binaries)
+
+Global install:
+
+```bash
+npm install -g clawedcode
+```
+
+This downloads a platform-specific `clawedcode-bin` from GitHub Releases on install (and also lazily on first run if needed).
+
 ## Current status
 
 This repository now has a clean Rust baseline with:
@@ -24,14 +50,7 @@ cargo run -- tui
 
 ## Layout
 
-- `src/app.rs`: top-level application flow
-- `src/cli.rs`: command-line parsing
-- `src/config.rs`: config loading and defaults
-- `src/prompt.rs`: built-in prompt packs
-- `src/runtime.rs`: session lifecycle and request submission
-- `src/session.rs`: transcript persistence
-- `src/tool.rs`: tool registry and metadata
-- `src/tui.rs`: interactive terminal surface
+- `crates/`: Rust workspace crates (`clawedcode` CLI + core/libs)
 - `docs/`: architecture and implementation notes
 
 ## Direction
