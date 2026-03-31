@@ -32,6 +32,7 @@ enum AppState {
 
 struct ReplHandler {
     transcript_lines: Vec<String>,
+    overlay_lines: Vec<String>,
     state: AppState,
 }
 
@@ -39,50 +40,45 @@ impl ReplHandler {
     fn new() -> Self {
         Self {
             transcript_lines: Vec::new(),
+            overlay_lines: Vec::new(),
             state: AppState::Idle,
         }
+    }
+
+    fn rebuild_from_session(&mut self, session: &clawedcode_core::session::Session) {
+        self.transcript_lines.clear();
+        for msg in &session.messages {
+            append_message_to_transcript(&mut self.transcript_lines, msg);
+        }
+    }
+
+    fn visible_lines(&self) -> Vec<String> {
+        let mut lines = self.transcript_lines.clone();
+        lines.extend(self.overlay_lines.iter().cloned());
+        lines
+    }
+
+    fn push_overlay(&mut self, line: impl Into<String>) {
+        self.overlay_lines.push(line.into());
     }
 }
 
 impl TuiHandler for ReplHandler {
     fn on_event(&mut self, event: &TuiEvent) {
         match event {
-            TuiEvent::ThinkingDelta { text } => {
-                self.transcript_lines.push(format!("[thinking] {text}"));
-            }
-            TuiEvent::MessageDelta { text } => {
-                self.transcript_lines.push(format!("[assistant] {text}"));
-            }
-            TuiEvent::ToolUse { name, input, .. } => {
-                self.transcript_lines.push(format!(
-                    "[tool_use] {name} {}",
-                    serde_json::to_string(input).unwrap_or_default()
-                ));
-            }
-            TuiEvent::ToolResult {
-                tool_use_id,
-                content,
-                is_error,
-            } => {
-                let prefix = if *is_error {
-                    "[tool_error]"
-                } else {
-                    "[tool_result]"
-                };
-                self.transcript_lines
-                    .push(format!("{prefix} {tool_use_id}: {content}"));
-            }
-            TuiEvent::AssistantDone => {
-                self.state = AppState::Idle;
-            }
-            TuiEvent::TurnComplete => {
+            TuiEvent::ThinkingDelta { .. }
+            | TuiEvent::MessageDelta { .. }
+            | TuiEvent::ToolUse { .. }
+            | TuiEvent::ToolResult { .. }
+            | TuiEvent::AssistantDone
+            | TuiEvent::TurnComplete => {
                 self.state = AppState::Idle;
             }
         }
     }
 
     fn request_approval(&mut self, request: &ApprovalRequest) -> bool {
-        self.transcript_lines.push(format!(
+        self.push_overlay(format!(
             "[approval] Tool '{}' requires approval. Input: {}",
             request.tool_name,
             serde_json::to_string(&request.input).unwrap_or_default()
@@ -94,10 +90,7 @@ impl TuiHandler for ReplHandler {
 
 fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     let mut handler = ReplHandler::new();
-
-    for msg in ctx.session().messages.iter() {
-        append_message_to_transcript(&mut handler.transcript_lines, msg);
-    }
+    handler.rebuild_from_session(ctx.session());
 
     let mut input_buffer = String::new();
     let mut cursor_pos: usize = 0;
@@ -124,7 +117,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 .block(Block::default().borders(Borders::ALL))
                 .style(Style::default().fg(Color::Cyan));
 
-            let transcript_text = handler.transcript_lines.join("\n");
+            let transcript_text = handler.visible_lines().join("\n");
             let transcript = Paragraph::new(transcript_text)
                 .block(Block::default().title("Transcript").borders(Borders::ALL))
                 .wrap(Wrap { trim: false })
@@ -184,31 +177,25 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                     match key.code {
                         KeyCode::Char('y') | KeyCode::Char('Y') => {
                             let req = awaiting_approval.take().unwrap();
-                            handler
-                                .transcript_lines
-                                .push(format!("[approval] Approved '{}'", req.tool_name));
+                            handler.push_overlay(format!("[approval] Approved '{}'", req.tool_name));
                             execute_tool_with_approval(ctx, &mut handler, &req, true);
+                            handler.rebuild_from_session(ctx.session());
                         }
                         KeyCode::Char('n') | KeyCode::Char('N') => {
                             let req = awaiting_approval.take().unwrap();
-                            handler
-                                .transcript_lines
-                                .push(format!("[approval] Denied '{}'", req.tool_name));
-                            handler.transcript_lines.push(format!(
-                                "[tool_error] {}: Tool '{}' denied by user",
-                                req.tool_use_id, req.tool_name
-                            ));
+                            handler.push_overlay(format!("[approval] Denied '{}'", req.tool_name));
                             let result_block = ContentBlock::tool_error(
                                 &req.tool_use_id,
                                 format!("Tool '{}' denied by user", req.tool_name),
                             );
                             ctx.session_mut()
                                 .push_blocks(Role::Tool, vec![result_block]);
+                            handler.rebuild_from_session(ctx.session());
                         }
                         _ => {}
                     }
                     scroll_offset = handler
-                        .transcript_lines
+                        .visible_lines()
                         .len()
                         .saturating_sub(chunks[1].height.saturating_sub(2) as usize);
                     continue;
@@ -223,20 +210,15 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                     }
                     KeyCode::Enter => {
                         if !input_buffer.trim().is_empty() {
-                            let prompt = input_buffer.clone();
-                            handler.transcript_lines.push(format!("[user] {prompt}"));
+                            let prompt = input_buffer.trim().to_string();
                             input_buffer.clear();
                             cursor_pos = 0;
 
-                            ctx.submit_interactive(&prompt, &mut handler);
-
-                            for msg in ctx.session().messages.iter().rev().take(3) {
-                                if msg.role != Role::User {
-                                    append_message_to_transcript(
-                                        &mut handler.transcript_lines,
-                                        msg,
-                                    );
-                                }
+                            if handle_slash_command(ctx, &mut handler, &prompt)? {
+                                handler.rebuild_from_session(ctx.session());
+                            } else {
+                                ctx.submit_interactive(&prompt, &mut handler);
+                                handler.rebuild_from_session(ctx.session());
                             }
 
                             if let Some(req) = check_for_pending_approval(ctx, &handler) {
@@ -283,7 +265,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 }
 
                 scroll_offset = handler
-                    .transcript_lines
+                    .visible_lines()
                     .len()
                     .saturating_sub(chunks[1].height.saturating_sub(2) as usize);
             }
@@ -358,7 +340,7 @@ fn check_for_pending_approval(ctx: &TuiContext, _handler: &ReplHandler) -> Optio
 
 fn execute_tool_with_approval(
     ctx: &mut TuiContext,
-    handler: &mut ReplHandler,
+    _handler: &mut ReplHandler,
     req: &ApprovalRequest,
     approved: bool,
 ) {
@@ -375,14 +357,6 @@ fn execute_tool_with_approval(
             is_error,
         } = result
         {
-            let prefix = if is_error {
-                "[tool_error]"
-            } else {
-                "[tool_result]"
-            };
-            handler
-                .transcript_lines
-                .push(format!("{prefix} {tool_use_id}: {content}"));
             ctx.session_mut().push_blocks(
                 Role::Tool,
                 vec![ContentBlock::ToolResult {
@@ -393,10 +367,6 @@ fn execute_tool_with_approval(
             );
         }
     } else {
-        handler.transcript_lines.push(format!(
-            "[tool_error] {}: Tool '{}' denied by user",
-            req.tool_use_id, req.tool_name
-        ));
         ctx.session_mut().push_blocks(
             Role::Tool,
             vec![ContentBlock::tool_error(
@@ -405,6 +375,48 @@ fn execute_tool_with_approval(
             )],
         );
     }
+}
+
+fn handle_slash_command(
+    ctx: &mut TuiContext,
+    handler: &mut ReplHandler,
+    prompt: &str,
+) -> Result<bool> {
+    if !prompt.starts_with('/') {
+        return Ok(false);
+    }
+
+    let command = prompt.split_whitespace().next().unwrap_or(prompt);
+    match command {
+        "/help" => {
+            handler.push_overlay("[system] Built-in commands:");
+            handler.push_overlay("[system] /help   Show available REPL commands");
+            handler.push_overlay("[system] /update Update clawedcode using npm or cargo, depending on how it was installed");
+            handler.push_overlay("[system] /clear  Clear local transcript overlays");
+        }
+        "/clear" => {
+            handler.overlay_lines.clear();
+        }
+        "/update" => match clawedcode_core::update::run_self_update() {
+            Ok(outcome) => {
+                handler.push_overlay(format!(
+                    "[system] Updated clawedcode via {:?} using `{}`",
+                    outcome.method, outcome.command
+                ));
+            }
+            Err(err) => {
+                handler.push_overlay(format!("[system] Update failed: {err}"));
+            }
+        },
+        other => {
+            handler.push_overlay(format!(
+                "[system] Unknown command `{other}`. Use `/help`."
+            ));
+        }
+    }
+
+    let _ = ctx.save_session();
+    Ok(true)
 }
 
 fn is_write_like(tool_name: &str) -> bool {

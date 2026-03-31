@@ -23,6 +23,7 @@ pub enum ExecutionMode {
     Continue(ContinueMode),
     Config,
     Compat,
+    Update,
     Headless(HeadlessMode),
     DirectConnect(DirectConnectMode),
     Ssh(SshMode),
@@ -124,6 +125,7 @@ pub fn resolve_mode(cli: &Cli) -> Result<ExecutionMode> {
         })),
         Command::Config => Ok(ExecutionMode::Config),
         Command::Compat => Ok(ExecutionMode::Compat),
+        Command::Update => Ok(ExecutionMode::Update),
         Command::Headless => Err(anyhow::anyhow!("headless mode is not yet implemented")),
         Command::DirectConnect => Err(anyhow::anyhow!(
             "direct-connect mode is not yet implemented"
@@ -272,6 +274,13 @@ mod tests {
         let cli = make_cli(Command::Compat);
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Compat));
+    }
+
+    #[test]
+    fn test_resolve_mode_update() {
+        let cli = make_cli(Command::Update);
+        let mode = resolve_mode(&cli).unwrap();
+        assert!(matches!(mode, ExecutionMode::Update));
     }
 
     #[test]
