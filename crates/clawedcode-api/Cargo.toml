@@ -10,5 +10,5 @@ readme.workspace = true
 
 [dependencies]
 serde.workspace = true
-clawedcode-mcp = { path = "../clawedcode-mcp", version = "0.0.1" }
-clawedcode-tools = { path = "../clawedcode-tools", version = "0.0.1" }
+clawedcode-mcp = { path = "../clawedcode-mcp", version = "0.0.2" }
+clawedcode-tools = { path = "../clawedcode-tools", version = "0.0.2" }
