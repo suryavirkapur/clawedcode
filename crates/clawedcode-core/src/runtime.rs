@@ -149,6 +149,17 @@ impl Runtime {
             .collect()
     }
 
+    fn effective_system_prompt_body(&self) -> String {
+        if self.compatibility.memory.trim().is_empty() {
+            self.system_prompt.body.to_string()
+        } else {
+            format!(
+                "{}\n\n## Loaded Memory\n{}",
+                self.system_prompt.body, self.compatibility.memory
+            )
+        }
+    }
+
     pub fn build_request(&self, session: &Session) -> CompletionRequest {
         let limit = self.config.runtime.session_history_limit;
         let messages = Self::trim_session_messages(&session.messages, limit);
@@ -156,7 +167,7 @@ impl Runtime {
             model: self.config.model.clone(),
             prompt_pack: self.config.prompts.default_prompt_pack.clone(),
             system_prompt_name: self.system_prompt.name.to_string(),
-            system_prompt_body: self.system_prompt.body.to_string(),
+            system_prompt_body: self.effective_system_prompt_body(),
             prompt: session.last_user_text().unwrap_or_default().to_string(),
             messages: messages
                 .iter()
@@ -614,6 +625,8 @@ mod tests {
             settings_files: vec![],
             settings: serde_json::Value::Null,
             skills: vec![],
+            memory_files: vec![],
+            memory: String::new(),
             mcp_servers: std::collections::BTreeMap::new(),
         };
         Runtime::with_provider(
@@ -636,6 +649,8 @@ mod tests {
             settings_files: vec![],
             settings: serde_json::Value::Null,
             skills: vec![],
+            memory_files: vec![],
+            memory: String::new(),
             mcp_servers: std::collections::BTreeMap::new(),
         };
         Runtime::with_provider(
@@ -798,6 +813,8 @@ mod tests {
             settings_files: vec![],
             settings: serde_json::Value::Null,
             skills: vec![],
+            memory_files: vec![],
+            memory: String::new(),
             mcp_servers: std::collections::BTreeMap::new(),
         };
         let runtime = Runtime::with_provider(
@@ -834,6 +851,8 @@ mod tests {
             settings_files: vec![],
             settings: serde_json::Value::Null,
             skills: vec![],
+            memory_files: vec![],
+            memory: String::new(),
             mcp_servers: std::collections::BTreeMap::new(),
         };
         let runtime = Runtime::with_provider(
@@ -947,6 +966,8 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
             settings_files: vec![],
             settings: serde_json::Value::Null,
             skills: vec![],
+            memory_files: vec![],
+            memory: String::new(),
             mcp_servers: std::collections::BTreeMap::new(),
         };
         let runtime = Runtime::with_provider(
@@ -993,6 +1014,8 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
             settings_files: vec![],
             settings: serde_json::Value::Null,
             skills: vec![],
+            memory_files: vec![],
+            memory: String::new(),
             mcp_servers: std::collections::BTreeMap::new(),
         };
         let runtime = Runtime::with_provider(
@@ -1033,6 +1056,8 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
             settings_files: vec![],
             settings: serde_json::Value::Null,
             skills: vec![],
+            memory_files: vec![],
+            memory: String::new(),
             mcp_servers: std::collections::BTreeMap::new(),
         };
         let runtime = Runtime::with_provider(
@@ -1073,5 +1098,37 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
             ]
         );
         assert_eq!(request.messages.len(), 4);
+    }
+
+    #[test]
+    fn build_request_includes_merged_memory_in_system_prompt_body() {
+        let config = AppConfig::default();
+        let prompt_spec = PromptSpec {
+            name: "test",
+            summary: "test",
+            body: "You are a test assistant.",
+        };
+        let compat = CompatibilitySnapshot {
+            settings_files: vec![],
+            settings: serde_json::Value::Null,
+            skills: vec![],
+            memory_files: vec![],
+            memory: "Follow the project rule.".to_string(),
+            mcp_servers: std::collections::BTreeMap::new(),
+        };
+        let runtime = Runtime::with_provider(
+            config,
+            prompt_spec,
+            compat,
+            PermissionMode::Default,
+            Box::new(MockProvider),
+        );
+
+        let session = runtime.start_session(PathBuf::from("/tmp"));
+        let request = runtime.build_request(&session);
+
+        assert!(request.system_prompt_body.contains("You are a test assistant."));
+        assert!(request.system_prompt_body.contains("## Loaded Memory"));
+        assert!(request.system_prompt_body.contains("Follow the project rule."));
     }
 }

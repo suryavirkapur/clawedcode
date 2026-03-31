@@ -13,6 +13,8 @@ pub struct CompatibilitySnapshot {
     pub settings_files: Vec<PathBuf>,
     pub settings: Value,
     pub skills: Vec<SkillDescriptor>,
+    pub memory_files: Vec<PathBuf>,
+    pub memory: String,
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
 }
 
@@ -34,12 +36,15 @@ struct SkillFrontmatter {
 pub fn discover(cwd: &Path) -> Result<CompatibilitySnapshot> {
     let (settings_files, settings) = discover_settings(cwd)?;
     let skills = discover_skills(cwd)?;
+    let (memory_files, memory) = discover_memory(cwd)?;
     let mcp_servers = discover_mcp_servers(cwd, &settings)?;
 
     Ok(CompatibilitySnapshot {
         settings_files,
         settings,
         skills,
+        memory_files,
+        memory,
         mcp_servers,
     })
 }
@@ -106,6 +111,106 @@ fn discover_skills(cwd: &Path) -> Result<Vec<SkillDescriptor>> {
     discovered.sort_by(|a, b| a.name.cmp(&b.name).then(a.path.cmp(&b.path)));
     discovered.dedup_by(|a, b| a.path == b.path);
     Ok(discovered)
+}
+
+fn discover_memory(cwd: &Path) -> Result<(Vec<PathBuf>, String)> {
+    let mut memory_files = Vec::new();
+    let mut sections = Vec::new();
+
+    for path in memory_search_paths(cwd, claude_home().as_deref())? {
+        if !path.exists() {
+            continue;
+        }
+
+        let expanded = expand_memory_file(&path, &mut Vec::new(), 0)?;
+        if expanded.trim().is_empty() {
+            continue;
+        }
+
+        memory_files.push(path.clone());
+        sections.push(format!("<!-- {} -->\n{}", path.display(), expanded.trim()));
+    }
+
+    Ok((memory_files, sections.join("\n\n")))
+}
+
+fn memory_search_paths(cwd: &Path, claude_home: Option<&Path>) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+
+    if let Some(home) = claude_home {
+        paths.push(home.join("CLAUDE.md"));
+    }
+
+    let mut ancestors: Vec<PathBuf> = cwd.ancestors().map(PathBuf::from).collect();
+    ancestors.reverse();
+
+    for ancestor in ancestors {
+        paths.push(ancestor.join("CLAUDE.md"));
+
+        let rules_dir = ancestor.join(".claude").join("rules");
+        if rules_dir.is_dir() {
+            let mut rule_paths: Vec<PathBuf> = fs::read_dir(&rules_dir)
+                .with_context(|| format!("failed to read {}", rules_dir.display()))?
+                .filter_map(|entry| entry.ok().map(|e| e.path()))
+                .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
+                .collect();
+            rule_paths.sort();
+            paths.extend(rule_paths);
+        }
+    }
+
+    Ok(paths)
+}
+
+fn expand_memory_file(path: &Path, stack: &mut Vec<PathBuf>, depth: usize) -> Result<String> {
+    const MAX_MEMORY_INCLUDE_DEPTH: usize = 16;
+
+    if depth >= MAX_MEMORY_INCLUDE_DEPTH {
+        return Ok(String::new());
+    }
+
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if stack.contains(&canonical) {
+        return Ok(String::new());
+    }
+
+    let raw = fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    stack.push(canonical);
+
+    let mut expanded = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if let Some(include_target) = trimmed.strip_prefix("@include ") {
+            let include_path = resolve_include_path(path, include_target.trim());
+            let nested = expand_memory_file(&include_path, stack, depth + 1)?;
+            if !nested.trim().is_empty() {
+                expanded.push(nested);
+            }
+        } else {
+            expanded.push(line.to_string());
+        }
+    }
+
+    stack.pop();
+    Ok(expanded.join("\n"))
+}
+
+fn resolve_include_path(source: &Path, target: &str) -> PathBuf {
+    if let Some(rest) = target.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+
+    let target_path = PathBuf::from(target);
+    if target_path.is_absolute() {
+        return target_path;
+    }
+
+    source
+        .parent()
+        .map(|parent| parent.join(target_path.clone()))
+        .unwrap_or(target_path)
 }
 
 fn discover_skills_in_root(root: &Path, out: &mut Vec<SkillDescriptor>) -> Result<()> {
@@ -225,5 +330,121 @@ fn deep_merge(target: &mut Value, source: Value) {
             }
         }
         (target_slot, source_value) => *target_slot = source_value,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("clawed_compat_{name}_{unique}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn memory_search_paths_orders_user_then_project_then_rules() {
+        let root = temp_dir("memory_paths");
+        let home = root.join("home");
+        let project = root.join("project");
+        let nested = project.join("apps").join("api");
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::create_dir_all(project.join(".claude").join("rules")).unwrap();
+        fs::create_dir_all(nested.clone()).unwrap();
+        let rule_file = project.join(".claude").join("rules").join("10-style.md");
+        fs::write(&rule_file, "rule").unwrap();
+
+        let paths = memory_search_paths(&nested, Some(&home.join(".claude"))).unwrap();
+
+        assert_eq!(paths[0], home.join(".claude").join("CLAUDE.md"));
+        assert!(paths.iter().any(|p| p == &project.join("CLAUDE.md")));
+        assert!(paths.iter().any(|p| p == &rule_file));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn expand_memory_file_resolves_relative_and_absolute_includes() {
+        let root = temp_dir("includes");
+        let main = root.join("CLAUDE.md");
+        let rel = root.join("relative.md");
+        let abs = root.join("absolute.md");
+
+        fs::write(&rel, "relative content").unwrap();
+        fs::write(&abs, "absolute content").unwrap();
+        fs::write(
+            &main,
+            format!(
+                "start\n@include relative.md\nmiddle\n@include {}\nend",
+                abs.display()
+            ),
+        )
+        .unwrap();
+
+        let expanded = expand_memory_file(&main, &mut Vec::new(), 0).unwrap();
+        assert!(expanded.contains("start"));
+        assert!(expanded.contains("relative content"));
+        assert!(expanded.contains("absolute content"));
+        assert!(expanded.contains("end"));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn expand_memory_file_avoids_include_cycles() {
+        let root = temp_dir("cycles");
+        let a = root.join("a.md");
+        let b = root.join("b.md");
+
+        fs::write(&a, "@include b.md\nfrom a").unwrap();
+        fs::write(&b, "@include a.md\nfrom b").unwrap();
+
+        let expanded = expand_memory_file(&a, &mut Vec::new(), 0).unwrap();
+        assert!(expanded.contains("from a"));
+        assert!(expanded.contains("from b"));
+        assert_eq!(expanded.matches("from a").count(), 1);
+        assert_eq!(expanded.matches("from b").count(), 1);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn discover_memory_merges_layers_in_priority_order() {
+        let root = temp_dir("layers");
+        let home = root.join("home");
+        let project = root.join("project");
+        let nested = project.join("apps").join("api");
+
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::create_dir_all(project.join(".claude").join("rules")).unwrap();
+        fs::create_dir_all(nested.clone()).unwrap();
+
+        fs::write(home.join(".claude").join("CLAUDE.md"), "user memory").unwrap();
+        fs::write(project.join("CLAUDE.md"), "project memory").unwrap();
+        fs::write(
+            project.join(".claude").join("rules").join("10-style.md"),
+            "rule memory",
+        )
+        .unwrap();
+
+        // SAFETY: test-scoped env manipulation.
+        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", home.join(".claude")) };
+        let (files, memory) = discover_memory(&nested).unwrap();
+        unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
+
+        assert_eq!(files.len(), 3);
+        let user_idx = memory.find("user memory").unwrap();
+        let project_idx = memory.find("project memory").unwrap();
+        let rule_idx = memory.find("rule memory").unwrap();
+        assert!(user_idx < project_idx);
+        assert!(project_idx < rule_idx);
+
+        fs::remove_dir_all(root).ok();
     }
 }
