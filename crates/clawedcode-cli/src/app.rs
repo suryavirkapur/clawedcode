@@ -52,9 +52,7 @@ pub async fn execute(boot: BootstrappedApp) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&compatibility)?);
             Ok(())
         }
-        ExecutionMode::Run(run_mode) => {
-            execute_run(cli, config, compatibility, run_mode).await
-        }
+        ExecutionMode::Run(run_mode) => execute_run(cli, config, compatibility, run_mode).await,
         ExecutionMode::Resume(resume_mode) => {
             execute_resume(cli, config, compatibility, resume_mode).await
         }
@@ -104,16 +102,12 @@ async fn execute_resume(
     resume_mode: crate::bootstrap::ResumeMode,
 ) -> Result<()> {
     let data_dir = cli.data_dir.clone();
-    let sessions_dir = session_store_dir(data_dir.clone())
-        .context("no sessions directory available")?;
+    let sessions_dir =
+        session_store_dir(data_dir.clone()).context("no sessions directory available")?;
     let mut session = Session::load_by_id(&sessions_dir, &resume_mode.session_id)
         .with_context(|| format!("failed to load session {}", resume_mode.session_id))?;
 
-    let runtime = Runtime::new(
-        config,
-        resolve_prompt(None),
-        compatibility,
-    );
+    let runtime = Runtime::new(config, resolve_prompt(None), compatibility);
 
     let output = if let Some(prompt) = resume_mode.prompt.clone() {
         runtime.submit(&mut session, &prompt)
@@ -140,19 +134,15 @@ async fn execute_continue(
     continue_mode: crate::bootstrap::ContinueMode,
 ) -> Result<()> {
     let data_dir = cli.data_dir.clone();
-    let sessions_dir = session_store_dir(data_dir.clone())
-        .context("no sessions directory available")?;
+    let sessions_dir =
+        session_store_dir(data_dir.clone()).context("no sessions directory available")?;
 
-    let latest_session = find_latest_session(&sessions_dir)
-        .context("no sessions found to continue")?;
+    let latest_session =
+        find_latest_session(&sessions_dir).context("no sessions found to continue")?;
 
     let mut session = latest_session;
 
-    let runtime = Runtime::new(
-        config,
-        resolve_prompt(None),
-        compatibility,
-    );
+    let runtime = Runtime::new(config, resolve_prompt(None), compatibility);
 
     let output = runtime.submit(&mut session, &continue_mode.prompt);
 
@@ -175,8 +165,12 @@ fn session_store_dir(explicit_data_dir: Option<PathBuf>) -> Option<PathBuf> {
 }
 
 fn find_latest_session(sessions_dir: &PathBuf) -> Result<Session> {
-    let entries = std::fs::read_dir(sessions_dir)
-        .with_context(|| format!("failed to read sessions directory {}", sessions_dir.display()))?;
+    let entries = std::fs::read_dir(sessions_dir).with_context(|| {
+        format!(
+            "failed to read sessions directory {}",
+            sessions_dir.display()
+        )
+    })?;
 
     let mut sessions: Vec<Session> = Vec::new();
     for entry in entries.flatten() {

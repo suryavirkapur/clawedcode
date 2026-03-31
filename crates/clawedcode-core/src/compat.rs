@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clawedcode_mcp::{discover_mcp_servers as parse_settings_mcp_servers, McpServerConfig};
+use clawedcode_mcp::{McpServerConfig, discover_mcp_servers as parse_settings_mcp_servers};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{

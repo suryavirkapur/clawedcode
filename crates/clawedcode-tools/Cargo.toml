@@ -10,3 +10,5 @@ readme.workspace = true
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
