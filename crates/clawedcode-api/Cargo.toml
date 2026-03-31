@@ -1,0 +1,14 @@
+[package]
+name = "clawedcode-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "API layer for clawedcode"
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+serde.workspace = true
+clawedcode-mcp = { path = "../clawedcode-mcp" }
+clawedcode-tools = { path = "../clawedcode-tools" }

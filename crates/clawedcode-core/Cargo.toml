@@ -1,0 +1,22 @@
+[package]
+name = "clawedcode-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Core functionality for clawedcode"
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+directories.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+toml.workspace = true
+uuid.workspace = true
+clawedcode-api = { path = "../clawedcode-api" }
+clawedcode-mcp = { path = "../clawedcode-mcp" }
+clawedcode-tools = { path = "../clawedcode-tools" }

@@ -1,6 +1,6 @@
 # ClawedCode
 
-ClawedCode is a Rust-native coding agent shell aimed at lower startup overhead, clearer runtime boundaries, and a terminal-first UX.
+ClawedCode is an educational Rust-native reimplementation of a coding agent shell, focused on startup speed, terminal UX, and compatibility research.
 
 ## Current status
 
@@ -36,4 +36,4 @@ cargo run -- tui
 
 ## Direction
 
-The implementation is intentionally small in the first pass. The next layer is the actual execution engine: model adapters, approval handling, transcript streaming, tool dispatch, and task orchestration.
+The implementation is intentionally small in the first pass. The next layer is the execution engine: model adapters, approval handling, transcript streaming, tool dispatch, and task orchestration.
