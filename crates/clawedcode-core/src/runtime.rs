@@ -12,12 +12,12 @@ use serde::Serialize;
 use std::{collections::HashMap, path::PathBuf};
 
 pub struct Runtime {
-    config: AppConfig,
-    system_prompt: PromptSpec,
-    tools: Vec<ToolSpec>,
+    pub(crate) config: AppConfig,
+    pub(crate) system_prompt: PromptSpec,
+    pub(crate) tools: Vec<ToolSpec>,
     tool_instances: HashMap<String, Box<dyn Tool>>,
-    compatibility: CompatibilitySnapshot,
-    api_client: MockApiClient,
+    pub(crate) compatibility: CompatibilitySnapshot,
+    pub(crate) api_client: MockApiClient,
     permission_engine: PermissionEngine,
 }
 
@@ -178,7 +178,7 @@ impl Runtime {
         }
     }
 
-    fn execute_tool(
+    pub fn execute_tool(
         &self,
         tool_use_id: &str,
         tool_name: &str,

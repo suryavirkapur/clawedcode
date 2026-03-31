@@ -12,3 +12,5 @@ readme.workspace = true
 anyhow.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
+serde_json.workspace = true
+clawedcode-core = { path = "../clawedcode-core", version = "0.0.2" }

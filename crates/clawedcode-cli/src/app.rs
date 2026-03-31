@@ -3,6 +3,7 @@ use clawedcode_core::{
     compat,
     config::AppConfig,
     config::default_data_dir,
+    interactive::TuiContext,
     prompt::{builtin_prompts, resolve_prompt},
     runtime::Runtime,
     session::Session,
@@ -35,7 +36,18 @@ pub async fn execute(boot: BootstrappedApp) -> Result<()> {
     let compatibility = boot.compatibility;
 
     match mode {
-        ExecutionMode::Tui => tui::run(),
+        ExecutionMode::Tui => {
+            let sessions_dir = session_store_dir(cli.data_dir.clone())
+                .context("no sessions directory available")?;
+            let ctx = TuiContext::new(
+                config,
+                resolve_prompt(None),
+                compatibility,
+                cli.cwd,
+                sessions_dir,
+            );
+            tui::run_with_context(ctx)
+        }
         ExecutionMode::Config => {
             let prompt_names = builtin_prompts().iter().map(|item| item.name).collect();
             let tool_names = builtin_tools().iter().map(|item| item.name).collect();
