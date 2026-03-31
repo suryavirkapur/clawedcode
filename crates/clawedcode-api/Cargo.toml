@@ -10,5 +10,16 @@ readme.workspace = true
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+pin-project-lite.workspace = true
+reqwest = { version = "0.12", features = ["json", "stream"], optional = true }
 clawedcode-mcp = { path = "../clawedcode-mcp", version = "0.0.2" }
 clawedcode-tools = { path = "../clawedcode-tools", version = "0.0.2" }
+
+[features]
+default = []
+anthropic = ["dep:reqwest"]

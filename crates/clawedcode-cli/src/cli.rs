@@ -39,6 +39,8 @@ pub enum Command {
         system_prompt: Option<String>,
         #[arg(long)]
         json: bool,
+        #[arg(long)]
+        show_thinking: bool,
     },
     /// Resume a previous session by ID.
     Resume {
@@ -48,6 +50,8 @@ pub enum Command {
         prompt: Option<String>,
         #[arg(long)]
         json: bool,
+        #[arg(long)]
+        show_thinking: bool,
     },
     /// Continue the most recent session.
     Continue {
@@ -55,6 +59,8 @@ pub enum Command {
         prompt: String,
         #[arg(long)]
         json: bool,
+        #[arg(long)]
+        show_thinking: bool,
     },
     /// Print the resolved configuration.
     Config,
@@ -165,6 +171,7 @@ mod tests {
             prompt: "hello".to_string(),
             system_prompt: None,
             json: false,
+            show_thinking: false,
         }));
         assert_eq!(cli.classify_intent(), Intent::Headless);
     }
@@ -175,6 +182,7 @@ mod tests {
             session_id: "abc".to_string(),
             prompt: None,
             json: false,
+            show_thinking: false,
         }));
         assert_eq!(cli.classify_intent(), Intent::Resume);
     }
@@ -184,6 +192,7 @@ mod tests {
         let cli = make_cli(Some(Command::Continue {
             prompt: "go on".to_string(),
             json: false,
+            show_thinking: false,
         }));
         assert_eq!(cli.classify_intent(), Intent::Continue);
     }

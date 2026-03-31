@@ -6,8 +6,11 @@ use crate::{
     prompt::PromptSpec,
     session::{Role, Session},
 };
-use clawedcode_api::{ApiClient, ApiEvent, CompletionRequest, CompletionResponse, MockApiClient};
+use clawedcode_api::{
+    ApiEvent, BoxedProvider, CompletionRequest, CompletionResponse, create_provider,
+};
 use clawedcode_tools::{Tool, ToolSpec, builtin_tool_instances, builtin_tools};
+use futures_util::StreamExt;
 use serde::Serialize;
 use std::{collections::HashMap, path::PathBuf};
 
@@ -17,7 +20,7 @@ pub struct Runtime {
     pub(crate) tools: Vec<ToolSpec>,
     tool_instances: HashMap<String, Box<dyn Tool>>,
     pub(crate) compatibility: CompatibilitySnapshot,
-    pub(crate) api_client: MockApiClient,
+    pub(crate) provider: BoxedProvider,
     permission_engine: PermissionEngine,
 }
 
@@ -30,6 +33,28 @@ pub struct RuntimeOutput {
     pub skill_count: usize,
     pub mcp_server_count: usize,
     pub tools_executed: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamingRuntimeOutput {
+    pub session_id: String,
+    pub system_prompt: String,
+    pub response: String,
+    pub thinking: String,
+    pub tool_count: usize,
+    pub skill_count: usize,
+    pub mcp_server_count: usize,
+    pub tools_executed: usize,
+    pub tool_uses: Vec<ToolUseRecord>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolUseRecord {
+    pub id: String,
+    pub name: String,
+    pub input: serde_json::Value,
+    pub result: Option<String>,
+    pub is_error: bool,
 }
 
 impl Runtime {
@@ -52,6 +77,22 @@ impl Runtime {
         compatibility: CompatibilitySnapshot,
         mode: PermissionMode,
     ) -> Self {
+        Self::with_provider(
+            config,
+            system_prompt,
+            compatibility,
+            mode,
+            create_provider(),
+        )
+    }
+
+    pub fn with_provider(
+        config: AppConfig,
+        system_prompt: PromptSpec,
+        compatibility: CompatibilitySnapshot,
+        mode: PermissionMode,
+        provider: BoxedProvider,
+    ) -> Self {
         let tool_instances: HashMap<String, Box<dyn Tool>> = builtin_tool_instances()
             .into_iter()
             .map(|t| (t.name().to_string(), t))
@@ -63,7 +104,7 @@ impl Runtime {
             tools: builtin_tools(),
             tool_instances,
             compatibility,
-            api_client: MockApiClient,
+            provider,
             permission_engine: PermissionEngine::new(mode),
         }
     }
@@ -74,107 +115,246 @@ impl Runtime {
         session
     }
 
+    pub fn build_request(&self, session: &Session) -> CompletionRequest {
+        CompletionRequest {
+            model: self.config.model.clone(),
+            prompt_pack: self.config.prompts.default_prompt_pack.clone(),
+            system_prompt_name: self.system_prompt.name.to_string(),
+            system_prompt_body: self.system_prompt.body.to_string(),
+            prompt: session.last_user_text().unwrap_or_default().to_string(),
+            tools: self.tools.clone(),
+            skill_count: self.compatibility.skills.len(),
+            mcp_servers: self.compatibility.mcp_servers.clone(),
+        }
+    }
+
+    /// Non-streaming submit: wraps the streaming path by collecting the stream.
     pub fn submit(&self, session: &mut Session, prompt: &str) -> RuntimeOutput {
         session.push(Role::User, prompt);
 
-        let mut tools_executed = 0usize;
+        let request = self.build_request(session);
 
-        loop {
-            let request = CompletionRequest {
-                model: self.config.model.clone(),
-                prompt_pack: self.config.prompts.default_prompt_pack.clone(),
-                system_prompt_name: self.system_prompt.name.to_string(),
-                system_prompt_body: self.system_prompt.body.to_string(),
-                prompt: session.last_user_text().unwrap_or_default().to_string(),
-                tools: self.tools.clone(),
-                skill_count: self.compatibility.skills.len(),
-                mcp_servers: self.compatibility.mcp_servers.clone(),
-            };
-
-            let events = self.api_client.stream(&request);
-
-            let mut text_accum = String::new();
-            let mut thinking_accum = String::new();
-            let mut tool_uses: Vec<(String, String, serde_json::Value)> = Vec::new();
-
-            for event in &events {
-                match event {
-                    ApiEvent::MessageDelta { text } => {
-                        text_accum.push_str(text);
-                    }
-                    ApiEvent::ThinkingDelta { text } => {
-                        thinking_accum.push_str(text);
-                    }
-                    ApiEvent::ToolUse { tool_use } => {
-                        tool_uses.push((
-                            tool_use.id.clone(),
-                            tool_use.name.clone(),
-                            serde_json::from_str(&tool_use.input)
-                                .unwrap_or(serde_json::Value::Null),
-                        ));
-                    }
-                    ApiEvent::ToolResult { .. } | ApiEvent::Usage { .. } | ApiEvent::Completed => {}
+        // `submit()` is sync but the provider stream is async and may require a Tokio runtime.
+        // In the CLI we are already inside a multi-thread runtime; in tests/TUI we may not be.
+        let rt_output = match tokio::runtime::Handle::try_current() {
+            Ok(handle) => match handle.runtime_flavor() {
+                tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(|| {
+                    handle.block_on(async {
+                        let stream = self.provider.stream(&request);
+                        self.submit_stream_internal(session, stream, &mut |_| {})
+                            .await
+                    })
+                }),
+                tokio::runtime::RuntimeFlavor::CurrentThread => {
+                    // `block_in_place` isn't supported on the current-thread runtime.
+                    // Fall back to spinning up a dedicated runtime for the blocking call.
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("failed to build tokio runtime");
+                    rt.block_on(async {
+                        let stream = self.provider.stream(&request);
+                        self.submit_stream_internal(session, stream, &mut |_| {})
+                            .await
+                    })
                 }
-            }
-
-            // If no tool uses, break the loop
-            if tool_uses.is_empty() {
-                let mut blocks: Vec<ContentBlock> = Vec::new();
-                if !thinking_accum.is_empty() {
-                    blocks.push(ContentBlock::thinking(&thinking_accum));
+                _ => {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("failed to build tokio runtime");
+                    rt.block_on(async {
+                        let stream = self.provider.stream(&request);
+                        self.submit_stream_internal(session, stream, &mut |_| {})
+                            .await
+                    })
                 }
-                if !text_accum.is_empty() {
-                    blocks.push(ContentBlock::text(&text_accum));
-                }
-
-                if blocks.is_empty() {
-                    session.push(Role::Assistant, "");
-                } else {
-                    session.push_blocks(Role::Assistant, blocks);
-                }
-                break;
+            },
+            Err(_) => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("failed to build tokio runtime");
+                rt.block_on(async {
+                    let stream = self.provider.stream(&request);
+                    self.submit_stream_internal(session, stream, &mut |_| {})
+                        .await
+                })
             }
-
-            // Persist assistant content for this turn, including tool_use blocks.
-            let mut assistant_blocks: Vec<ContentBlock> = Vec::new();
-            if !thinking_accum.is_empty() {
-                assistant_blocks.push(ContentBlock::thinking(&thinking_accum));
-            }
-            if !text_accum.is_empty() {
-                assistant_blocks.push(ContentBlock::text(&text_accum));
-            }
-            for (tool_use_id, tool_name, input) in &tool_uses {
-                assistant_blocks.push(ContentBlock::tool_use(
-                    tool_use_id,
-                    tool_name,
-                    input.clone(),
-                ));
-            }
-            session.push_blocks(Role::Assistant, assistant_blocks);
-
-            // Execute tool calls (single loop).
-            let mut result_blocks: Vec<ContentBlock> = Vec::new();
-            for (tool_use_id, tool_name, input) in &tool_uses {
-                let result = self.execute_tool(tool_use_id, tool_name, input.clone(), &session.cwd);
-                result_blocks.push(result);
-                tools_executed += 1;
-            }
-
-            // Append tool results as a Tool message
-            session.push_blocks(Role::Tool, result_blocks);
-
-            // Single tool-use loop: break after one round
-            break;
-        }
+        };
 
         RuntimeOutput {
+            session_id: rt_output.session_id,
+            system_prompt: rt_output.system_prompt,
+            response: rt_output.response.clone(),
+            tool_count: rt_output.tool_count,
+            skill_count: rt_output.skill_count,
+            mcp_server_count: rt_output.mcp_server_count,
+            tools_executed: rt_output.tools_executed,
+        }
+    }
+
+    /// Async streaming submit: consumes the provider stream, yields events to a callback,
+    /// while persisting a structured transcript.
+    pub async fn submit_stream<F>(
+        &self,
+        session: &mut Session,
+        prompt: &str,
+        mut on_event: F,
+    ) -> StreamingRuntimeOutput
+    where
+        F: FnMut(&ApiEvent),
+    {
+        session.push(Role::User, prompt);
+
+        let request = self.build_request(session);
+        let stream = self.provider.stream(&request);
+        self.submit_stream_internal(session, stream, &mut on_event)
+            .await
+    }
+
+    async fn submit_stream_internal<F>(
+        &self,
+        session: &mut Session,
+        stream: clawedcode_api::EventStream,
+        on_event: &mut F,
+    ) -> StreamingRuntimeOutput
+    where
+        F: FnMut(&ApiEvent),
+    {
+        let mut text_accum = String::new();
+        let mut thinking_accum = String::new();
+        let mut tool_uses: Vec<(String, String, serde_json::Value)> = Vec::new();
+        let mut tool_use_records: Vec<ToolUseRecord> = Vec::new();
+        let mut s = stream;
+
+        while let Some(event) = s.next().await {
+            let event = match event {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::error!("Provider stream error: {e}");
+                    break;
+                }
+            };
+
+            match &event {
+                ApiEvent::MessageDelta { text } => {
+                    text_accum.push_str(text);
+                }
+                ApiEvent::ThinkingDelta { text } => {
+                    thinking_accum.push_str(text);
+                }
+                ApiEvent::ToolUse { tool_use } => {
+                    tool_uses.push((
+                        tool_use.id.clone(),
+                        tool_use.name.clone(),
+                        serde_json::from_str(&tool_use.input).unwrap_or(serde_json::Value::Null),
+                    ));
+                }
+                ApiEvent::ToolResult { tool_result } => {
+                    if let Some(record) = tool_use_records
+                        .iter_mut()
+                        .find(|r| r.id == tool_result.tool_use_id)
+                    {
+                        record.result = Some(tool_result.content.clone());
+                        record.is_error = tool_result.is_error;
+                    }
+                }
+                ApiEvent::Usage { usage: _ } => {}
+                ApiEvent::Completed => {}
+            }
+
+            on_event(&event);
+
+            if matches!(event, ApiEvent::Completed) {
+                break;
+            }
+        }
+
+        // If no tool uses, break the loop
+        if tool_uses.is_empty() {
+            let mut blocks: Vec<ContentBlock> = Vec::new();
+            if !thinking_accum.is_empty() {
+                blocks.push(ContentBlock::thinking(&thinking_accum));
+            }
+            if !text_accum.is_empty() {
+                blocks.push(ContentBlock::text(&text_accum));
+            }
+
+            if blocks.is_empty() {
+                session.push(Role::Assistant, "");
+            } else {
+                session.push_blocks(Role::Assistant, blocks);
+            }
+
+            return StreamingRuntimeOutput {
+                session_id: session.id.to_string(),
+                system_prompt: self.system_prompt.name.to_string(),
+                response: text_accum.clone(),
+                thinking: thinking_accum,
+                tool_count: self.tools.len(),
+                skill_count: self.compatibility.skills.len(),
+                mcp_server_count: self.compatibility.mcp_servers.len(),
+                tools_executed: 0,
+                tool_uses: tool_use_records,
+            };
+        }
+
+        // Persist assistant content for this turn, including tool_use blocks.
+        let mut assistant_blocks: Vec<ContentBlock> = Vec::new();
+        if !thinking_accum.is_empty() {
+            assistant_blocks.push(ContentBlock::thinking(&thinking_accum));
+        }
+        if !text_accum.is_empty() {
+            assistant_blocks.push(ContentBlock::text(&text_accum));
+        }
+        for (tool_use_id, tool_name, input) in &tool_uses {
+            assistant_blocks.push(ContentBlock::tool_use(
+                tool_use_id,
+                tool_name,
+                input.clone(),
+            ));
+            tool_use_records.push(ToolUseRecord {
+                id: tool_use_id.clone(),
+                name: tool_name.clone(),
+                input: input.clone(),
+                result: None,
+                is_error: false,
+            });
+        }
+        session.push_blocks(Role::Assistant, assistant_blocks);
+
+        // Execute tool calls.
+        let mut tools_executed = 0usize;
+        let mut result_blocks: Vec<ContentBlock> = Vec::new();
+        for (tool_use_id, tool_name, input) in &tool_uses {
+            let result = self.execute_tool(tool_use_id, tool_name, input.clone(), &session.cwd);
+            if let ContentBlock::ToolResult {
+                is_error, content, ..
+            } = &result
+            {
+                if let Some(record) = tool_use_records.iter_mut().find(|r| r.id == *tool_use_id) {
+                    record.result = Some(content.clone());
+                    record.is_error = *is_error;
+                }
+            }
+            result_blocks.push(result);
+            tools_executed += 1;
+        }
+
+        // Append tool results as a Tool message
+        session.push_blocks(Role::Tool, result_blocks);
+
+        StreamingRuntimeOutput {
             session_id: session.id.to_string(),
             system_prompt: self.system_prompt.name.to_string(),
-            response: text_accum_or_last(session),
+            response: text_accum,
+            thinking: thinking_accum,
             tool_count: self.tools.len(),
             skill_count: self.compatibility.skills.len(),
             mcp_server_count: self.compatibility.mcp_servers.len(),
             tools_executed,
+            tool_uses: tool_use_records,
         }
     }
 
@@ -205,7 +385,6 @@ impl Runtime {
                 ),
             ),
             PermissionDecision::Ask => {
-                // In non-interactive mode, auto-approve for now (bypass skeleton)
                 let result = tool.execute(input, cwd);
                 if result.is_error {
                     ContentBlock::tool_error(tool_use_id, result.content)
@@ -229,17 +408,6 @@ fn is_write_like(tool_name: &str) -> bool {
     matches!(tool_name, "shell" | "apply_patch")
 }
 
-fn text_accum_or_last(session: &Session) -> String {
-    session
-        .messages
-        .iter()
-        .rev()
-        .find(|m| m.role == Role::Assistant)
-        .and_then(|m| m.primary_text())
-        .unwrap_or("")
-        .to_string()
-}
-
 impl RuntimeOutput {
     pub fn from_api(session_id: String, response: CompletionResponse) -> Self {
         Self {
@@ -258,6 +426,7 @@ impl RuntimeOutput {
 mod tests {
     use super::*;
     use crate::config::AppConfig;
+    use clawedcode_api::MockProvider;
 
     fn make_runtime() -> Runtime {
         let config = AppConfig::default();
@@ -272,7 +441,13 @@ mod tests {
             skills: vec![],
             mcp_servers: std::collections::BTreeMap::new(),
         };
-        Runtime::new(config, prompt_spec, compat)
+        Runtime::with_provider(
+            config,
+            prompt_spec,
+            compat,
+            PermissionMode::Default,
+            Box::new(MockProvider),
+        )
     }
 
     #[test]
@@ -339,18 +514,79 @@ mod tests {
 
         let output = runtime.submit(&mut session, "hello");
 
-        let direct = runtime.api_client.complete(&CompletionRequest {
-            model: runtime.config.model.clone(),
-            prompt_pack: runtime.config.prompts.default_prompt_pack.clone(),
-            system_prompt_name: runtime.system_prompt.name.to_string(),
-            system_prompt_body: runtime.system_prompt.body.to_string(),
-            prompt: "hello".to_string(),
-            tools: runtime.tools.clone(),
-            skill_count: runtime.compatibility.skills.len(),
-            mcp_servers: runtime.compatibility.mcp_servers.clone(),
-        });
+        let request = runtime.build_request(&session);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build tokio runtime");
+        let direct = rt.block_on(runtime.provider.complete(&request)).unwrap();
 
         assert_eq!(output.response, direct.response);
+    }
+
+    #[tokio::test]
+    async fn submit_stream_concat_equals_complete() {
+        let runtime = make_runtime();
+        let session = runtime.start_session(PathBuf::from("/tmp"));
+        let request = runtime.build_request(&session);
+
+        let direct_response = runtime.provider.complete(&request).await.unwrap();
+
+        let mut events: Vec<ApiEvent> = Vec::new();
+        let stream = runtime.provider.stream(&request);
+        let mut s = stream;
+        while let Some(event) = s.next().await {
+            if let Ok(e) = event {
+                let is_completed = matches!(e, ApiEvent::Completed);
+                events.push(e);
+                if is_completed {
+                    break;
+                }
+            }
+        }
+
+        let streamed_text: String = events
+            .iter()
+            .filter_map(|e| {
+                if let ApiEvent::MessageDelta { text } = e {
+                    Some(text.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert_eq!(streamed_text, direct_response.response);
+    }
+
+    #[tokio::test]
+    async fn submit_stream_order_thinking_before_text() {
+        let runtime = make_runtime();
+        let session = runtime.start_session(PathBuf::from("/tmp"));
+        let request = runtime.build_request(&session);
+
+        let stream = runtime.provider.stream(&request);
+        let mut s = stream;
+        let mut events: Vec<ApiEvent> = Vec::new();
+        while let Some(event) = s.next().await {
+            if let Ok(e) = event {
+                events.push(e);
+            }
+        }
+
+        let thinking_idx = events
+            .iter()
+            .position(|e| matches!(e, ApiEvent::ThinkingDelta { .. }))
+            .expect("Should have ThinkingDelta");
+        let text_idx = events
+            .iter()
+            .position(|e| matches!(e, ApiEvent::MessageDelta { .. }))
+            .expect("Should have MessageDelta");
+
+        assert!(
+            thinking_idx < text_idx,
+            "ThinkingDelta should come before MessageDelta"
+        );
     }
 
     #[test]
@@ -367,7 +603,13 @@ mod tests {
             skills: vec![],
             mcp_servers: std::collections::BTreeMap::new(),
         };
-        let runtime = Runtime::with_mode(config, prompt_spec, compat, PermissionMode::Plan);
+        let runtime = Runtime::with_provider(
+            config,
+            prompt_spec,
+            compat,
+            PermissionMode::Plan,
+            Box::new(MockProvider),
+        );
         let session = runtime.start_session(PathBuf::from("/tmp"));
 
         let result = runtime.execute_tool(
@@ -397,7 +639,13 @@ mod tests {
             skills: vec![],
             mcp_servers: std::collections::BTreeMap::new(),
         };
-        let runtime = Runtime::with_mode(config, prompt_spec, compat, PermissionMode::Bypass);
+        let runtime = Runtime::with_provider(
+            config,
+            prompt_spec,
+            compat,
+            PermissionMode::Bypass,
+            Box::new(MockProvider),
+        );
         let dir = std::env::temp_dir().join(format!("clawed_rt_test_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("hello.txt"), "hi").unwrap();

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use clawedcode_api::ApiEvent;
 use clawedcode_core::{
     compat,
     config::AppConfig,
@@ -93,16 +94,29 @@ async fn execute_run(
         compatibility,
     );
     let mut session = runtime.start_session(cli.cwd);
-    let output = runtime.submit(&mut session, &run_mode.prompt);
-
-    if let Some(path) = session_store_dir(data_dir) {
-        let _ = session.save(&path);
-    }
 
     if run_mode.json {
+        let output = runtime.submit(&mut session, &run_mode.prompt);
+
+        if let Some(path) = session_store_dir(data_dir) {
+            let _ = session.save(&path);
+        }
+
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
-        println!("{}", output.response);
+        let show_thinking = run_mode.show_thinking;
+        let output =
+            execute_streaming_submit(&runtime, &mut session, &run_mode.prompt, show_thinking)
+                .await?;
+
+        if let Some(path) = session_store_dir(data_dir) {
+            let _ = session.save(&path);
+        }
+
+        println!(
+            "\n---\ntool_count: {}, tools_executed: {}",
+            output.tool_count, output.tools_executed
+        );
     }
     Ok(())
 }
@@ -121,20 +135,32 @@ async fn execute_resume(
 
     let runtime = Runtime::new(config, resolve_prompt(None), compatibility);
 
-    let output = if let Some(prompt) = resume_mode.prompt.clone() {
-        runtime.submit(&mut session, &prompt)
-    } else {
-        runtime.submit(&mut session, "Continue.")
-    };
-
-    if let Some(path) = session_store_dir(data_dir) {
-        let _ = session.save(&path);
-    }
-
     if resume_mode.json {
+        let output = if let Some(prompt) = resume_mode.prompt.clone() {
+            runtime.submit(&mut session, &prompt)
+        } else {
+            runtime.submit(&mut session, "Continue.")
+        };
+
+        if let Some(path) = session_store_dir(data_dir) {
+            let _ = session.save(&path);
+        }
+
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
-        println!("{}", output.response);
+        let prompt = resume_mode.prompt.as_deref().unwrap_or("Continue.");
+        let show_thinking = resume_mode.show_thinking;
+        let output =
+            execute_streaming_submit(&runtime, &mut session, prompt, show_thinking).await?;
+
+        if let Some(path) = session_store_dir(data_dir) {
+            let _ = session.save(&path);
+        }
+
+        println!(
+            "\n---\ntool_count: {}, tools_executed: {}",
+            output.tool_count, output.tools_executed
+        );
     }
     Ok(())
 }
@@ -156,18 +182,70 @@ async fn execute_continue(
 
     let runtime = Runtime::new(config, resolve_prompt(None), compatibility);
 
-    let output = runtime.submit(&mut session, &continue_mode.prompt);
-
-    if let Some(path) = session_store_dir(data_dir) {
-        let _ = session.save(&path);
-    }
-
     if continue_mode.json {
+        let output = runtime.submit(&mut session, &continue_mode.prompt);
+
+        if let Some(path) = session_store_dir(data_dir) {
+            let _ = session.save(&path);
+        }
+
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
-        println!("{}", output.response);
+        let show_thinking = continue_mode.show_thinking;
+        let output =
+            execute_streaming_submit(&runtime, &mut session, &continue_mode.prompt, show_thinking)
+                .await?;
+
+        if let Some(path) = session_store_dir(data_dir) {
+            let _ = session.save(&path);
+        }
+
+        println!(
+            "\n---\ntool_count: {}, tools_executed: {}",
+            output.tool_count, output.tools_executed
+        );
     }
     Ok(())
+}
+
+async fn execute_streaming_submit(
+    runtime: &Runtime,
+    session: &mut Session,
+    prompt: &str,
+    show_thinking: bool,
+) -> Result<clawedcode_core::runtime::StreamingRuntimeOutput> {
+    let output = runtime
+        .submit_stream(session, prompt, |event| match event {
+            ApiEvent::MessageDelta { text } => {
+                print!("{text}");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            }
+            ApiEvent::ThinkingDelta { text } => {
+                if show_thinking {
+                    eprintln!("[thinking] {text}");
+                }
+            }
+            ApiEvent::ToolUse { tool_use } => {
+                eprintln!("\n[tool] {} {}", tool_use.name, tool_use.id);
+            }
+            ApiEvent::ToolResult { tool_result } => {
+                let status = if tool_result.is_error { "error" } else { "ok" };
+                eprintln!("[tool_result:{}] {}", status, tool_result.tool_use_id);
+            }
+            ApiEvent::Usage { usage } => {
+                eprintln!(
+                    "[usage] in={} out={} cache_r={} cache_w={}",
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cache_read_tokens,
+                    usage.cache_write_tokens
+                );
+            }
+            ApiEvent::Completed => {}
+        })
+        .await;
+
+    Ok(output)
 }
 
 fn session_store_dir(explicit_data_dir: Option<PathBuf>) -> Option<PathBuf> {
