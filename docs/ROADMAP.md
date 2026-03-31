@@ -228,7 +228,7 @@ Current status:
 
 ### Deliverables
 
-- [ ] Slash-command registry
+- [x] Slash-command registry for built-ins
 - [ ] Skill-backed command discovery
 - [ ] Dynamic command reload on file changes
 - [ ] Command filtering by mode and environment
@@ -241,6 +241,12 @@ Interactive REPL should expose commands from:
 - built-ins
 - discovered skills
 - MCP servers where appropriate
+
+Current status:
+
+- built-in slash commands are available in the TUI (`/help`, `/clear`, `/update`)
+- install-aware self-update is available through `clawedcode update` and `/update`
+- skill-backed and dynamic command discovery are still pending
 
 ## Phase 9: Sub-Agents And Background Tasks
 

@@ -72,6 +72,8 @@ pub enum Command {
     Config,
     /// Inspect compatibility discovery for config, skills, and MCP servers.
     Compat,
+    /// Update clawedcode using the package manager that installed it.
+    Update,
     /// Headless batch execution mode (not yet implemented).
     Headless,
     /// Direct connection to a remote Claude Code instance (not yet implemented).
@@ -90,6 +92,7 @@ pub enum Intent {
     Continue,
     Config,
     Compat,
+    Update,
     Remote,
     DirectConnect,
     Ssh,
@@ -119,6 +122,7 @@ impl Cli {
             Some(Command::Continue { .. }) => Intent::Continue,
             Some(Command::Config) => Intent::Config,
             Some(Command::Compat) => Intent::Compat,
+            Some(Command::Update) => Intent::Update,
             Some(Command::Headless) => Intent::Headless,
             Some(Command::DirectConnect) => Intent::DirectConnect,
             Some(Command::Ssh) => Intent::Ssh,
@@ -216,6 +220,12 @@ mod tests {
     fn test_classify_intent_compat() {
         let cli = make_cli(Some(Command::Compat));
         assert_eq!(cli.classify_intent(), Intent::Compat);
+    }
+
+    #[test]
+    fn test_classify_intent_update() {
+        let cli = make_cli(Some(Command::Update));
+        assert_eq!(cli.classify_intent(), Intent::Update);
     }
 
     #[test]

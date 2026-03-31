@@ -66,6 +66,7 @@ pub async fn execute(boot: BootstrappedApp) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&compatibility)?);
             Ok(())
         }
+        ExecutionMode::Update => execute_update(),
         ExecutionMode::Run(run_mode) => execute_run(cli, config, compatibility, run_mode).await,
         ExecutionMode::Resume(resume_mode) => {
             execute_resume(cli, config, compatibility, resume_mode).await
@@ -80,6 +81,15 @@ pub async fn execute(boot: BootstrappedApp) -> Result<()> {
             unreachable!("future modes are rejected during mode resolution");
         }
     }
+}
+
+fn execute_update() -> Result<()> {
+    let outcome = clawedcode_core::update::run_self_update()?;
+    println!(
+        "Updated clawedcode via {:?} using `{}`",
+        outcome.method, outcome.command
+    );
+    Ok(())
 }
 
 fn build_approval_fn(yes: bool) -> ApprovalFn {

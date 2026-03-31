@@ -21,5 +21,11 @@ if (!hasUsableBinary(binPath)) {
   if (res.status !== 0) process.exit(res.status ?? 1);
 }
 
-const res = spawnSync(binPath, process.argv.slice(2), { stdio: 'inherit' });
+const res = spawnSync(binPath, process.argv.slice(2), {
+  stdio: 'inherit',
+  env: {
+    ...process.env,
+    CLAWEDCODE_INSTALL_METHOD: process.env.CLAWEDCODE_INSTALL_METHOD || 'npm',
+  },
+});
 process.exit(res.status ?? 1);
