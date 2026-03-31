@@ -1,0 +1,30 @@
+#!/bin/sh
+set -e
+
+# Determine platform
+UNAME=$(uname -s)
+ARCH=$(uname -m)
+
+case "$UNAME" in
+  Linux*)  OS="linux" ;;
+  Darwin*) OS="darwin" ;;
+  *)       echo "Unsupported OS: $UNAME"; exit 1 ;;
+esac
+
+case "$ARCH" in
+  x86_64)  TARGET="x86_64" ;;
+  aarch64) TARGET="aarch64" ;;
+  arm64)   TARGET="aarch64" ;;
+  *)       echo "Unsupported architecture: $ARCH"; exit 1 ;;
+esac
+
+BIN_NAME="clawedcode-$TARGET-$OS"
+BIN_URL="https://github.com/suryavirkapur/clawedcode/releases/download/v0.0.1/$BIN_NAME"
+BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+BIN_PATH="$BIN_DIR/clawedcode"
+
+# Download
+curl -fSL "$BIN_URL" -o "$BIN_PATH"
+chmod +x "$BIN_PATH"
+
+echo "clawedcode installed to $BIN_PATH"
