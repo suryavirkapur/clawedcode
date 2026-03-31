@@ -4,7 +4,7 @@ use crate::{
     content::ContentBlock,
     permissions::{PermissionDecision, PermissionEngine, PermissionMode},
     prompt::PromptSpec,
-    session::{Role, Session},
+    session::{Message, Role, Session},
 };
 use clawedcode_api::{
     ApiEvent, BoxedProvider, CompletionRequest, CompletionResponse, create_provider,
@@ -128,15 +128,37 @@ impl Runtime {
         session
     }
 
+    fn trim_session_messages(messages: &[Message], limit: usize) -> Vec<Message> {
+        let non_system_total = messages.iter().filter(|m| m.role != Role::System).count();
+        let skip_non_system = non_system_total.saturating_sub(limit);
+        let mut skipped = 0usize;
+
+        messages
+            .iter()
+            .filter(|message| {
+                if message.role == Role::System {
+                    return true;
+                }
+                if skipped < skip_non_system {
+                    skipped += 1;
+                    return false;
+                }
+                true
+            })
+            .cloned()
+            .collect()
+    }
+
     pub fn build_request(&self, session: &Session) -> CompletionRequest {
+        let limit = self.config.runtime.session_history_limit;
+        let messages = Self::trim_session_messages(&session.messages, limit);
         CompletionRequest {
             model: self.config.model.clone(),
             prompt_pack: self.config.prompts.default_prompt_pack.clone(),
             system_prompt_name: self.system_prompt.name.to_string(),
             system_prompt_body: self.system_prompt.body.to_string(),
             prompt: session.last_user_text().unwrap_or_default().to_string(),
-            messages: session
-                .messages
+            messages: messages
                 .iter()
                 .map(|m| clawedcode_api::ProviderMessage {
                     role: match m.role {
@@ -909,5 +931,147 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn build_request_trims_old_non_system_messages() {
+        let mut config = AppConfig::default();
+        config.runtime.session_history_limit = 2;
+
+        let prompt_spec = PromptSpec {
+            name: "test",
+            summary: "test",
+            body: "You are a test assistant.",
+        };
+        let compat = CompatibilitySnapshot {
+            settings_files: vec![],
+            settings: serde_json::Value::Null,
+            skills: vec![],
+            mcp_servers: std::collections::BTreeMap::new(),
+        };
+        let runtime = Runtime::with_provider(
+            config,
+            prompt_spec,
+            compat,
+            PermissionMode::Default,
+            Box::new(MockProvider),
+        );
+
+        let mut session = runtime.start_session(PathBuf::from("/tmp"));
+        session.push(Role::User, "first");
+        session.push(Role::Assistant, "first reply");
+        session.push(Role::User, "second");
+        session.push(Role::Assistant, "second reply");
+
+        let request = runtime.build_request(&session);
+        let texts: Vec<_> = request
+            .messages
+            .iter()
+            .filter_map(|m| m.content.iter().find_map(|b| match b {
+                clawedcode_api::ProviderContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            }))
+            .collect();
+
+        assert_eq!(
+            texts,
+            vec!["You are a test assistant.", "second", "second reply"]
+        );
+    }
+
+    #[test]
+    fn build_request_preserves_system_messages_when_limit_is_zero() {
+        let mut config = AppConfig::default();
+        config.runtime.session_history_limit = 0;
+
+        let prompt_spec = PromptSpec {
+            name: "test",
+            summary: "test",
+            body: "You are a test assistant.",
+        };
+        let compat = CompatibilitySnapshot {
+            settings_files: vec![],
+            settings: serde_json::Value::Null,
+            skills: vec![],
+            mcp_servers: std::collections::BTreeMap::new(),
+        };
+        let runtime = Runtime::with_provider(
+            config,
+            prompt_spec,
+            compat,
+            PermissionMode::Default,
+            Box::new(MockProvider),
+        );
+
+        let mut session = runtime.start_session(PathBuf::from("/tmp"));
+        session.push(Role::User, "discard me");
+        session.push(Role::Assistant, "discard me too");
+
+        let request = runtime.build_request(&session);
+        assert_eq!(request.messages.len(), 1);
+        let system_text = request.messages[0]
+            .content
+            .iter()
+            .find_map(|b| match b {
+                clawedcode_api::ProviderContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            });
+        assert_eq!(system_text, Some("You are a test assistant."));
+    }
+
+    #[test]
+    fn build_request_keeps_newest_non_system_messages_in_original_order() {
+        let mut config = AppConfig::default();
+        config.runtime.session_history_limit = 3;
+
+        let prompt_spec = PromptSpec {
+            name: "test",
+            summary: "test",
+            body: "You are a test assistant.",
+        };
+        let compat = CompatibilitySnapshot {
+            settings_files: vec![],
+            settings: serde_json::Value::Null,
+            skills: vec![],
+            mcp_servers: std::collections::BTreeMap::new(),
+        };
+        let runtime = Runtime::with_provider(
+            config,
+            prompt_spec,
+            compat,
+            PermissionMode::Default,
+            Box::new(MockProvider),
+        );
+
+        let mut session = runtime.start_session(PathBuf::from("/tmp"));
+        session.push(Role::User, "old user");
+        session.push(Role::Assistant, "old assistant");
+        session.push_blocks(
+            Role::Assistant,
+            vec![ContentBlock::tool_use(
+                "tool-1",
+                "read_file",
+                serde_json::json!({"path": "Cargo.toml"}),
+            )],
+        );
+        session.push_blocks(
+            Role::Tool,
+            vec![ContentBlock::tool_result("tool-1", "contents")],
+        );
+        session.push(Role::User, "latest user");
+
+        let request = runtime.build_request(&session);
+        let kept_roles: Vec<_> = request.messages.iter().map(|m| &m.role).collect();
+
+        assert_eq!(
+            kept_roles,
+            vec![
+                &clawedcode_api::ProviderRole::User,
+                &clawedcode_api::ProviderRole::Assistant,
+                &clawedcode_api::ProviderRole::Assistant,
+                &clawedcode_api::ProviderRole::User,
+            ]
+        );
+        assert_eq!(request.messages.len(), 4);
     }
 }

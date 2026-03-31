@@ -29,7 +29,7 @@ Already done:
 Not done:
 
 - [ ] MCP connections and discovery
-- [ ] Session compaction / context trimming
+- [x] Session compaction / context trimming
 - [ ] sub-agents
 - [ ] remote/direct-connect/ssh modes
 
@@ -180,7 +180,7 @@ Should open an interactive REPL that can:
 - [ ] `CLAUDE.md` layered memory loading
 - [ ] `.claude/rules/*.md` discovery
 - [ ] `@include` expansion and cycle protection
-- [ ] Context trimming/compaction strategy
+- [x] Context trimming/compaction strategy
 
 ### Exit Criteria
 
