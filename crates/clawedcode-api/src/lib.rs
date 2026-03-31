@@ -532,12 +532,24 @@ pub mod anthropic_provider {
         timeout: TimeoutConfig,
     }
 
+    pub(crate) fn normalize_anthropic_endpoint(endpoint: &str) -> String {
+        if endpoint.contains("/v1/messages") {
+            endpoint.to_string()
+        } else {
+            let endpoint = endpoint.trim_end_matches('/');
+            format!("{}/v1/messages", endpoint)
+        }
+    }
+
     impl AnthropicProvider {
         pub fn from_env() -> Option<Self> {
-            let api_key = std::env::var("ANTHROPIC_API_KEY").ok()?;
+            let api_key = std::env::var("ANTHROPIC_API_KEY")
+                .or_else(|_| std::env::var("ANTHROPIC_AUTH_TOKEN"))
+                .ok()?;
             let endpoint = std::env::var("CLAWEDCODE_ANTHROPIC_ENDPOINT")
                 .or_else(|_| std::env::var("ANTHROPIC_BASE_URL"))
                 .unwrap_or_else(|_| "https://api.anthropic.com/v1/messages".to_string());
+            let endpoint = normalize_anthropic_endpoint(&endpoint);
             let anthropic_version = std::env::var("CLAWEDCODE_ANTHROPIC_VERSION")
                 .unwrap_or_else(|_| "2023-06-01".to_string());
             Some(Self {
@@ -1161,5 +1173,42 @@ mod tests {
             last_error: "timeout".to_string(),
         };
         assert!(err.to_string().contains("3"));
+    }
+
+    #[cfg(feature = "anthropic")]
+    mod anthropic_tests {
+        use crate::anthropic_provider::normalize_anthropic_endpoint;
+
+        #[test]
+        fn test_normalize_anthropic_endpoint_base_url() {
+            assert_eq!(
+                normalize_anthropic_endpoint("http://localhost:11434"),
+                "http://localhost:11434/v1/messages"
+            );
+        }
+
+        #[test]
+        fn test_normalize_anthropic_endpoint_trailing_slash() {
+            assert_eq!(
+                normalize_anthropic_endpoint("http://localhost:11434/"),
+                "http://localhost:11434/v1/messages"
+            );
+        }
+
+        #[test]
+        fn test_normalize_anthropic_endpoint_already_has_v1() {
+            assert_eq!(
+                normalize_anthropic_endpoint("http://localhost:11434/v1/messages"),
+                "http://localhost:11434/v1/messages"
+            );
+        }
+
+        #[test]
+        fn test_normalize_anthropic_endpoint_custom_path() {
+            assert_eq!(
+                normalize_anthropic_endpoint("https://api.anthropic.com"),
+                "https://api.anthropic.com/v1/messages"
+            );
+        }
     }
 }
