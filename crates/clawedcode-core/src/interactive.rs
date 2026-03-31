@@ -82,46 +82,49 @@ impl TuiContext {
         let mut thinking_accum = String::new();
         let mut tool_uses: Vec<(String, String, serde_json::Value)> = Vec::new();
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("failed to build tokio runtime");
+        run_in_runtime(async {
+            let mut s = self.runtime.provider.stream(&request);
+            loop {
+                let next = s.next().await;
+                let Some(next) = next else { break };
+                let event = match next {
+                    Ok(e) => e,
+                    Err(_) => break,
+                };
 
-        let mut s = rt.block_on(async { self.runtime.provider.stream(&request) });
-        loop {
-            let next = rt.block_on(async { s.next().await });
-            let Some(next) = next else { break };
-            let event = match next {
-                Ok(e) => e,
-                Err(_) => break,
-            };
+                match &event {
+                    ApiEvent::MessageDelta { text } => {
+                        text_accum.push_str(text.as_str());
+                        handler.on_event(&TuiEvent::MessageDelta { text: text.clone() });
+                    }
+                    ApiEvent::ThinkingDelta { text } => {
+                        thinking_accum.push_str(text.as_str());
+                        handler.on_event(&TuiEvent::ThinkingDelta { text: text.clone() });
+                    }
+                    ApiEvent::ToolUse { tool_use } => {
+                        let input = serde_json::from_str(&tool_use.input)
+                            .unwrap_or(serde_json::Value::Null);
+                        tool_uses.push((
+                            tool_use.id.clone(),
+                            tool_use.name.clone(),
+                            input.clone(),
+                        ));
+                        handler.on_event(&TuiEvent::ToolUse {
+                            id: tool_use.id.clone(),
+                            name: tool_use.name.clone(),
+                            input,
+                        });
+                    }
+                    ApiEvent::ToolResult { .. }
+                    | ApiEvent::Usage { .. }
+                    | ApiEvent::Completed => {}
+                }
 
-            match &event {
-                ApiEvent::MessageDelta { text } => {
-                    text_accum.push_str(text.as_str());
-                    handler.on_event(&TuiEvent::MessageDelta { text: text.clone() });
+                if matches!(event, ApiEvent::Completed) {
+                    break;
                 }
-                ApiEvent::ThinkingDelta { text } => {
-                    thinking_accum.push_str(text.as_str());
-                    handler.on_event(&TuiEvent::ThinkingDelta { text: text.clone() });
-                }
-                ApiEvent::ToolUse { tool_use } => {
-                    let input =
-                        serde_json::from_str(&tool_use.input).unwrap_or(serde_json::Value::Null);
-                    tool_uses.push((tool_use.id.clone(), tool_use.name.clone(), input.clone()));
-                    handler.on_event(&TuiEvent::ToolUse {
-                        id: tool_use.id.clone(),
-                        name: tool_use.name.clone(),
-                        input,
-                    });
-                }
-                ApiEvent::ToolResult { .. } | ApiEvent::Usage { .. } | ApiEvent::Completed => {}
             }
-
-            if matches!(event, ApiEvent::Completed) {
-                break;
-            }
-        }
+        });
 
         handler.on_event(&TuiEvent::AssistantDone);
 
@@ -232,6 +235,33 @@ impl TuiContext {
     }
 }
 
+fn run_in_runtime<F, T>(f: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => match handle.runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| handle.block_on(f))
+            }
+            _ => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("failed to build tokio runtime");
+                rt.block_on(f)
+            }
+        },
+        Err(_) => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime");
+            rt.block_on(f)
+        }
+    }
+}
+
 fn is_write_like(tool_name: &str) -> bool {
     matches!(tool_name, "shell" | "apply_patch")
 }
@@ -338,6 +368,22 @@ mod tests {
                 .iter()
                 .any(|m| m.role == Role::Assistant)
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn submit_interactive_works_inside_existing_runtime() {
+        let mut ctx = make_context();
+        let mut handler = TestHandler::new();
+
+        ctx.submit_interactive("hello", &mut handler);
+
+        assert!(
+            handler
+                .events
+                .iter()
+                .any(|e| matches!(e, TuiEvent::TurnComplete))
+        );
+        assert!(ctx.session.messages.iter().any(|m| m.role == Role::Assistant));
     }
 
     #[test]
