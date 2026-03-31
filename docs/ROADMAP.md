@@ -90,7 +90,7 @@ Produces a persisted session transcript with enough structure to support:
 
 - [x] Provider trait with streaming and non-streaming paths
 - [x] Initial request shaping (system prompt + latest user message + tools metadata)
-- [ ] Full session-history shaping (multi-turn transcript)
+- [x] Full session-history shaping (multi-turn transcript)
 - [x] Streaming event model
 - [x] Retry and timeout envelope (scaffold)
 - [x] Usage accounting scaffold
@@ -119,12 +119,12 @@ cargo run -- run --prompt "hello"
 
 ### Deliverables
 
-- [ ] Tool trait and execution context
-- [ ] Read/write/shell risk classification
-- [ ] Permission mode model: default, accept-edits, plan, bypass
-- [ ] Approval decision engine
-- [ ] Built-in file and shell tool implementations
-- [ ] Tool result insertion back into the conversation loop
+- [x] Tool trait and execution context
+- [x] Read/write/shell risk classification
+- [x] Permission mode model: default, accept-edits, plan, bypass
+- [x] Approval decision engine (headless: y/N prompt or `--yes`)
+- [x] Built-in file and shell tool implementations
+- [x] Tool result insertion back into the conversation loop (tool-call loop)
 
 ### Exit Criteria
 
@@ -134,6 +134,12 @@ cargo run -- run --prompt "edit config to change the default theme"
 ```
 
 The first should execute without unsafe prompts. The second should flow through the approval engine.
+
+Headless auto-approval:
+
+```bash
+cargo run -- run --prompt "edit config to change the default theme" --yes
+```
 
 ## Phase 5: Stateful REPL
 

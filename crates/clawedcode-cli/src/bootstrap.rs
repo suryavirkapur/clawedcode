@@ -35,6 +35,7 @@ pub struct RunMode {
     pub system_prompt: Option<String>,
     pub json: bool,
     pub show_thinking: bool,
+    pub yes: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +44,7 @@ pub struct ResumeMode {
     pub prompt: Option<String>,
     pub json: bool,
     pub show_thinking: bool,
+    pub yes: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +52,7 @@ pub struct ContinueMode {
     pub prompt: String,
     pub json: bool,
     pub show_thinking: bool,
+    pub yes: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -87,31 +90,37 @@ pub fn resolve_mode(cli: &Cli) -> Result<ExecutionMode> {
             system_prompt,
             json,
             show_thinking,
+            yes,
         } => Ok(ExecutionMode::Run(RunMode {
             prompt,
             system_prompt,
             json,
             show_thinking,
+            yes,
         })),
         Command::Resume {
             session_id,
             prompt,
             json,
             show_thinking,
+            yes,
         } => Ok(ExecutionMode::Resume(ResumeMode {
             session_id,
             prompt,
             json,
             show_thinking,
+            yes,
         })),
         Command::Continue {
             prompt,
             json,
             show_thinking,
+            yes,
         } => Ok(ExecutionMode::Continue(ContinueMode {
             prompt,
             json,
             show_thinking,
+            yes,
         })),
         Command::Config => Ok(ExecutionMode::Config),
         Command::Compat => Ok(ExecutionMode::Compat),
@@ -202,6 +211,7 @@ mod tests {
             system_prompt: None,
             json: false,
             show_thinking: false,
+            yes: false,
         });
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Run(_)));
@@ -209,6 +219,7 @@ mod tests {
             assert_eq!(run.prompt, "hello");
             assert!(!run.json);
             assert!(!run.show_thinking);
+            assert!(!run.yes);
         }
     }
 
@@ -219,6 +230,7 @@ mod tests {
             prompt: Some("continue".to_string()),
             json: false,
             show_thinking: false,
+            yes: false,
         });
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Resume(_)));
@@ -226,6 +238,7 @@ mod tests {
             assert_eq!(resume.session_id, "abc-123");
             assert_eq!(resume.prompt.as_deref(), Some("continue"));
             assert!(!resume.show_thinking);
+            assert!(!resume.yes);
         }
     }
 
@@ -235,6 +248,7 @@ mod tests {
             prompt: "keep going".to_string(),
             json: true,
             show_thinking: false,
+            yes: true,
         });
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Continue(_)));
@@ -242,6 +256,7 @@ mod tests {
             assert_eq!(cont.prompt, "keep going");
             assert!(cont.json);
             assert!(!cont.show_thinking);
+            assert!(cont.yes);
         }
     }
 

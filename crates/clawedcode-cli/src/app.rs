@@ -5,8 +5,9 @@ use clawedcode_core::{
     config::AppConfig,
     config::default_data_dir,
     interactive::TuiContext,
+    permissions::PermissionMode,
     prompt::{builtin_prompts, resolve_prompt},
-    runtime::Runtime,
+    runtime::{ApprovalFn, Runtime},
     session::Session,
 };
 use clawedcode_tools::builtin_tools;
@@ -81,6 +82,33 @@ pub async fn execute(boot: BootstrappedApp) -> Result<()> {
     }
 }
 
+fn build_approval_fn(yes: bool) -> ApprovalFn {
+    if yes {
+        Box::new(|_, _, _| true)
+    } else {
+        Box::new(|_tool_use_id, tool_name, input| {
+            let input_preview = serde_json::to_string(input).unwrap_or_default();
+            eprintln!(
+                "\n[approval] Tool '{}' requested. Input: {}",
+                tool_name, input_preview
+            );
+            if atty::is(atty::Stream::Stdin) {
+                eprint!("Approve? [y/N] ");
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+                let mut line = String::new();
+                if std::io::stdin().read_line(&mut line).is_err() {
+                    return false;
+                }
+                let trimmed = line.trim().to_lowercase();
+                trimmed == "y" || trimmed == "yes"
+            } else {
+                eprintln!("Not a TTY; denying by default. Use --yes to auto-approve.");
+                false
+            }
+        })
+    }
+}
+
 async fn execute_run(
     cli: Cli,
     config: AppConfig,
@@ -88,15 +116,17 @@ async fn execute_run(
     run_mode: crate::bootstrap::RunMode,
 ) -> Result<()> {
     let data_dir = cli.data_dir.clone();
-    let runtime = Runtime::new(
+    let runtime = Runtime::with_mode(
         config,
         resolve_prompt(run_mode.system_prompt.as_deref()),
         compatibility,
+        PermissionMode::Default,
     );
     let mut session = runtime.start_session(cli.cwd);
+    let approval_fn = build_approval_fn(run_mode.yes);
 
     if run_mode.json {
-        let output = runtime.submit(&mut session, &run_mode.prompt);
+        let output = runtime.submit_with_approval(&mut session, &run_mode.prompt, &*approval_fn);
 
         if let Some(path) = session_store_dir(data_dir) {
             let _ = session.save(&path);
@@ -105,9 +135,14 @@ async fn execute_run(
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         let show_thinking = run_mode.show_thinking;
-        let output =
-            execute_streaming_submit(&runtime, &mut session, &run_mode.prompt, show_thinking)
-                .await?;
+        let output = execute_streaming_submit_with_approval(
+            &runtime,
+            &mut session,
+            &run_mode.prompt,
+            show_thinking,
+            &approval_fn,
+        )
+        .await?;
 
         if let Some(path) = session_store_dir(data_dir) {
             let _ = session.save(&path);
@@ -133,13 +168,19 @@ async fn execute_resume(
     let mut session = Session::load_by_id(&sessions_dir, &resume_mode.session_id)
         .with_context(|| format!("failed to load session {}", resume_mode.session_id))?;
 
-    let runtime = Runtime::new(config, resolve_prompt(None), compatibility);
+    let runtime = Runtime::with_mode(
+        config,
+        resolve_prompt(None),
+        compatibility,
+        PermissionMode::Default,
+    );
+    let approval_fn = build_approval_fn(resume_mode.yes);
 
     if resume_mode.json {
         let output = if let Some(prompt) = resume_mode.prompt.clone() {
-            runtime.submit(&mut session, &prompt)
+            runtime.submit_with_approval(&mut session, &prompt, &*approval_fn)
         } else {
-            runtime.submit(&mut session, "Continue.")
+            runtime.submit_with_approval(&mut session, "Continue.", &*approval_fn)
         };
 
         if let Some(path) = session_store_dir(data_dir) {
@@ -150,8 +191,14 @@ async fn execute_resume(
     } else {
         let prompt = resume_mode.prompt.as_deref().unwrap_or("Continue.");
         let show_thinking = resume_mode.show_thinking;
-        let output =
-            execute_streaming_submit(&runtime, &mut session, prompt, show_thinking).await?;
+        let output = execute_streaming_submit_with_approval(
+            &runtime,
+            &mut session,
+            prompt,
+            show_thinking,
+            &approval_fn,
+        )
+        .await?;
 
         if let Some(path) = session_store_dir(data_dir) {
             let _ = session.save(&path);
@@ -180,10 +227,17 @@ async fn execute_continue(
 
     let mut session = latest_session;
 
-    let runtime = Runtime::new(config, resolve_prompt(None), compatibility);
+    let runtime = Runtime::with_mode(
+        config,
+        resolve_prompt(None),
+        compatibility,
+        PermissionMode::Default,
+    );
+    let approval_fn = build_approval_fn(continue_mode.yes);
 
     if continue_mode.json {
-        let output = runtime.submit(&mut session, &continue_mode.prompt);
+        let output =
+            runtime.submit_with_approval(&mut session, &continue_mode.prompt, &*approval_fn);
 
         if let Some(path) = session_store_dir(data_dir) {
             let _ = session.save(&path);
@@ -192,9 +246,14 @@ async fn execute_continue(
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         let show_thinking = continue_mode.show_thinking;
-        let output =
-            execute_streaming_submit(&runtime, &mut session, &continue_mode.prompt, show_thinking)
-                .await?;
+        let output = execute_streaming_submit_with_approval(
+            &runtime,
+            &mut session,
+            &continue_mode.prompt,
+            show_thinking,
+            &approval_fn,
+        )
+        .await?;
 
         if let Some(path) = session_store_dir(data_dir) {
             let _ = session.save(&path);
@@ -208,41 +267,50 @@ async fn execute_continue(
     Ok(())
 }
 
-async fn execute_streaming_submit(
+async fn execute_streaming_submit_with_approval<A>(
     runtime: &Runtime,
     session: &mut Session,
     prompt: &str,
     show_thinking: bool,
-) -> Result<clawedcode_core::runtime::StreamingRuntimeOutput> {
+    approval_fn: &A,
+) -> Result<clawedcode_core::runtime::StreamingRuntimeOutput>
+where
+    A: Fn(&str, &str, &serde_json::Value) -> bool + Send + Sync,
+{
     let output = runtime
-        .submit_stream(session, prompt, |event| match event {
-            ApiEvent::MessageDelta { text } => {
-                print!("{text}");
-                let _ = std::io::Write::flush(&mut std::io::stdout());
-            }
-            ApiEvent::ThinkingDelta { text } => {
-                if show_thinking {
-                    eprintln!("[thinking] {text}");
+        .submit_stream_with_approval(
+            session,
+            prompt,
+            |event| match event {
+                ApiEvent::MessageDelta { text } => {
+                    print!("{text}");
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
                 }
-            }
-            ApiEvent::ToolUse { tool_use } => {
-                eprintln!("\n[tool] {} {}", tool_use.name, tool_use.id);
-            }
-            ApiEvent::ToolResult { tool_result } => {
-                let status = if tool_result.is_error { "error" } else { "ok" };
-                eprintln!("[tool_result:{}] {}", status, tool_result.tool_use_id);
-            }
-            ApiEvent::Usage { usage } => {
-                eprintln!(
-                    "[usage] in={} out={} cache_r={} cache_w={}",
-                    usage.input_tokens,
-                    usage.output_tokens,
-                    usage.cache_read_tokens,
-                    usage.cache_write_tokens
-                );
-            }
-            ApiEvent::Completed => {}
-        })
+                ApiEvent::ThinkingDelta { text } => {
+                    if show_thinking {
+                        eprintln!("[thinking] {text}");
+                    }
+                }
+                ApiEvent::ToolUse { tool_use } => {
+                    eprintln!("\n[tool] {} {}", tool_use.name, tool_use.id);
+                }
+                ApiEvent::ToolResult { tool_result } => {
+                    let status = if tool_result.is_error { "error" } else { "ok" };
+                    eprintln!("[tool_result:{}] {}", status, tool_result.tool_use_id);
+                }
+                ApiEvent::Usage { usage } => {
+                    eprintln!(
+                        "[usage] in={} out={} cache_r={} cache_w={}",
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        usage.cache_read_tokens,
+                        usage.cache_write_tokens
+                    );
+                }
+                ApiEvent::Completed => {}
+            },
+            approval_fn,
+        )
         .await;
 
     Ok(output)

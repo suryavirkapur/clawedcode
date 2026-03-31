@@ -41,6 +41,8 @@ pub enum Command {
         json: bool,
         #[arg(long)]
         show_thinking: bool,
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Resume a previous session by ID.
     Resume {
@@ -52,6 +54,8 @@ pub enum Command {
         json: bool,
         #[arg(long)]
         show_thinking: bool,
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Continue the most recent session.
     Continue {
@@ -61,6 +65,8 @@ pub enum Command {
         json: bool,
         #[arg(long)]
         show_thinking: bool,
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
     /// Print the resolved configuration.
     Config,
@@ -172,6 +178,7 @@ mod tests {
             system_prompt: None,
             json: false,
             show_thinking: false,
+            yes: false,
         }));
         assert_eq!(cli.classify_intent(), Intent::Headless);
     }
@@ -183,6 +190,7 @@ mod tests {
             prompt: None,
             json: false,
             show_thinking: false,
+            yes: false,
         }));
         assert_eq!(cli.classify_intent(), Intent::Resume);
     }
@@ -193,6 +201,7 @@ mod tests {
             prompt: "go on".to_string(),
             json: false,
             show_thinking: false,
+            yes: false,
         }));
         assert_eq!(cli.classify_intent(), Intent::Continue);
     }
