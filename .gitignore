@@ -7,4 +7,5 @@ claude-code-src/
 node_modules/
 bin/clawedcode-bin*
 clawedcode-*.tgz
+._tmp/
 .npm/
