@@ -10,7 +10,8 @@ use clawedcode_api::{
     ApiEvent, BoxedProvider, CompletionRequest, CompletionResponse, create_provider,
 };
 use clawedcode_mcp::{
-    McpServerConfig, discover_mcp_tools_sync, make_mcp_tool_name, run_mcp_tool_sync,
+    McpServerConfig, discover_mcp_resources_sync, discover_mcp_tools_sync, make_mcp_tool_name,
+    read_mcp_resource_sync, run_mcp_tool_sync,
 };
 use clawedcode_tools::{Tool, ToolResult, ToolSpec, builtin_tool_instances, builtin_tools};
 use futures_util::StreamExt;
@@ -56,6 +57,124 @@ impl Tool for McpToolInstance {
                 content,
                 is_error: false,
             },
+            Err(content) => ToolResult {
+                content,
+                is_error: true,
+            },
+        }
+    }
+}
+
+struct ListMcpResourcesToolInstance {
+    servers: BTreeMap<String, McpServerConfig>,
+}
+
+impl Tool for ListMcpResourcesToolInstance {
+    fn name(&self) -> &str {
+        "ListMcpResourcesTool"
+    }
+
+    fn description(&self) -> &str {
+        "List resources exposed by connected MCP servers. Use this before reading a resource when you need to discover valid server names or URIs."
+    }
+
+    fn needs_approval(&self) -> bool {
+        false
+    }
+
+    fn execute(&self, input: serde_json::Value, _cwd: &std::path::Path) -> ToolResult {
+        let target_server = input.get("server").and_then(|value| value.as_str());
+        let resources = discover_mcp_resources_sync(&self.servers);
+
+        let mut all_resources = Vec::new();
+        if let Some(server_name) = target_server {
+            match resources.get(server_name) {
+                Some(items) => all_resources.extend(items.iter().cloned()),
+                None => {
+                    return ToolResult {
+                        content: format!("Server \"{server_name}\" not found or does not support resources"),
+                        is_error: true,
+                    };
+                }
+            }
+        } else {
+            for items in resources.values() {
+                all_resources.extend(items.iter().cloned());
+            }
+        }
+
+        if all_resources.is_empty() {
+            ToolResult {
+                content: "No resources found. MCP servers may still provide tools even if they have no resources.".to_string(),
+                is_error: false,
+            }
+        } else {
+            ToolResult {
+                content: serde_json::to_string(&serde_json::json!({
+                    "resources": all_resources
+                }))
+                .unwrap_or_else(|_| "{\"resources\":[]}".to_string()),
+                is_error: false,
+            }
+        }
+    }
+}
+
+struct ReadMcpResourceToolInstance {
+    servers: BTreeMap<String, McpServerConfig>,
+}
+
+impl Tool for ReadMcpResourceToolInstance {
+    fn name(&self) -> &str {
+        "ReadMcpResourceTool"
+    }
+
+    fn description(&self) -> &str {
+        "Read a specific MCP resource by server name and URI. The result includes a top-level text field when the resource contains plain text."
+    }
+
+    fn needs_approval(&self) -> bool {
+        false
+    }
+
+    fn execute(&self, input: serde_json::Value, _cwd: &std::path::Path) -> ToolResult {
+        let Some(server_name) = input.get("server").and_then(|value| value.as_str()) else {
+            return ToolResult {
+                content: "Missing 'server' parameter".to_string(),
+                is_error: true,
+            };
+        };
+        let Some(uri) = input.get("uri").and_then(|value| value.as_str()) else {
+            return ToolResult {
+                content: "Missing 'uri' parameter".to_string(),
+                is_error: true,
+            };
+        };
+
+        let Some(McpServerConfig::Stdio {
+            command, args, env, ..
+        }) = self.servers.get(server_name)
+        else {
+            return ToolResult {
+                content: format!("Server \"{server_name}\" not found"),
+                is_error: true,
+            };
+        };
+
+        match read_mcp_resource_sync(server_name, command, args, env, uri) {
+            Ok(contents) => {
+                let text = contents.iter().find_map(|content| content.text.clone());
+                ToolResult {
+                    content: serde_json::to_string(&serde_json::json!({
+                        "server": server_name,
+                        "uri": uri,
+                        "text": text,
+                        "contents": contents,
+                    }))
+                    .unwrap_or_else(|_| "{\"contents\":[]}".to_string()),
+                    is_error: false,
+                }
+            }
             Err(content) => ToolResult {
                 content,
                 is_error: true,
@@ -196,6 +315,55 @@ impl Runtime {
             }
         }
 
+        if !discover_mcp_resources_sync(&compatibility.mcp_servers).is_empty() {
+            tools.push(ToolSpec {
+                name: "ListMcpResourcesTool".to_string(),
+                description: "List resources exposed by connected MCP servers. Use this first when you need to discover valid server names or resource URIs.".to_string(),
+                needs_approval: false,
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "server": {
+                            "type": "string",
+                            "description": "Optional server name to filter resources by"
+                        }
+                    }
+                }),
+            });
+            tool_instances.insert(
+                "ListMcpResourcesTool".to_string(),
+                Box::new(ListMcpResourcesToolInstance {
+                    servers: compatibility.mcp_servers.clone(),
+                }),
+            );
+
+            tools.push(ToolSpec {
+                name: "ReadMcpResourceTool".to_string(),
+                description: "Read a specific MCP resource by server name and URI. Returns JSON with server, uri, text, and contents fields.".to_string(),
+                needs_approval: false,
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "server": {
+                            "type": "string",
+                            "description": "The MCP server name"
+                        },
+                        "uri": {
+                            "type": "string",
+                            "description": "The resource URI to read"
+                        }
+                    },
+                    "required": ["server", "uri"]
+                }),
+            });
+            tool_instances.insert(
+                "ReadMcpResourceTool".to_string(),
+                Box::new(ReadMcpResourceToolInstance {
+                    servers: compatibility.mcp_servers.clone(),
+                }),
+            );
+        }
+
         Self {
             config,
             system_prompt,
@@ -261,7 +429,7 @@ impl Runtime {
                         Role::User => clawedcode_api::ProviderRole::User,
                         Role::Assistant => clawedcode_api::ProviderRole::Assistant,
                         Role::System => clawedcode_api::ProviderRole::User,
-                        Role::Tool => clawedcode_api::ProviderRole::Assistant,
+                        Role::Tool => clawedcode_api::ProviderRole::User,
                     },
                     content: m
                         .content_blocks
@@ -821,6 +989,33 @@ while True:
                 "content": [{"type": "text", "text": json.dumps(arguments)}]
             }
         })
+    elif method == "resources/list":
+        send({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "resources": [{
+                    "uri": "resource://runtime/test",
+                    "name": "runtime.txt",
+                    "mimeType": "text/plain",
+                    "description": "Runtime test resource"
+                }]
+            }
+        })
+    elif method == "resources/read":
+        params = msg.get("params", {})
+        uri = params.get("uri", "")
+        send({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "contents": [{
+                    "uri": uri,
+                    "mimeType": "text/plain",
+                    "text": "Runtime MCP resource body"
+                }]
+            }
+        })
 "#;
 
         let path = std::env::temp_dir().join(format!(
@@ -1191,6 +1386,88 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
     }
 
     #[test]
+    fn runtime_registers_and_executes_mcp_resource_helper_tools() {
+        let script_path = temp_python_mcp_server();
+
+        let config = AppConfig::default();
+        let prompt_spec = PromptSpec {
+            name: "test",
+            summary: "test",
+            body: "You are a test assistant.",
+        };
+        let mut mcp_servers = std::collections::BTreeMap::new();
+        mcp_servers.insert(
+            "test-server".to_string(),
+            McpServerConfig::Stdio {
+                r#type: Some("stdio".to_string()),
+                command: "python3".to_string(),
+                args: vec![script_path.to_string_lossy().into_owned()],
+                env: std::collections::BTreeMap::new(),
+            },
+        );
+        let compat = CompatibilitySnapshot {
+            settings_files: vec![],
+            settings: serde_json::Value::Null,
+            skills: vec![],
+            memory_files: vec![],
+            memory: String::new(),
+            mcp_servers,
+        };
+
+        let runtime = Runtime::with_provider(
+            config,
+            prompt_spec,
+            compat,
+            PermissionMode::Bypass,
+            Box::new(MockProvider),
+        );
+
+        assert!(runtime.tools.iter().any(|tool| tool.name == "ListMcpResourcesTool"));
+        assert!(runtime.tools.iter().any(|tool| tool.name == "ReadMcpResourceTool"));
+
+        let list_result = runtime.execute_tool(
+            "tool-list",
+            "ListMcpResourcesTool",
+            serde_json::json!({}),
+            &std::env::current_dir().unwrap(),
+        );
+        match list_result {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                assert!(!is_error);
+                assert!(content.contains("\"resources\""));
+                assert!(content.contains("resource://runtime/test"));
+            }
+            other => panic!("expected tool result, got {other:?}"),
+        }
+
+        let read_result = runtime.execute_tool(
+            "tool-read",
+            "ReadMcpResourceTool",
+            serde_json::json!({
+                "server": "test-server",
+                "uri": "resource://runtime/test"
+            }),
+            &std::env::current_dir().unwrap(),
+        );
+        match read_result {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                assert!(!is_error);
+                assert!(content.contains("\"server\":\"test-server\""));
+                assert!(content.contains("\"uri\":\"resource://runtime/test\""));
+                assert!(content.contains("\"text\":\"Runtime MCP resource body\""));
+                assert!(content.contains("Runtime MCP resource body"));
+            }
+            other => panic!("expected tool result, got {other:?}"),
+        }
+
+        fs::remove_file(script_path).ok();
+    }
+
+    #[test]
     fn build_request_trims_old_non_system_messages() {
         let mut config = AppConfig::default();
         config.runtime.session_history_limit = 2;
@@ -1331,7 +1608,7 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
             vec![
                 &clawedcode_api::ProviderRole::User,
                 &clawedcode_api::ProviderRole::Assistant,
-                &clawedcode_api::ProviderRole::Assistant,
+                &clawedcode_api::ProviderRole::User,
                 &clawedcode_api::ProviderRole::User,
             ]
         );

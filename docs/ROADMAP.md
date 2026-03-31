@@ -28,7 +28,7 @@ Already done:
 
 Not done:
 
-- [ ] MCP resources/helper tools and non-stdio transports
+- [ ] MCP non-stdio transports
 - [x] Session compaction / context trimming
 - [ ] sub-agents
 - [ ] remote/direct-connect/ssh modes
@@ -202,8 +202,8 @@ The app should restore useful context instead of only loading raw transcript tex
 - [x] Stdio transport
 - [ ] HTTP/SSE transport
 - [x] Tool discovery
-- [ ] Resource discovery
-- [ ] MCP-backed helper tools for resource listing/reading
+- [x] Resource discovery
+- [x] MCP-backed helper tools for resource listing/reading
 
 ### Exit Criteria
 
@@ -219,7 +219,8 @@ Current status:
 - stdio MCP servers are discovered from settings and ancestor `.mcp.json` files
 - MCP tools are surfaced into the runtime as namespaced tools
 - MCP stdio tool execution works end-to-end
-- resource discovery/helper tools and non-stdio transports are still pending
+- MCP resource discovery and helper tools are wired into the runtime
+- non-stdio transports are still pending
 
 ## Phase 8: Commands, Skills, And Dynamic Command Surface
 
