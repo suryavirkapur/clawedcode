@@ -17,6 +17,6 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 toml.workspace = true
 uuid.workspace = true
-clawedcode-api = { version = "0.0.1" }
-clawedcode-mcp = { version = "0.0.1" }
-clawedcode-tools = { version = "0.0.1" }
+clawedcode-api = { path = "../clawedcode-api", version = "0.0.1" }
+clawedcode-mcp = { path = "../clawedcode-mcp", version = "0.0.1" }
+clawedcode-tools = { path = "../clawedcode-tools", version = "0.0.1" }
