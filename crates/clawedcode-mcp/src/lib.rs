@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 #[derive(Debug, Clone)]
@@ -11,8 +11,51 @@ pub struct McpToolSpec {
     pub input_schema: Value,
 }
 
+const CLAUDEAI_SERVER_PREFIX: &str = "claude.ai ";
+
+pub fn normalize_name_for_mcp(name: &str) -> String {
+    let mut normalized = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            normalized.push(c);
+        } else {
+            normalized.push('_');
+        }
+    }
+    if name.starts_with(CLAUDEAI_SERVER_PREFIX) {
+        let mut collapsed = String::new();
+        let mut last_was_underscore = false;
+        for c in normalized.chars() {
+            if c == '_' {
+                if !last_was_underscore {
+                    collapsed.push(c);
+                    last_was_underscore = true;
+                }
+            } else {
+                collapsed.push(c);
+                last_was_underscore = false;
+            }
+        }
+        let trimmed = collapsed.trim_matches('_');
+        if trimmed.is_empty() {
+            normalized
+        } else {
+            trimmed.to_string()
+        }
+    } else {
+        normalized
+    }
+}
+
+pub fn make_mcp_tool_name(server_name: &str, tool_name: &str) -> String {
+    let prefix = format!("mcp__{}__", normalize_name_for_mcp(server_name));
+    format!("{}{}", prefix, normalize_name_for_mcp(tool_name))
+}
+
 struct SyncIoBridge {
     child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
 }
 
 impl SyncIoBridge {
@@ -26,18 +69,24 @@ impl SyncIoBridge {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
-        let child = cmd
+        let mut child = cmd
             .spawn()
             .map_err(|e| format!("failed to spawn {}: {e}", command))?;
-        Ok(Self { child })
+        let stdin = child.stdin.take().ok_or("missing child stdin")?;
+        let stdout = child.stdout.take().ok_or("missing child stdout")?;
+        Ok(Self {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+        })
     }
 
     fn stdin(&mut self) -> &mut ChildStdin {
-        self.child.stdin.as_mut().unwrap()
+        &mut self.stdin
     }
 
-    fn stdout(&mut self) -> &mut ChildStdout {
-        self.child.stdout.as_mut().unwrap()
+    fn stdout(&mut self) -> &mut BufReader<ChildStdout> {
+        &mut self.stdout
     }
 
     fn kill(&mut self) {
@@ -98,13 +147,12 @@ impl McpStdioClient {
     }
 
     fn send_json(&mut self, value: &serde_json::Value) -> Result<(), String> {
-        let line = serde_json::to_string(value).map_err(|e| format!("serialize error: {e}"))?;
+        let bytes = serde_json::to_vec(value).map_err(|e| format!("serialize error: {e}"))?;
         let stdin = self.io.stdin();
+        write!(stdin, "Content-Length: {}\r\n\r\n", bytes.len())
+            .map_err(|e| format!("write header error: {e}"))?;
         stdin
-            .write_all(line.as_bytes())
-            .map_err(|e| format!("write error: {e}"))?;
-        stdin
-            .write_all(b"\n")
+            .write_all(&bytes)
             .map_err(|e| format!("write error: {e}"))?;
         stdin.flush().map_err(|e| format!("flush error: {e}"))?;
         Ok(())
@@ -112,12 +160,42 @@ impl McpStdioClient {
 
     fn read_json(&mut self) -> Result<Value, String> {
         let stdout = self.io.stdout();
-        let mut reader = BufReader::new(stdout).lines();
-        let line = reader
-            .next()
-            .ok_or_else(|| "EOF".to_string())?
-            .map_err(|e| format!("read error: {e}"))?;
-        serde_json::from_str(&line).map_err(|e| format!("parse error: {e}"))
+        let mut content_length = None;
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            stdout
+                .read_line(&mut line)
+                .map_err(|e| format!("read header error: {e}"))?;
+
+            if line.is_empty() {
+                return Err("unexpected EOF while reading MCP headers".into());
+            }
+
+            if line == "\r\n" || line == "\n" {
+                break;
+            }
+
+            let trimmed = line.trim();
+            if let Some(value) = trimmed.strip_prefix("Content-Length:") {
+                content_length = Some(
+                    value
+                        .trim()
+                        .parse()
+                        .map_err(|e| format!("parse Content-Length error: {e}"))?,
+                );
+            }
+        }
+
+        let content_length = content_length.ok_or("missing Content-Length header")?;
+
+        let mut body = vec![0u8; content_length];
+        stdout
+            .read_exact(&mut body)
+            .map_err(|e| format!("read body error: {e}"))?;
+
+        serde_json::from_slice(&body).map_err(|e| format!("parse error: {e}"))
     }
 
     pub fn list_tools(&mut self) -> Result<Vec<McpToolSpec>, String> {
@@ -234,21 +312,6 @@ pub fn discover_mcp_tools_sync(
     result
 }
 
-pub fn make_mcp_tool_name(server_name: &str, tool_name: &str) -> String {
-    let sanitized = |s: &str| {
-        s.chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect::<String>()
-    };
-    format!("mcp_{}_{}", sanitized(server_name), sanitized(tool_name))
-}
-
 pub fn run_mcp_tool_sync(
     server_name: &str,
     command: &str,
@@ -334,21 +397,31 @@ import sys
 import json
 
 def send(obj):
-    line = json.dumps(obj)
-    sys.stdout.write(line + '\n')
-    sys.stdout.flush()
+    content = json.dumps(obj).encode('utf-8')
+    header = ('Content-Length: %d\r\n\r\n' % len(content)).encode('ascii')
+    sys.stdout.buffer.write(header)
+    sys.stdout.buffer.write(content)
+    sys.stdout.buffer.flush()
 
-def read():
-    try:
-        line = sys.stdin.readline()
-        if not line:
+def read_request():
+    content_length = None
+    while True:
+        header = sys.stdin.buffer.readline()
+        if not header:
             return None
-        return json.loads(line.strip())
-    except Exception:
+        if header in (b'\r\n', b'\n'):
+            break
+        if header.startswith(b'Content-Length:'):
+            content_length = int(header.split(b':', 1)[1].strip())
+    if content_length is None:
         return None
+    body = sys.stdin.buffer.read(content_length)
+    if not body:
+        return None
+    return json.loads(body)
 
 while True:
-    msg = read()
+    msg = read_request()
     if msg is None:
         break
     method = msg.get("method", "")
@@ -401,7 +474,7 @@ while True:
                 "jsonrpc": "2.0",
                 "id": id,
                 "result": {
-                    "content": [{"type": "text", "text": "Received: " + msg_text}]
+                    "content": [{"type": "text", "text": f"Received: {msg_text}"}]
                 }
             })
         elif tool_name == "echo":
@@ -416,7 +489,7 @@ while True:
             send({
                 "jsonrpc": "2.0",
                 "id": id,
-                "error": {"code": -32601, "message": "Unknown tool: " + tool_name}
+                "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"}
             })
 "#;
 
@@ -431,14 +504,46 @@ while True:
     }
 
     #[test]
-    fn make_mcp_tool_name_sanitizes_special_chars() {
+    fn normalize_name_for_mcp_basic() {
+        assert_eq!(normalize_name_for_mcp("hello"), "hello");
+        assert_eq!(normalize_name_for_mcp("hello-world"), "hello-world");
+        assert_eq!(normalize_name_for_mcp("hello.world"), "hello_world");
+        assert_eq!(normalize_name_for_mcp("hello world"), "hello_world");
+        assert_eq!(
+            normalize_name_for_mcp("hello.world.test"),
+            "hello_world_test"
+        );
+    }
+
+    #[test]
+    fn normalize_name_for_mcp_claudeai_prefix() {
+        assert_eq!(
+            normalize_name_for_mcp("claude.ai server"),
+            "claude_ai_server"
+        );
+        assert_eq!(
+            normalize_name_for_mcp("claude.ai  server"),
+            "claude_ai_server"
+        );
+        assert_eq!(
+            normalize_name_for_mcp("claude.ai server__tool"),
+            "claude_ai_server_tool"
+        );
+        assert_eq!(
+            normalize_name_for_mcp("_claude.ai server_"),
+            "_claude_ai_server_"
+        );
+    }
+
+    #[test]
+    fn make_mcp_tool_name_basic() {
         assert_eq!(
             make_mcp_tool_name("my-server", "my_tool"),
-            "mcp_my_server_my_tool"
+            "mcp__my-server__my_tool"
         );
         assert_eq!(
             make_mcp_tool_name("server-with-dashes", "tool-with-dashes"),
-            "mcp_server_with_dashes_tool_with_dashes"
+            "mcp__server-with-dashes__tool-with-dashes"
         );
     }
 
@@ -446,7 +551,15 @@ while True:
     fn make_mcp_tool_name_preserves_valid_names() {
         assert_eq!(
             make_mcp_tool_name("server123", "tool456"),
-            "mcp_server123_tool456"
+            "mcp__server123__tool456"
+        );
+    }
+
+    #[test]
+    fn make_mcp_tool_name_claudeai() {
+        assert_eq!(
+            make_mcp_tool_name("claude.ai github", "create_issue"),
+            "mcp__claude_ai_github__create_issue"
         );
     }
 

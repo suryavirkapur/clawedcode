@@ -9,10 +9,60 @@ use crate::{
 use clawedcode_api::{
     ApiEvent, BoxedProvider, CompletionRequest, CompletionResponse, create_provider,
 };
-use clawedcode_tools::{Tool, ToolSpec, builtin_tool_instances, builtin_tools};
+use clawedcode_mcp::{
+    McpServerConfig, discover_mcp_tools_sync, make_mcp_tool_name, run_mcp_tool_sync,
+};
+use clawedcode_tools::{Tool, ToolResult, ToolSpec, builtin_tool_instances, builtin_tools};
 use futures_util::StreamExt;
 use serde::Serialize;
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::PathBuf,
+};
+
+struct McpToolInstance {
+    name: String,
+    description: String,
+    server_name: String,
+    remote_tool_name: String,
+    command: String,
+    args: Vec<String>,
+    env: BTreeMap<String, String>,
+}
+
+impl Tool for McpToolInstance {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn needs_approval(&self) -> bool {
+        true
+    }
+
+    fn execute(&self, input: serde_json::Value, _cwd: &std::path::Path) -> ToolResult {
+        match run_mcp_tool_sync(
+            &self.server_name,
+            &self.command,
+            &self.args,
+            &self.env,
+            &self.remote_tool_name,
+            input,
+        ) {
+            Ok(content) => ToolResult {
+                content,
+                is_error: false,
+            },
+            Err(content) => ToolResult {
+                content,
+                is_error: true,
+            },
+        }
+    }
+}
 
 pub struct Runtime {
     pub(crate) config: AppConfig,
@@ -106,15 +156,50 @@ impl Runtime {
         mode: PermissionMode,
         provider: BoxedProvider,
     ) -> Self {
-        let tool_instances: HashMap<String, Box<dyn Tool>> = builtin_tool_instances()
+        let mut tool_instances: HashMap<String, Box<dyn Tool>> = builtin_tool_instances()
             .into_iter()
             .map(|t| (t.name().to_string(), t))
             .collect();
+        let mut tools = builtin_tools();
+
+        for (server_name, discovered_tools) in discover_mcp_tools_sync(&compatibility.mcp_servers) {
+            let Some(McpServerConfig::Stdio {
+                command, args, env, ..
+            }) = compatibility.mcp_servers.get(&server_name)
+            else {
+                continue;
+            };
+
+            for discovered in discovered_tools {
+                let full_name = make_mcp_tool_name(&server_name, &discovered.name);
+                let description = discovered.description.unwrap_or_default();
+
+                tools.push(ToolSpec {
+                    name: full_name.clone(),
+                    description: description.clone(),
+                    needs_approval: true,
+                    input_schema: discovered.input_schema.clone(),
+                });
+
+                tool_instances.insert(
+                    full_name.clone(),
+                    Box::new(McpToolInstance {
+                        name: full_name,
+                        description,
+                        server_name: server_name.clone(),
+                        remote_tool_name: discovered.name,
+                        command: command.clone(),
+                        args: args.clone(),
+                        env: env.clone(),
+                    }),
+                );
+            }
+        }
 
         Self {
             config,
             system_prompt,
-            tools: builtin_tools(),
+            tools,
             tool_instances,
             compatibility,
             provider,
@@ -613,6 +698,10 @@ mod tests {
     use super::*;
     use crate::config::AppConfig;
     use clawedcode_api::{MockProvider, MockToolProvider};
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     fn make_runtime() -> Runtime {
         let config = AppConfig::default();
@@ -660,6 +749,89 @@ mod tests {
             PermissionMode::Bypass,
             Box::new(MockToolProvider),
         )
+    }
+
+    fn temp_python_mcp_server() -> std::path::PathBuf {
+        let script = r#"
+import sys
+import json
+
+def send(obj):
+    content = json.dumps(obj).encode('utf-8')
+    header = ('Content-Length: %d\r\n\r\n' % len(content)).encode('ascii')
+    sys.stdout.buffer.write(header)
+    sys.stdout.buffer.write(content)
+    sys.stdout.buffer.flush()
+
+def read_request():
+    content_length = None
+    while True:
+        header = sys.stdin.buffer.readline()
+        if not header:
+            return None
+        if header in (b'\r\n', b'\n'):
+            break
+        if header.startswith(b'Content-Length:'):
+            content_length = int(header.split(b':', 1)[1].strip())
+    if content_length is None:
+        return None
+    body = sys.stdin.buffer.read(content_length)
+    if not body:
+        return None
+    return json.loads(body)
+
+while True:
+    msg = read_request()
+    if msg is None:
+        break
+    method = msg.get("method", "")
+    id = msg.get("id")
+
+    if method == "initialize":
+        send({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "runtime-test-server", "version": "1.0.0"}
+            }
+        })
+    elif method == "notifications/initialized":
+        pass
+    elif method == "tools/list":
+        send({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "tools": [{
+                    "name": "echo",
+                    "description": "Echo back the input",
+                    "inputSchema": {"type": "object"}
+                }]
+            }
+        })
+    elif method == "tools/call":
+        params = msg.get("params", {})
+        arguments = params.get("arguments", {})
+        send({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "content": [{"type": "text", "text": json.dumps(arguments)}]
+            }
+        })
+"#;
+
+        let path = std::env::temp_dir().join(format!(
+            "clawed_runtime_mcp_{}.py",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, script).unwrap();
+        path
     }
 
     #[test]
@@ -950,6 +1122,72 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn runtime_registers_and_executes_mcp_stdio_tools() {
+        let script_path = temp_python_mcp_server();
+
+        let config = AppConfig::default();
+        let prompt_spec = PromptSpec {
+            name: "test",
+            summary: "test",
+            body: "You are a test assistant.",
+        };
+        let mut mcp_servers = std::collections::BTreeMap::new();
+        mcp_servers.insert(
+            "test-server".to_string(),
+            McpServerConfig::Stdio {
+                r#type: Some("stdio".to_string()),
+                command: "python3".to_string(),
+                args: vec![script_path.to_string_lossy().into_owned()],
+                env: std::collections::BTreeMap::new(),
+            },
+        );
+        let compat = CompatibilitySnapshot {
+            settings_files: vec![],
+            settings: serde_json::Value::Null,
+            skills: vec![],
+            memory_files: vec![],
+            memory: String::new(),
+            mcp_servers,
+        };
+
+        let runtime = Runtime::with_provider(
+            config,
+            prompt_spec,
+            compat,
+            PermissionMode::Bypass,
+            Box::new(MockProvider),
+        );
+
+        assert!(
+            runtime
+                .tools
+                .iter()
+                .any(|tool| tool.name == "mcp__test-server__echo"),
+            "expected runtime to surface discovered MCP tool"
+        );
+
+        let result = runtime.execute_tool(
+            "tool-1",
+            "mcp__test-server__echo",
+            serde_json::json!({"hello": "world"}),
+            &std::env::current_dir().unwrap(),
+        );
+
+        match result {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                assert!(!is_error);
+                assert!(content.contains("hello"));
+                assert!(content.contains("world"));
+            }
+            other => panic!("expected tool result, got {other:?}"),
+        }
+
+        fs::remove_file(script_path).ok();
     }
 
     #[test]
