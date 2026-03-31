@@ -41,18 +41,34 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install musl-tools (Linux)
+      - name: Install Zig (Linux)
         if: matrix.os == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-          rustup target add ${{ matrix.target }}
+        uses: taiki-e/install-action@v2
+        with:
+          tool: zig
+
+      - name: Install cargo-zigbuild (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }} -p clawedcode
+        run: |
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+            cargo zigbuild --release --target ${{ matrix.target }} -p clawedcode
+          else
+            cargo build --release --target ${{ matrix.target }} -p clawedcode
+          fi
+
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/clawedcode${{ matrix.os == 'windows-latest' && '.exe' || '' }}" "dist/clawedcode-${{ matrix.name }}"
 
       - name: Upload binary
         uses: softprops/action-gh-release@v2
         with:
-          files: target/${{ matrix.target }}/release/clawedcode${{ matrix.os == 'windows-latest' && '.exe' || '' }}
+          files: dist/clawedcode-${{ matrix.name }}
           tag_name: ${{ github.ref_name }}

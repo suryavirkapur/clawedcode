@@ -1,30 +1,25 @@
-#!/bin/sh
-set -e
+#!/usr/bin/env node
+const { spawnSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
 
-# Determine platform
-UNAME=$(uname -s)
-ARCH=$(uname -m)
+const ext = process.platform === 'win32' ? '.exe' : '';
+const binPath = path.join(__dirname, `clawedcode-bin${ext}`);
 
-case "$UNAME" in
-  Linux*)  OS="linux" ;;
-  Darwin*) OS="darwin" ;;
-  *)       echo "Unsupported OS: $UNAME"; exit 1 ;;
-esac
+function hasUsableBinary(p) {
+  try {
+    const st = fs.statSync(p);
+    return st.isFile() && st.size > 0;
+  } catch {
+    return false;
+  }
+}
 
-case "$ARCH" in
-  x86_64)  TARGET="x86_64" ;;
-  aarch64) TARGET="aarch64" ;;
-  arm64)   TARGET="aarch64" ;;
-  *)       echo "Unsupported architecture: $ARCH"; exit 1 ;;
-esac
+if (!hasUsableBinary(binPath)) {
+  const installer = path.join(__dirname, '..', 'install.js');
+  const res = spawnSync(process.execPath, [installer], { stdio: 'inherit' });
+  if (res.status !== 0) process.exit(res.status ?? 1);
+}
 
-BIN_NAME="clawedcode-$TARGET-$OS"
-BIN_URL="https://github.com/suryavirkapur/clawedcode/releases/download/v0.0.1/$BIN_NAME"
-BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
-BIN_PATH="$BIN_DIR/clawedcode"
-
-# Download
-curl -fSL "$BIN_URL" -o "$BIN_PATH"
-chmod +x "$BIN_PATH"
-
-echo "clawedcode installed to $BIN_PATH"
+const res = spawnSync(binPath, process.argv.slice(2), { stdio: 'inherit' });
+process.exit(res.status ?? 1);
