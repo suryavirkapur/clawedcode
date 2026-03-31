@@ -29,32 +29,37 @@ pub async fn run(cli: Cli) -> Result<()> {
 }
 
 pub async fn execute(boot: BootstrappedApp) -> Result<()> {
-    match boot.mode {
+    let mode = boot.mode;
+    let cli = boot.cli;
+    let config = boot.config;
+    let compatibility = boot.compatibility;
+
+    match mode {
         ExecutionMode::Tui => tui::run(),
         ExecutionMode::Config => {
             let prompt_names = builtin_prompts().iter().map(|item| item.name).collect();
             let tool_names = builtin_tools().iter().map(|item| item.name).collect();
             let payload = ResolvedConfig {
-                config: &boot.config,
+                config: &config,
                 builtin_prompts: prompt_names,
                 builtin_tools: tool_names,
-                compatibility: boot.compatibility,
+                compatibility,
             };
             println!("{}", serde_json::to_string_pretty(&payload)?);
             Ok(())
         }
         ExecutionMode::Compat => {
-            println!("{}", serde_json::to_string_pretty(&boot.compatibility)?);
+            println!("{}", serde_json::to_string_pretty(&compatibility)?);
             Ok(())
         }
-        ExecutionMode::Run(ref run_mode) => {
-            execute_run(boot, run_mode).await
+        ExecutionMode::Run(run_mode) => {
+            execute_run(cli, config, compatibility, run_mode).await
         }
-        ExecutionMode::Resume(ref resume_mode) => {
-            execute_resume(boot, resume_mode).await
+        ExecutionMode::Resume(resume_mode) => {
+            execute_resume(cli, config, compatibility, resume_mode).await
         }
-        ExecutionMode::Continue(ref continue_mode) => {
-            execute_continue(boot, continue_mode).await
+        ExecutionMode::Continue(continue_mode) => {
+            execute_continue(cli, config, compatibility, continue_mode).await
         }
         ExecutionMode::Headless(_)
         | ExecutionMode::DirectConnect(_)
@@ -65,14 +70,19 @@ pub async fn execute(boot: BootstrappedApp) -> Result<()> {
     }
 }
 
-async fn execute_run(boot: BootstrappedApp, run_mode: &crate::bootstrap::RunMode) -> Result<()> {
-    let data_dir = boot.cli.data_dir.clone();
+async fn execute_run(
+    cli: Cli,
+    config: AppConfig,
+    compatibility: compat::CompatibilitySnapshot,
+    run_mode: crate::bootstrap::RunMode,
+) -> Result<()> {
+    let data_dir = cli.data_dir.clone();
     let runtime = Runtime::new(
-        boot.config,
+        config,
         resolve_prompt(run_mode.system_prompt.as_deref()),
-        boot.compatibility,
+        compatibility,
     );
-    let mut session = runtime.start_session(boot.cli.cwd);
+    let mut session = runtime.start_session(cli.cwd);
     let output = runtime.submit(&mut session, &run_mode.prompt);
 
     if let Some(path) = session_store_dir(data_dir) {
@@ -87,17 +97,22 @@ async fn execute_run(boot: BootstrappedApp, run_mode: &crate::bootstrap::RunMode
     Ok(())
 }
 
-async fn execute_resume(boot: BootstrappedApp, resume_mode: &crate::bootstrap::ResumeMode) -> Result<()> {
-    let data_dir = boot.cli.data_dir.clone();
+async fn execute_resume(
+    cli: Cli,
+    config: AppConfig,
+    compatibility: compat::CompatibilitySnapshot,
+    resume_mode: crate::bootstrap::ResumeMode,
+) -> Result<()> {
+    let data_dir = cli.data_dir.clone();
     let sessions_dir = session_store_dir(data_dir.clone())
         .context("no sessions directory available")?;
     let mut session = Session::load_by_id(&sessions_dir, &resume_mode.session_id)
         .with_context(|| format!("failed to load session {}", resume_mode.session_id))?;
 
     let runtime = Runtime::new(
-        boot.config,
+        config,
         resolve_prompt(None),
-        boot.compatibility,
+        compatibility,
     );
 
     let output = if let Some(prompt) = resume_mode.prompt.clone() {
@@ -118,8 +133,13 @@ async fn execute_resume(boot: BootstrappedApp, resume_mode: &crate::bootstrap::R
     Ok(())
 }
 
-async fn execute_continue(boot: BootstrappedApp, continue_mode: &crate::bootstrap::ContinueMode) -> Result<()> {
-    let data_dir = boot.cli.data_dir.clone();
+async fn execute_continue(
+    cli: Cli,
+    config: AppConfig,
+    compatibility: compat::CompatibilitySnapshot,
+    continue_mode: crate::bootstrap::ContinueMode,
+) -> Result<()> {
+    let data_dir = cli.data_dir.clone();
     let sessions_dir = session_store_dir(data_dir.clone())
         .context("no sessions directory available")?;
 
@@ -129,9 +149,9 @@ async fn execute_continue(boot: BootstrappedApp, continue_mode: &crate::bootstra
     let mut session = latest_session;
 
     let runtime = Runtime::new(
-        boot.config,
+        config,
         resolve_prompt(None),
-        boot.compatibility,
+        compatibility,
     );
 
     let output = runtime.submit(&mut session, &continue_mode.prompt);
