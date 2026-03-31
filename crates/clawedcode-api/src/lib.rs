@@ -273,7 +273,7 @@ fn mock_complete_response(request: &CompletionRequest) -> CompletionResponse {
         request
             .tools
             .iter()
-            .map(|tool| tool.name)
+            .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>()
             .join(", "),
         request.skill_count,

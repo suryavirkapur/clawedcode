@@ -512,8 +512,8 @@ pub fn builtin_tool_instances() -> Vec<Box<dyn Tool>> {
 pub fn builtin_tools() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
-            name: "shell",
-            description: "Run local commands inside the working directory",
+            name: "shell".to_string(),
+            description: "Run local commands inside the working directory".to_string(),
             needs_approval: true,
             input_schema: serde_json::json!({
                 "type": "object",
@@ -527,8 +527,8 @@ pub fn builtin_tools() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
-            name: "read_file",
-            description: "Read the contents of a file under the working directory",
+            name: "read_file".to_string(),
+            description: "Read the contents of a file under the working directory".to_string(),
             needs_approval: false,
             input_schema: serde_json::json!({
                 "type": "object",
@@ -542,8 +542,8 @@ pub fn builtin_tools() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
-            name: "apply_patch",
-            description: "Apply structured file edits",
+            name: "apply_patch".to_string(),
+            description: "Apply structured file edits".to_string(),
             needs_approval: true,
             input_schema: serde_json::json!({
                 "type": "object",
@@ -561,8 +561,8 @@ pub fn builtin_tools() -> Vec<ToolSpec> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSpec {
-    pub name: &'static str,
-    pub description: &'static str,
+    pub name: String,
+    pub description: String,
     pub needs_approval: bool,
     pub input_schema: serde_json::Value,
 }

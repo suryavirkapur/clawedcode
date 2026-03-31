@@ -22,7 +22,7 @@ use crate::cli::Cli;
 struct ResolvedConfig<'a> {
     config: &'a AppConfig,
     builtin_prompts: Vec<&'a str>,
-    builtin_tools: Vec<&'a str>,
+    builtin_tools: Vec<String>,
     compatibility: compat::CompatibilitySnapshot,
 }
 
@@ -52,7 +52,7 @@ pub async fn execute(boot: BootstrappedApp) -> Result<()> {
         }
         ExecutionMode::Config => {
             let prompt_names = builtin_prompts().iter().map(|item| item.name).collect();
-            let tool_names = builtin_tools().iter().map(|item| item.name).collect();
+            let tool_names = builtin_tools().iter().map(|item| item.name.clone()).collect();
             let payload = ResolvedConfig {
                 config: &config,
                 builtin_prompts: prompt_names,
