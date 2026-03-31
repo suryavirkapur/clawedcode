@@ -250,8 +250,10 @@ name = "clawedcode-tui"
 version = "0.0.2"
 dependencies = [
  "anyhow",
+ "clawedcode-core",
  "crossterm 0.29.0",
  "ratatui",
+ "serde_json",
 ]
 
 [[package]]
