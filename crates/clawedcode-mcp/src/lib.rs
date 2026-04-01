@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
@@ -118,6 +119,16 @@ pub struct McpStdioClient {
     io: SyncIoBridge,
     initialized: bool,
     next_id: u64,
+}
+
+impl fmt::Debug for McpStdioClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("McpStdioClient")
+            .field("server_name", &self.server_name)
+            .field("initialized", &self.initialized)
+            .field("next_id", &self.next_id)
+            .finish()
+    }
 }
 
 impl McpStdioClient {
@@ -895,5 +906,204 @@ while True:
         assert_eq!(contents[0].text.as_deref(), Some("Hello from MCP resource"));
 
         std::fs::remove_file(script_path).ok();
+    }
+
+    mod transport_failure_tests {
+        use super::*;
+
+        fn temp_exiting_mcp_server() -> std::path::PathBuf {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let script_path = std::env::temp_dir().join(format!("exiting_mcp_{}.sh", now));
+            let script = r#"#!/bin/sh
+echo 'Content-Length: 44\r\n\r\n{"jsonrpc":"2.0","id":1,"result":{}}' >&2
+exit 0
+"#;
+            std::fs::write(&script_path, script).unwrap();
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&script_path, perms).unwrap();
+            }
+
+            script_path
+        }
+
+        #[test]
+        fn mcp_connection_failure_returns_clean_error() {
+            let result = McpStdioClient::new(
+                "nonexistent-server".to_string(),
+                "/path/to/nonexistent/server",
+                &[],
+                &BTreeMap::new(),
+            );
+
+            assert!(result.is_err());
+            let error = result.unwrap_err();
+            assert!(error.contains("failed to spawn") || error.contains("No such file"));
+        }
+
+        #[test]
+        fn discover_mcp_sync_skips_failed_servers() {
+            let exiting_script = temp_exiting_mcp_server();
+            let normal_script = temp_python_mcp_server();
+
+            let mut servers = BTreeMap::new();
+            servers.insert(
+                "exiting-server".to_string(),
+                McpServerConfig::Stdio {
+                    r#type: Some("stdio".to_string()),
+                    command: exiting_script.to_str().unwrap().to_string(),
+                    args: vec![],
+                    env: BTreeMap::new(),
+                },
+            );
+            servers.insert(
+                "working-server".to_string(),
+                McpServerConfig::Stdio {
+                    r#type: Some("stdio".to_string()),
+                    command: "python3".to_string(),
+                    args: vec![normal_script.to_str().unwrap().to_string()],
+                    env: BTreeMap::new(),
+                },
+            );
+
+            let tools = discover_mcp_tools_sync(&servers);
+
+            assert!(
+                tools.contains_key("working-server"),
+                "working server should be discovered"
+            );
+            let working_tools = tools.get("working-server").unwrap();
+            assert!(
+                !working_tools.is_empty(),
+                "working server should have tools"
+            );
+
+            std::fs::remove_file(&exiting_script).ok();
+            std::fs::remove_file(&normal_script).ok();
+        }
+
+        #[test]
+        fn mcp_tool_execution_returns_clean_error_on_transport_failure() {
+            let exiting_script = temp_exiting_mcp_server();
+
+            let result = run_mcp_tool_sync(
+                "exiting-server",
+                exiting_script.to_str().unwrap(),
+                &[],
+                &BTreeMap::new(),
+                "test_tool",
+                serde_json::json!({}),
+            );
+
+            assert!(result.is_err());
+            let error = result.unwrap_err();
+            assert!(!error.is_empty(), "error message should be present");
+
+            std::fs::remove_file(&exiting_script).ok();
+        }
+
+        #[test]
+        fn mcp_connection_succeeds_after_previous_failure() {
+            let normal_script = temp_python_mcp_server();
+
+            let _failed = McpStdioClient::new(
+                "will-fail".to_string(),
+                "/nonexistent/path/server",
+                &[],
+                &BTreeMap::new(),
+            );
+            assert!(_failed.is_err(), "first connection should fail");
+
+            let mut client = McpStdioClient::new(
+                "working-server".to_string(),
+                "python3",
+                &[normal_script.to_str().unwrap().to_string()],
+                &BTreeMap::new(),
+            )
+            .expect("second connection should succeed");
+
+            assert!(client.is_initialized());
+            let tools = client.list_tools().expect("tools should work");
+            assert!(!tools.is_empty());
+
+            std::fs::remove_file(&normal_script).ok();
+        }
+
+        #[test]
+        fn discover_mcp_resources_sync_handles_missing_server() {
+            let mut servers = BTreeMap::new();
+            servers.insert(
+                "missing-server".to_string(),
+                McpServerConfig::Stdio {
+                    r#type: Some("stdio".to_string()),
+                    command: "/nonexistent/server".to_string(),
+                    args: vec![],
+                    env: BTreeMap::new(),
+                },
+            );
+
+            let resources = discover_mcp_resources_sync(&servers);
+
+            assert!(
+                resources.is_empty() || !resources.contains_key("missing-server"),
+                "missing server should not appear in resources"
+            );
+        }
+
+        #[test]
+        fn mcp_read_resource_handles_missing_server() {
+            let result = read_mcp_resource_sync(
+                "missing-server",
+                "/nonexistent/server",
+                &[],
+                &BTreeMap::new(),
+                "resource://test/data",
+            );
+
+            assert!(result.is_err());
+            assert!(!result.unwrap_err().is_empty());
+        }
+
+        #[test]
+        fn make_mcp_tool_name_normalizes_special_characters() {
+            assert_eq!(
+                make_mcp_tool_name("my server", "get_data"),
+                "mcp__my_server__get_data"
+            );
+            assert_eq!(
+                make_mcp_tool_name("my-server", "get.data"),
+                "mcp__my-server__get_data"
+            );
+            assert_eq!(
+                make_mcp_tool_name("My Server", "GetData"),
+                "mcp__My_Server__GetData"
+            );
+        }
+
+        #[test]
+        fn mcp_resource_content_deserialization() {
+            let json = r#"{"uri":"file://test","name":"test.txt","mimeType":"text/plain","description":"A test file","server":"test-server"}"#;
+            let resource: McpResource = serde_json::from_str(json).unwrap();
+            assert_eq!(resource.uri, "file://test");
+            assert_eq!(resource.name, "test.txt");
+            assert_eq!(resource.mime_type, Some("text/plain".to_string()));
+            assert_eq!(resource.server, "test-server");
+        }
+
+        #[test]
+        fn mcp_resource_content_fields() {
+            let json = r#"{"uri":"file://test","mimeType":"text/plain","text":"hello world"}"#;
+            let content: McpResourceContent = serde_json::from_str(json).unwrap();
+            assert_eq!(content.uri, "file://test");
+            assert_eq!(content.text, Some("hello world".to_string()));
+            assert!(content.blob.is_none());
+        }
     }
 }

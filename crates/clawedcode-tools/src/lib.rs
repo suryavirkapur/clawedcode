@@ -4,6 +4,9 @@ use std::{
     str::FromStr,
 };
 
+pub const AGENT_TOOL_NAME: &str = "Agent";
+pub const LEGACY_AGENT_TOOL_NAME: &str = "Task";
+
 /// Result of executing a tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
@@ -513,7 +516,7 @@ pub fn builtin_tools() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "shell".to_string(),
-            description: "Run local commands inside the working directory".to_string(),
+            description: "Run local commands inside the working directory. Set run_in_background to true to run long-running commands without blocking.".to_string(),
             needs_approval: true,
             input_schema: serde_json::json!({
                 "type": "object",
@@ -521,6 +524,11 @@ pub fn builtin_tools() -> Vec<ToolSpec> {
                     "command": {
                         "type": "string",
                         "description": "The shell command to execute"
+                    },
+                    "run_in_background": {
+                        "type": "boolean",
+                        "description": "Run the command in the background without blocking (default: false)",
+                        "default": false
                     }
                 },
                 "required": ["command"]
@@ -554,6 +562,246 @@ pub fn builtin_tools() -> Vec<ToolSpec> {
                     }
                 },
                 "required": ["patch"]
+            }),
+        },
+        ToolSpec {
+            name: AGENT_TOOL_NAME.to_string(),
+            description: "Launch a new agent to handle a bounded task. Use this when the work is complex enough to benefit from a forked sub-agent; omit subagent_type to fork with the current conversation context.".to_string(),
+            needs_approval: false,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "description": {
+                        "type": "string",
+                        "description": "A short 3-5 word description of the delegated task"
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "The task for the spawned agent to perform"
+                    },
+                    "subagent_type": {
+                        "type": "string",
+                        "description": "Optional specialized agent type. Omit to fork with the current conversation context."
+                    }
+                },
+                "required": ["description", "prompt"]
+            }),
+        },
+        ToolSpec {
+            name: LEGACY_AGENT_TOOL_NAME.to_string(),
+            description: "Legacy alias for Agent. Launch a new agent to handle a bounded task.".to_string(),
+            needs_approval: false,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "description": {
+                        "type": "string",
+                        "description": "A short 3-5 word description of the delegated task"
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "The task for the spawned agent to perform"
+                    },
+                    "subagent_type": {
+                        "type": "string",
+                        "description": "Optional specialized agent type. Omit to fork with the current conversation context."
+                    }
+                },
+                "required": ["description", "prompt"]
+            }),
+        },
+        ToolSpec {
+            name: "TaskCreate".to_string(),
+            description: "Create a new task in the task list. Use this tool when you need to create a task with a subject and description.".to_string(),
+            needs_approval: false,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "subject": {
+                        "type": "string",
+                        "description": "A brief title for the task"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "What needs to be done"
+                    },
+                    "activeForm": {
+                        "type": "string",
+                        "description": "Present continuous form shown in spinner when in_progress (e.g., 'Running tests')"
+                    },
+                    "metadata": {
+                        "type": "object",
+                        "description": "Arbitrary metadata to attach to the task"
+                    }
+                },
+                "required": ["subject", "description"]
+            }),
+        },
+        ToolSpec {
+            name: "TaskList".to_string(),
+            description: "List all tasks in the task list. Use this tool to see all tasks and their current status.".to_string(),
+            needs_approval: false,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
+        ToolSpec {
+            name: "TaskGet".to_string(),
+            description: "Get a specific task by ID. Use this tool when you need to retrieve detailed information about a single task.".to_string(),
+            needs_approval: false,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "taskId": {
+                        "type": "string",
+                        "description": "The ID of the task to retrieve"
+                    }
+                },
+                "required": ["taskId"]
+            }),
+        },
+        ToolSpec {
+            name: "TaskUpdate".to_string(),
+            description: "Update a task by ID. Use this tool to modify task status, owner, subject, description, or blocking relationships.".to_string(),
+            needs_approval: false,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "taskId": {
+                        "type": "string",
+                        "description": "The ID of the task to update"
+                    },
+                    "subject": {
+                        "type": "string",
+                        "description": "New subject for the task"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "New description for the task"
+                    },
+                    "activeForm": {
+                        "type": "string",
+                        "description": "Present continuous form shown in spinner when in_progress"
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["pending", "in_progress", "completed", "deleted"],
+                        "description": "New status for the task"
+                    },
+                    "owner": {
+                        "type": "string",
+                        "description": "New owner for the task"
+                    },
+                    "addBlocks": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Task IDs that this task blocks"
+                    },
+                    "addBlockedBy": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Task IDs that block this task"
+                    },
+                    "metadata": {
+                        "type": "object",
+                        "description": "Metadata keys to merge into the task"
+                    }
+                },
+                "required": ["taskId"]
+            }),
+        },
+        ToolSpec {
+            name: "TaskOutput".to_string(),
+            description: "Get output from a background task by ID. Use this tool to read the output file and status of a previously started background shell command.".to_string(),
+            needs_approval: false,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "The ID of the background task"
+                    },
+                    "block": {
+                        "type": "boolean",
+                        "description": "Whether to wait for task completion (default: true)",
+                        "default": true
+                    },
+                    "timeout": {
+                        "type": "number",
+                        "description": "Max wait time in ms (default: 30000)",
+                        "default": 30000
+                    }
+                },
+                "required": ["task_id"]
+            }),
+        },
+        ToolSpec {
+            name: "TaskStop".to_string(),
+            description: "Stop a running background task by ID. Use this tool to kill a background shell command that is still running.".to_string(),
+            needs_approval: true,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "The ID of the background task to stop"
+                    },
+                    "shell_id": {
+                        "type": "string",
+                        "description": "Deprecated compatibility alias for task_id"
+                    }
+                },
+                "anyOf": [
+                    { "required": ["task_id"] },
+                    { "required": ["shell_id"] }
+                ]
+            }),
+        },
+        ToolSpec {
+            name: "Agent".to_string(),
+            description: "Launch a specialized agent to handle complex tasks. Use this when you need to perform multi-step operations that require careful planning and execution.".to_string(),
+            needs_approval: false,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "description": {
+                        "type": "string",
+                        "description": "A short description of what the agent will do"
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "The task for the agent to perform"
+                    },
+                    "subagent_type": {
+                        "type": "string",
+                        "description": "Optional type of specialized agent to use"
+                    }
+                },
+                "required": ["description", "prompt"]
+            }),
+        },
+        ToolSpec {
+            name: "Task".to_string(),
+            description: "Launch a specialized agent to handle complex tasks. Use this when you need to perform multi-step operations that require careful planning and execution.".to_string(),
+            needs_approval: false,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "description": {
+                        "type": "string",
+                        "description": "A short description of what the agent will do"
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "The task for the agent to perform"
+                    },
+                    "subagent_type": {
+                        "type": "string",
+                        "description": "Optional type of specialized agent to use"
+                    }
+                },
+                "required": ["description", "prompt"]
             }),
         },
     ]

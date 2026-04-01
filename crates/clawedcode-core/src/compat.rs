@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clawedcode_mcp::{McpServerConfig, discover_mcp_servers as parse_settings_mcp_servers};
+use clawedcode_mcp::{discover_mcp_servers as parse_settings_mcp_servers, McpServerConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{
@@ -122,7 +122,11 @@ fn discover_skills(cwd: &Path) -> Result<Vec<SkillDescriptor>> {
         unique.push(skill);
     }
 
-    unique.sort_by(|a, b| a.slash_command.cmp(&b.slash_command).then(a.path.cmp(&b.path)));
+    unique.sort_by(|a, b| {
+        a.slash_command
+            .cmp(&b.slash_command)
+            .then(a.path.cmp(&b.path))
+    });
     Ok(unique)
 }
 
@@ -410,13 +414,8 @@ fn deep_merge(target: &mut Value, source: Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use crate::test_support::env_lock;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().expect("env lock")
-    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -850,5 +849,283 @@ Some more content here.
         assert_eq!(review_matches[0].body, "Project review body");
 
         fs::remove_dir_all(root).ok();
+    }
+
+    mod snapshot_tests {
+        use super::*;
+        use crate::test_support::env_lock;
+
+        #[test]
+        fn discover_snapshot_exact_fields() {
+            let _guard = env_lock();
+            let root = temp_dir("discover_snapshot");
+            let project = root.join("project");
+            let home = root.join("home").join(".claude");
+
+            fs::create_dir_all(&project).unwrap();
+            fs::create_dir_all(&home).unwrap();
+
+            fs::write(
+                home.join("settings.json"),
+                r#"{"mcpServers": {"settings-server": {"type": "stdio", "command": "echo", "args": ["settings"]}}}"#,
+            )
+            .unwrap();
+
+            fs::write(
+                project.join(".mcp.json"),
+                r#"{"mcpServers": {"project-server": {"type": "stdio", "command": "echo", "args": ["project"]}}}"#,
+            )
+            .unwrap();
+
+            fs::create_dir_all(home.join("skills")).unwrap();
+            fs::write(
+                home.join("skills").join("TestSkill.md"),
+                "---\nname: Test Skill\ndescription: A test skill\n---\nTest skill body",
+            )
+            .unwrap();
+
+            fs::write(
+                home.join("CLAUDE.md"),
+                "# User Memory\n\nFollow these rules.",
+            )
+            .unwrap();
+
+            unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", &home) };
+            let snapshot = discover(&project).unwrap();
+            unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
+
+            assert!(snapshot
+                .settings_files
+                .iter()
+                .any(|p| p.ends_with("settings.json")));
+            assert!(snapshot.mcp_servers.contains_key("settings-server"));
+            assert!(snapshot.mcp_servers.contains_key("project-server"));
+            assert!(snapshot.skills.iter().any(|s| s.name == "Test Skill"));
+            assert!(snapshot.memory.contains("User Memory"));
+            assert!(snapshot.memory.contains("Follow these rules."));
+
+            fs::remove_dir_all(root).ok();
+        }
+
+        #[test]
+        fn mcp_server_config_snapshot_stdio_exact() {
+            let json = r#"{"type": "stdio", "command": "/usr/bin/python3", "args": ["-m", "mymcp"], "env": {"KEY": "value"}}"#;
+            let config: McpServerConfig = serde_json::from_str(json).unwrap();
+
+            match config {
+                McpServerConfig::Stdio {
+                    r#type,
+                    command,
+                    args,
+                    env,
+                } => {
+                    assert_eq!(r#type, Some("stdio".to_string()));
+                    assert_eq!(command, "/usr/bin/python3");
+                    assert_eq!(args, vec!["-m", "mymcp"]);
+                    assert_eq!(env.get("KEY"), Some(&"value".to_string()));
+                }
+                _ => panic!("expected Stdio variant"),
+            }
+        }
+
+        #[test]
+        fn mcp_server_config_snapshot_http_exact() {
+            let json = r#"{"type": "http", "url": "https://api.example.com/mcp", "headers": {"Authorization": "Bearer token"}}"#;
+            let config: McpServerConfig = serde_json::from_str(json).unwrap();
+
+            match &config {
+                McpServerConfig::Sse {
+                    r#type,
+                    url,
+                    headers,
+                }
+                | McpServerConfig::Http {
+                    r#type,
+                    url,
+                    headers,
+                }
+                | McpServerConfig::Ws {
+                    r#type,
+                    url,
+                    headers,
+                } => {
+                    assert_eq!(*r#type, "http");
+                    assert_eq!(url, "https://api.example.com/mcp");
+                    assert_eq!(
+                        headers.get("Authorization"),
+                        Some(&"Bearer token".to_string())
+                    );
+                }
+                McpServerConfig::Stdio { .. } | McpServerConfig::Sdk { .. } => {
+                    panic!("expected url-bearing variant, got {:?}", config)
+                }
+            }
+        }
+
+        #[test]
+        fn mcp_server_config_snapshot_sse_exact() {
+            let json = r#"{"type": "sse", "url": "https://events.example.com/mcp", "headers": {"X-Custom": "value"}}"#;
+            let config: McpServerConfig = serde_json::from_str(json).unwrap();
+
+            match &config {
+                McpServerConfig::Sse {
+                    r#type,
+                    url,
+                    headers,
+                } => {
+                    assert_eq!(*r#type, "sse");
+                    assert_eq!(url, "https://events.example.com/mcp");
+                    assert_eq!(headers.get("X-Custom"), Some(&"value".to_string()));
+                }
+                McpServerConfig::Http { .. }
+                | McpServerConfig::Ws { .. }
+                | McpServerConfig::Stdio { .. }
+                | McpServerConfig::Sdk { .. } => {
+                    panic!("expected Sse variant, got {:?}", config)
+                }
+            }
+        }
+
+        #[test]
+        fn mcp_server_config_snapshot_ws_exact() {
+            let json = r#"{"type": "ws", "url": "wss://ws.example.com/mcp", "headers": {}}"#;
+            let config: McpServerConfig = serde_json::from_str(json).unwrap();
+
+            match &config {
+                McpServerConfig::Sse {
+                    r#type,
+                    url,
+                    headers,
+                }
+                | McpServerConfig::Ws {
+                    r#type,
+                    url,
+                    headers,
+                }
+                | McpServerConfig::Http {
+                    r#type,
+                    url,
+                    headers,
+                } => {
+                    assert_eq!(*r#type, "ws");
+                    assert_eq!(url, "wss://ws.example.com/mcp");
+                    assert!(headers.is_empty());
+                }
+                McpServerConfig::Stdio { .. } | McpServerConfig::Sdk { .. } => {
+                    panic!("expected url-bearing variant, got {:?}", config)
+                }
+            }
+        }
+
+        #[test]
+        fn deep_merge_snapshot_nested_objects() {
+            let mut target = serde_json::json!({
+                "model": "default-model",
+                " provider": {"endpoint": "default-endpoint"}
+            });
+            let source = serde_json::json!({
+                "model": "override-model",
+                "mcpServers": {"server1": {"command": "echo"}}
+            });
+
+            deep_merge(&mut target, source);
+
+            let expected = serde_json::json!({
+                "model": "override-model",
+                " provider": {"endpoint": "default-endpoint"},
+                "mcpServers": {"server1": {"command": "echo"}}
+            });
+
+            assert_eq!(target, expected);
+        }
+
+        #[test]
+        fn settings_resolution_order_snapshot() {
+            let _guard = env_lock();
+            let root = temp_dir("settings_order");
+            let home = root.join("home").join(".claude");
+            let project = root.join("project").join(".claude");
+            let nested = root.join("project").join("apps").join("api");
+
+            fs::create_dir_all(&home).unwrap();
+            fs::create_dir_all(&project).unwrap();
+            fs::create_dir_all(&nested).unwrap();
+
+            fs::write(
+                home.join("settings.json"),
+                r#"{"global": "from-home", "override": "home"}"#,
+            )
+            .unwrap();
+            fs::write(
+                project.join("settings.json"),
+                r#"{"project": "from-project", "override": "project"}"#,
+            )
+            .unwrap();
+            fs::write(
+                project.join("settings.local.json"),
+                r#"{"local": "from-local", "override": "local"}"#,
+            )
+            .unwrap();
+
+            unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", root.join("home").join(".claude")) };
+            let (files, settings) = discover_settings(&nested).unwrap();
+            unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
+
+            assert!(files.iter().any(|p| p.ends_with("settings.json")));
+            assert!(files.iter().any(|p| p.ends_with("settings.local.json")));
+
+            assert_eq!(
+                settings.get("global").and_then(|v| v.as_str()),
+                Some("from-home")
+            );
+            assert_eq!(
+                settings.get("project").and_then(|v| v.as_str()),
+                Some("from-project")
+            );
+            assert_eq!(
+                settings.get("local").and_then(|v| v.as_str()),
+                Some("from-local")
+            );
+            assert_eq!(
+                settings.get("override").and_then(|v| v.as_str()),
+                Some("local")
+            );
+
+            fs::remove_dir_all(root).ok();
+        }
+
+        #[test]
+        fn slash_command_generation_snapshot() {
+            assert_eq!(slash_command_from_name("Code Review"), "/code-review");
+            assert_eq!(slash_command_from_name("My Test Skill"), "/my-test-skill");
+            assert_eq!(slash_command_from_name("simple"), "/simple");
+            assert_eq!(slash_command_from_name("Already-Dashed"), "/already-dashed");
+            assert_eq!(
+                slash_command_from_name("Multi Word Name"),
+                "/multi-word-name"
+            );
+        }
+
+        #[test]
+        fn skill_descriptor_snapshot_exact_fields() {
+            let path = PathBuf::from("/skills/my-skill/SKILL.md");
+            let skill = SkillDescriptor {
+                name: "My Skill".to_string(),
+                description: Some("Does something useful".to_string()),
+                when_to_use: Some("Use when needed".to_string()),
+                path: path.clone(),
+                body: "Skill content here.\n\nMore details.".to_string(),
+                slash_command: "/my-skill".to_string(),
+                legacy_command: false,
+            };
+
+            assert_eq!(skill.name, "My Skill");
+            assert_eq!(skill.description.as_deref(), Some("Does something useful"));
+            assert_eq!(skill.when_to_use.as_deref(), Some("Use when needed"));
+            assert_eq!(skill.path, path);
+            assert!(skill.body.contains("Skill content here"));
+            assert_eq!(skill.slash_command, "/my-skill");
+            assert!(!skill.legacy_command);
+        }
     }
 }

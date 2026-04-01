@@ -12,6 +12,7 @@ readme.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 directories.workspace = true
+once_cell.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
@@ -20,6 +21,9 @@ toml.workspace = true
 uuid.workspace = true
 futures-util.workspace = true
 tracing.workspace = true
-clawedcode-api = { path = "../clawedcode-api", version = "0.0.6" }
-clawedcode-mcp = { path = "../clawedcode-mcp", version = "0.0.6" }
-clawedcode-tools = { path = "../clawedcode-tools", version = "0.0.6" }
+clawedcode-api = { path = "../clawedcode-api", version = "0.0.7" }
+clawedcode-mcp = { path = "../clawedcode-mcp", version = "0.0.7" }
+clawedcode-tools = { path = "../clawedcode-tools", version = "0.0.7" }
+
+[dev-dependencies]
+tempfile.workspace = true

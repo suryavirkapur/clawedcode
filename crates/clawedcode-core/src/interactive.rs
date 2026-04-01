@@ -6,6 +6,11 @@ use crate::{
     prompt::PromptSpec,
     runtime::Runtime,
     session::{Role, Session},
+    subagent::{
+        CompletedSubAgentTask, SubAgentConfig, SubAgentResult, SubAgentRuntime,
+        SubAgentTaskState, drain_completed_subagent_tasks_for_parent,
+    },
+    tool_input::decode_tool_input,
 };
 use clawedcode_api::ApiEvent;
 use futures_util::StreamExt;
@@ -128,8 +133,7 @@ impl TuiContext {
                         handler.on_event(&TuiEvent::ThinkingDelta { text: text.clone() });
                     }
                     ApiEvent::ToolUse { tool_use } => {
-                        let input = serde_json::from_str(&tool_use.input)
-                            .unwrap_or(serde_json::Value::Null);
+                        let input = decode_tool_input(&tool_use.name, &tool_use.input);
                         tool_uses.push((tool_use.id.clone(), tool_use.name.clone(), input.clone()));
                         handler.on_event(&TuiEvent::ToolUse {
                             id: tool_use.id.clone(),
@@ -201,7 +205,7 @@ impl TuiContext {
                         tool_use_id,
                         tool_name,
                         input.clone(),
-                        &self.session.cwd,
+                        &mut self.session,
                     )
                 } else {
                     unreachable!("non-approval tools always approved")
@@ -284,6 +288,63 @@ impl TuiContext {
         self.refresh_compatibility()?;
         Ok(true)
     }
+
+    pub fn spawn_subagent(&mut self, prompt: &str) -> anyhow::Result<SubAgentResult> {
+        let runtime = SubAgentRuntime::new(
+            self.config.clone(),
+            self.system_prompt.clone(),
+            self.runtime.compatibility.clone(),
+            self.sessions_dir.clone(),
+            self.session.cwd.clone(),
+        );
+
+        runtime.spawn_and_link_to_parent(
+            &mut self.session,
+            SubAgentConfig {
+                prompt: prompt.to_string(),
+                max_turns: self.runtime.max_turns(),
+                permission_mode: self.runtime.permission_mode(),
+            },
+        )
+    }
+
+    pub fn spawn_subagent_background(&mut self, prompt: &str) -> anyhow::Result<SubAgentTaskState> {
+        let runtime = SubAgentRuntime::new(
+            self.config.clone(),
+            self.system_prompt.clone(),
+            self.runtime.compatibility.clone(),
+            self.sessions_dir.clone(),
+            self.session.cwd.clone(),
+        );
+
+        runtime.spawn_in_background_and_link_to_parent(
+            &mut self.session,
+            SubAgentConfig {
+                prompt: prompt.to_string(),
+                max_turns: self.runtime.max_turns(),
+                permission_mode: self.runtime.permission_mode(),
+            },
+        )
+    }
+
+    pub fn drain_completed_subagent_summaries(&mut self) -> Vec<CompletedSubAgentTask> {
+        let completed = drain_completed_subagent_tasks_for_parent(self.session.id);
+        if completed.is_empty() {
+            return completed;
+        }
+
+        for task in &completed {
+            self.session.push_blocks(
+                Role::Assistant,
+                vec![ContentBlock::subagent_summary(
+                    task.child_session_id.to_string(),
+                    task.summary.clone(),
+                )],
+            );
+        }
+
+        completed
+    }
 }
 
 fn run_in_runtime<F, T>(f: F) -> T
@@ -321,12 +382,7 @@ fn is_write_like(tool_name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::compat::CompatibilitySnapshot;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().expect("env lock")
-    }
+    use crate::test_support::env_lock;
 
     struct TestHandler {
         events: Vec<TuiEvent>,
@@ -501,5 +557,30 @@ mod tests {
 
         unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
         std::fs::remove_dir_all(&temp).ok();
+    }
+
+    mod approval_loop_tests {
+        use super::*;
+
+        #[test]
+        fn write_like_tools_require_approval_in_interactive_loop() {
+            assert!(is_write_like("shell"));
+            assert!(is_write_like("apply_patch"));
+            assert!(!is_write_like("read_file"));
+            assert!(!is_write_like("unknown_tool"));
+        }
+
+        #[test]
+        fn approval_request_populates_tool_fields() {
+            let request = ApprovalRequest {
+                tool_use_id: "tool-123".to_string(),
+                tool_name: "shell".to_string(),
+                input: serde_json::json!({"command": "rm -rf /"}),
+            };
+
+            assert_eq!(request.tool_use_id, "tool-123");
+            assert_eq!(request.tool_name, "shell");
+            assert_eq!(request.input["command"], "rm -rf /");
+        }
     }
 }

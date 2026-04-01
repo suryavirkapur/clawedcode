@@ -11,7 +11,7 @@ default-members = ["crates/clawedcode-cli"]
 resolver = "3"
 
 [workspace.package]
-version = "0.0.6"
+version = "0.0.7"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
@@ -24,10 +24,12 @@ chrono = { version = "0.4.42", features = ["serde"] }
 clap = { version = "4.5.48", features = ["derive", "env"] }
 crossterm = "0.29.0"
 directories = "6.0.0"
+once_cell = "1.21.3"
 ratatui = "0.29.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 serde_yaml = "0.9.34"
+tempfile = "3"
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 toml = "0.9.7"
 tracing = "0.1.41"

@@ -21,6 +21,10 @@ pub enum ContentBlock {
     Thinking {
         thinking: String,
     },
+    SubAgentSummary {
+        child_session_id: String,
+        summary: String,
+    },
 }
 
 impl ContentBlock {
@@ -59,6 +63,16 @@ impl ContentBlock {
     pub fn thinking(thinking: impl Into<String>) -> Self {
         Self::Thinking {
             thinking: thinking.into(),
+        }
+    }
+
+    pub fn subagent_summary(
+        child_session_id: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Self {
+        Self::SubAgentSummary {
+            child_session_id: child_session_id.into(),
+            summary: summary.into(),
         }
     }
 
@@ -107,6 +121,16 @@ mod tests {
         let block = ContentBlock::thinking("let me think");
         let json = serde_json::to_string(&block).unwrap();
         assert_eq!(json, r#"{"type":"thinking","thinking":"let me think"}"#);
+    }
+
+    #[test]
+    fn serialize_subagent_summary_block() {
+        let block = ContentBlock::subagent_summary("abc123", "done");
+        let json = serde_json::to_string(&block).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"sub_agent_summary","child_session_id":"abc123","summary":"done"}"#
+        );
     }
 
     #[test]

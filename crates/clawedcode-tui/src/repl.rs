@@ -1,19 +1,24 @@
 use anyhow::Result;
+use clawedcode_core::background_task::{list_background_tasks, TaskStatus as ShellTaskStatus};
 use clawedcode_core::compat::SkillDescriptor;
 use clawedcode_core::content::ContentBlock;
 use clawedcode_core::interactive::{ApprovalRequest, TuiContext, TuiEvent, TuiHandler};
 use clawedcode_core::session::{Message, Role, Session};
+use clawedcode_core::subagent::{
+    list_subagent_tasks_for_parent, SubAgentTaskState, SubAgentTaskStatus,
+};
+use clawedcode_core::update::InstallMethod;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
+        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
     },
 };
 use ratatui::{
-    DefaultTerminal,
     prelude::*,
     widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
+    DefaultTerminal,
 };
 use std::{
     cmp::Reverse,
@@ -26,6 +31,44 @@ use std::{
 const ACCENT: Color = Color::Rgb(224, 122, 95);
 const MUTED: Color = Color::Rgb(150, 150, 150);
 const DASHBOARD_HEIGHT: u16 = 13;
+
+const BUILTIN_COMMANDS: &[&str] = &["/help", "/clear", "/update", "/task", "/tasks"];
+
+fn is_reserved_command(name: &str) -> bool {
+    BUILTIN_COMMANDS.contains(&name)
+}
+
+fn is_valid_command_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix('/') else {
+        return false;
+    };
+    if rest.is_empty() {
+        return false;
+    }
+    rest.chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+fn update_is_supported(install_method: InstallMethod) -> bool {
+    matches!(install_method, InstallMethod::Cargo | InstallMethod::Npm)
+}
+
+fn command_is_visible(entry: &CommandEntry, install_method: InstallMethod) -> bool {
+    match entry.name.as_str() {
+        "/update" => update_is_supported(install_method),
+        _ => true,
+    }
+}
+
+fn skill_is_registerable(skill: &SkillDescriptor) -> bool {
+    if !skill.body.trim().is_empty()
+        && is_valid_command_name(&skill.slash_command)
+        && !is_reserved_command(&skill.slash_command)
+    {
+        return true;
+    }
+    false
+}
 
 pub fn run_with_context(mut ctx: TuiContext) -> Result<()> {
     enable_raw_mode()?;
@@ -129,6 +172,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     let mut last_area = Rect::default();
 
     loop {
+        integrate_completed_subagents(ctx, &mut handler);
+
         if input_buffer.trim_start().starts_with('/') {
             let _ = ctx.refresh_compatibility_if_stale(Duration::from_millis(500));
         }
@@ -576,6 +621,17 @@ fn append_message_to_transcript(lines: &mut Vec<String>, msg: &Message, show_thi
                 lines.push(format!("{prefix} {tool_use_id}: {content}"));
                 lines.push(String::new());
             }
+            ContentBlock::SubAgentSummary {
+                child_session_id,
+                summary,
+            } => {
+                lines.push(format!(
+                    "[sub-agent: {}] {}",
+                    &child_session_id[..8.min(child_session_id.len())],
+                    summary
+                ));
+                lines.push(String::new());
+            }
         }
     }
 
@@ -620,7 +676,7 @@ fn execute_tool_with_approval(
             &req.tool_use_id,
             &req.tool_name,
             req.input.clone(),
-            &ctx.session().cwd,
+            &mut ctx.session,
         );
         if let ContentBlock::ToolResult {
             tool_use_id,
@@ -681,17 +737,66 @@ fn handle_slash_command(
             let _ = ctx.save_session();
             return Ok(true);
         }
-        "/update" => match clawedcode_core::update::run_self_update() {
-            Ok(outcome) => {
+        "/update" => {
+            let install_method = clawedcode_core::update::detect_install_method();
+            if !update_is_supported(install_method) {
+                let msg = match install_method {
+                    InstallMethod::LocalBuild => "[info] Self-update is not supported for local builds. Install via cargo or npm to enable updates.".to_string(),
+                    InstallMethod::Unknown => "[info] Could not determine install method. Set CLAWEDCODE_INSTALL_METHOD to cargo or npm.".to_string(),
+                    _ => "[info] Self-update is not available.".to_string(),
+                };
+                handler.push_overlay(msg);
+            } else {
+                match clawedcode_core::update::run_self_update() {
+                    Ok(outcome) => {
+                        handler.push_overlay(format!(
+                            "[info] Updated clawedcode via {:?} using `{}`",
+                            outcome.method, outcome.command
+                        ));
+                    }
+                    Err(err) => {
+                        handler.push_overlay(format!("[info] Update failed: {err}"));
+                    }
+                }
+            }
+        }
+        "/task" => {
+            let task_prompt = prompt
+                .strip_prefix("/task")
+                .map(str::trim)
+                .unwrap_or_default();
+            if task_prompt.is_empty() {
+                handler.push_overlay(
+                    "[info] Usage: /task <prompt>. Provide a prompt for the sub-agent.".to_string(),
+                );
+            } else {
                 handler.push_overlay(format!(
-                    "[info] Updated clawedcode via {:?} using `{}`",
-                    outcome.method, outcome.command
+                    "[info] Starting background sub-agent: {}...",
+                    truncate_for_display(task_prompt, 50)
                 ));
+                match ctx.spawn_subagent_background(task_prompt) {
+                    Ok(result) => {
+                        handler.push_overlay(format!(
+                            "[info] Sub-agent queued (session: {}, status: running)",
+                            &result.child_session_id.to_string()[..8],
+                        ));
+                    }
+                    Err(err) => {
+                        handler.push_overlay(format!("[error] Sub-agent failed: {err}"));
+                    }
+                }
             }
-            Err(err) => {
-                handler.push_overlay(format!("[info] Update failed: {err}"));
+            let _ = ctx.save_session();
+            return Ok(true);
+        }
+        "/tasks" => {
+            handler.push_overlay("[info] Background tasks:");
+            for line in background_task_lines(ctx) {
+                handler.push_overlay(format!("[info] {line}"));
             }
-        },
+            let _ = ctx.save_session();
+            return Ok(true);
+        }
         other => {
             if let Some(skill) = find_skill_command(ctx, other) {
                 execute_skill_command(ctx, handler, prompt, skill);
@@ -712,14 +817,6 @@ fn execute_skill_command(
     visible_prompt: &str,
     skill: SkillDescriptor,
 ) {
-    if !skill_is_executable(&skill) {
-        handler.push_overlay(format!(
-            "[info] Skill '{}' has no content",
-            skill.slash_command
-        ));
-        return;
-    }
-
     let args = visible_prompt
         .strip_prefix(&skill.slash_command)
         .map(str::trim)
@@ -735,6 +832,7 @@ fn execute_skill_command(
 }
 
 fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
+    let install_method = clawedcode_core::update::detect_install_method();
     let mut entries = vec![
         CommandEntry {
             name: "/help".to_string(),
@@ -751,12 +849,24 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
             description: "Update clawedcode using the detected install method".to_string(),
             source: CommandSource::BuiltIn,
         },
+        CommandEntry {
+            name: "/task".to_string(),
+            description: "Spawn a child agent to handle a sub-task".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/tasks".to_string(),
+            description: "Show running and completed background tasks".to_string(),
+            source: CommandSource::BuiltIn,
+        },
     ];
+
+    entries.retain(|entry| command_is_visible(entry, install_method));
 
     for skill in ctx
         .skills()
         .iter()
-        .filter(|skill| skill_is_executable(skill))
+        .filter(|skill| skill_is_registerable(skill))
     {
         entries.push(CommandEntry {
             name: skill.slash_command.clone(),
@@ -785,6 +895,88 @@ fn filtered_command_entries(ctx: &TuiContext, input_buffer: &str) -> Vec<Command
         .collect()
 }
 
+fn integrate_completed_subagents(ctx: &mut TuiContext, handler: &mut ReplHandler) {
+    let completed = ctx.drain_completed_subagent_summaries();
+    if completed.is_empty() {
+        return;
+    }
+
+    for task in completed {
+        let status = match task.status {
+            SubAgentTaskStatus::Completed => "completed",
+            SubAgentTaskStatus::Failed => "failed",
+            SubAgentTaskStatus::Running => "running",
+        };
+        handler.push_overlay(format!(
+            "[info] Background sub-agent {} {status} ({} tool calls)",
+            &task.child_session_id.to_string()[..8],
+            task.tools_executed
+        ));
+    }
+
+    handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
+}
+
+fn background_task_lines(ctx: &TuiContext) -> Vec<String> {
+    let session_id = ctx.session().id.to_string();
+    let mut lines = Vec::new();
+
+    let mut shell_tasks: Vec<_> = list_background_tasks()
+        .into_iter()
+        .filter(|task| task.session_id == session_id)
+        .collect();
+    shell_tasks.sort_by_key(|task| task.created_at);
+
+    for task in shell_tasks {
+        lines.push(format!(
+            "[shell:{status}] {id} {desc}",
+            status = shell_task_status_name(task.status),
+            id = &task.id[..8.min(task.id.len())],
+            desc = truncate_for_display(&task.description, 48),
+        ));
+    }
+
+    let subagent_tasks = list_subagent_tasks_for_parent(ctx.session().id);
+    for task in subagent_tasks {
+        lines.push(format_subagent_task_line(&task));
+    }
+
+    if lines.is_empty() {
+        vec!["No background tasks".to_string()]
+    } else {
+        lines
+    }
+}
+
+fn shell_task_status_name(status: ShellTaskStatus) -> &'static str {
+    match status {
+        ShellTaskStatus::Pending => "pending",
+        ShellTaskStatus::Running => "running",
+        ShellTaskStatus::Completed => "completed",
+        ShellTaskStatus::Failed => "failed",
+        ShellTaskStatus::Killed => "killed",
+    }
+}
+
+fn format_subagent_task_line(task: &SubAgentTaskState) -> String {
+    let status = match task.status {
+        SubAgentTaskStatus::Running => "running",
+        SubAgentTaskStatus::Completed => "completed",
+        SubAgentTaskStatus::Failed => "failed",
+    };
+    let detail = task
+        .summary
+        .clone()
+        .or_else(|| task.error.clone())
+        .unwrap_or_else(|| truncate_for_display(&task.prompt, 48));
+
+    format!(
+        "[agent:{status}] {id} {detail}",
+        id = &task.child_session_id.to_string()[..8],
+        detail = truncate_for_display(&detail, 48),
+    )
+}
+
 fn is_write_like(tool_name: &str) -> bool {
     matches!(tool_name, "shell" | "apply_patch")
 }
@@ -792,12 +984,8 @@ fn is_write_like(tool_name: &str) -> bool {
 fn find_skill_command(ctx: &TuiContext, command: &str) -> Option<SkillDescriptor> {
     ctx.skills()
         .iter()
-        .find(|skill| skill_is_executable(skill) && skill.slash_command == command)
+        .find(|skill| skill_is_registerable(skill) && skill.slash_command == command)
         .cloned()
-}
-
-fn skill_is_executable(skill: &SkillDescriptor) -> bool {
-    skill.slash_command.starts_with('/') && !skill.body.trim().is_empty()
 }
 
 fn build_skill_execution_prompt(skill: &SkillDescriptor, args: &str) -> String {
@@ -905,6 +1093,17 @@ fn truncate_summary(text: &str) -> String {
     }
 }
 
+fn truncate_for_display(text: &str, max_len: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.len() <= max_len {
+        trimmed.to_string()
+    } else {
+        let mut chars = trimmed.chars();
+        let summary: String = chars.by_ref().take(max_len).collect();
+        format!("{summary}...")
+    }
+}
+
 fn relative_time_label(timestamp: i64) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -941,4 +1140,376 @@ fn restore_terminal() -> Result<()> {
     execute!(io::stdout(), LeaveAlternateScreen)?;
     ratatui::restore();
     Ok(())
+}
+
+#[cfg(test)]
+mod command_policy_tests {
+    use super::*;
+
+    #[test]
+    fn test_is_reserved_command() {
+        assert!(is_reserved_command("/help"));
+        assert!(is_reserved_command("/clear"));
+        assert!(is_reserved_command("/update"));
+        assert!(is_reserved_command("/task"));
+        assert!(is_reserved_command("/tasks"));
+        assert!(!is_reserved_command("/code-review"));
+        assert!(!is_reserved_command("/my-skill"));
+    }
+
+    #[test]
+    fn test_is_valid_command_name_valid() {
+        assert!(is_valid_command_name("/help"));
+        assert!(is_valid_command_name("/clear"));
+        assert!(is_valid_command_name("/task"));
+        assert!(is_valid_command_name("/tasks"));
+        assert!(is_valid_command_name("/code-review"));
+        assert!(is_valid_command_name("/my-skill-123"));
+        assert!(is_valid_command_name("/a"));
+        assert!(is_valid_command_name("/abc123"));
+    }
+
+    #[test]
+    fn test_is_valid_command_name_invalid() {
+        assert!(!is_valid_command_name("help"));
+        assert!(!is_valid_command_name("/"));
+        assert!(!is_valid_command_name("/Bad"));
+        assert!(!is_valid_command_name("/bad_name"));
+        assert!(!is_valid_command_name("/bad name"));
+        assert!(!is_valid_command_name("/bad@name"));
+        assert!(!is_valid_command_name("/bad.Name"));
+        assert!(!is_valid_command_name("/bad name"));
+    }
+
+    #[test]
+    fn test_update_is_supported() {
+        assert!(update_is_supported(InstallMethod::Cargo));
+        assert!(update_is_supported(InstallMethod::Npm));
+        assert!(!update_is_supported(InstallMethod::LocalBuild));
+        assert!(!update_is_supported(InstallMethod::Unknown));
+    }
+
+    #[test]
+    fn test_skill_is_registerable_valid() {
+        let skill = SkillDescriptor {
+            slash_command: "/code-review".to_string(),
+            name: "Code Review".to_string(),
+            description: Some("Reviews code".to_string()),
+            when_to_use: None,
+            legacy_command: false,
+            body: "Review the code changes".to_string(),
+            path: PathBuf::from("/skills/code-review.md"),
+        };
+        assert!(skill_is_registerable(&skill));
+    }
+
+    #[test]
+    fn test_skill_is_registerable_collides_with_builtin() {
+        let skill = SkillDescriptor {
+            slash_command: "/help".to_string(),
+            name: "Help Skill".to_string(),
+            description: Some("Provides help".to_string()),
+            when_to_use: None,
+            legacy_command: false,
+            body: "Help content".to_string(),
+            path: PathBuf::from("/skills/help.md"),
+        };
+        assert!(!skill_is_registerable(&skill));
+    }
+
+    #[test]
+    fn test_skill_is_registerable_malformed_name() {
+        let skill = SkillDescriptor {
+            slash_command: "/Bad Name".to_string(),
+            name: "Bad Name Skill".to_string(),
+            description: Some("Bad name".to_string()),
+            when_to_use: None,
+            legacy_command: false,
+            body: "Content".to_string(),
+            path: PathBuf::from("/skills/bad-name.md"),
+        };
+        assert!(!skill_is_registerable(&skill));
+    }
+
+    #[test]
+    fn test_skill_is_registerable_empty_body() {
+        let skill = SkillDescriptor {
+            slash_command: "/valid".to_string(),
+            name: "Valid Skill".to_string(),
+            description: Some("Valid".to_string()),
+            when_to_use: None,
+            legacy_command: false,
+            body: "   ".to_string(),
+            path: PathBuf::from("/skills/valid.md"),
+        };
+        assert!(!skill_is_registerable(&skill));
+    }
+
+    #[test]
+    fn test_command_is_visible_update_cargo() {
+        let entry = CommandEntry {
+            name: "/update".to_string(),
+            description: "Update clawedcode".to_string(),
+            source: CommandSource::BuiltIn,
+        };
+        assert!(command_is_visible(&entry, InstallMethod::Cargo));
+    }
+
+    #[test]
+    fn test_command_is_visible_update_npm() {
+        let entry = CommandEntry {
+            name: "/update".to_string(),
+            description: "Update clawedcode".to_string(),
+            source: CommandSource::BuiltIn,
+        };
+        assert!(command_is_visible(&entry, InstallMethod::Npm));
+    }
+
+    #[test]
+    fn test_command_is_visible_update_local_build() {
+        let entry = CommandEntry {
+            name: "/update".to_string(),
+            description: "Update clawedcode".to_string(),
+            source: CommandSource::BuiltIn,
+        };
+        assert!(!command_is_visible(&entry, InstallMethod::LocalBuild));
+    }
+
+    #[test]
+    fn test_command_is_visible_update_unknown() {
+        let entry = CommandEntry {
+            name: "/update".to_string(),
+            description: "Update clawedcode".to_string(),
+            source: CommandSource::BuiltIn,
+        };
+        assert!(!command_is_visible(&entry, InstallMethod::Unknown));
+    }
+
+    #[test]
+    fn test_command_is_visible_help_always_visible() {
+        let entry = CommandEntry {
+            name: "/help".to_string(),
+            description: "Show help".to_string(),
+            source: CommandSource::BuiltIn,
+        };
+        assert!(command_is_visible(&entry, InstallMethod::Cargo));
+        assert!(command_is_visible(&entry, InstallMethod::LocalBuild));
+        assert!(command_is_visible(&entry, InstallMethod::Unknown));
+    }
+
+    #[test]
+    fn format_subagent_task_line_uses_summary_when_available() {
+        let task = SubAgentTaskState {
+            child_session_id: uuid::Uuid::new_v4(),
+            parent_session_id: uuid::Uuid::new_v4(),
+            prompt: "Inspect two modules".to_string(),
+            status: SubAgentTaskStatus::Completed,
+            summary: Some("Compared the modules and found the shared bug".to_string()),
+            tools_executed: 3,
+            error: None,
+            created_at: chrono::Utc::now(),
+            ended_at: Some(chrono::Utc::now()),
+            surfaced: false,
+        };
+
+        let line = format_subagent_task_line(&task);
+        assert!(line.starts_with("[agent:completed] "));
+        assert!(line.contains("Compared the modules"));
+    }
+
+    #[test]
+    fn format_subagent_task_line_falls_back_to_prompt() {
+        let task = SubAgentTaskState {
+            child_session_id: uuid::Uuid::new_v4(),
+            parent_session_id: uuid::Uuid::new_v4(),
+            prompt: "Inspect two modules in parallel".to_string(),
+            status: SubAgentTaskStatus::Running,
+            summary: None,
+            tools_executed: 0,
+            error: None,
+            created_at: chrono::Utc::now(),
+            ended_at: None,
+            surfaced: false,
+        };
+
+        let line = format_subagent_task_line(&task);
+        assert!(line.starts_with("[agent:running] "));
+        assert!(line.contains("Inspect two modules"));
+    }
+
+    mod transcript_snapshot_tests {
+        use super::*;
+        use clawedcode_core::{
+            compat::CompatibilitySnapshot, config::AppConfig, prompt::PromptSpec,
+        };
+        use std::{
+            fs,
+            path::PathBuf,
+            time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+        };
+
+        fn temp_dir(name: &str) -> PathBuf {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!("clawed_tui_{name}_{unique}"));
+            fs::create_dir_all(&dir).expect("create temp dir");
+            dir
+        }
+
+        fn render_session(session: &Session, show_thinking: bool) -> String {
+            let mut handler = ReplHandler::new();
+            handler.rebuild_from_session(session, show_thinking);
+            handler.visible_lines().join("\n")
+        }
+
+        fn make_context(sessions_dir: PathBuf) -> TuiContext {
+            TuiContext::new(
+                AppConfig::default(),
+                PromptSpec {
+                    name: "test",
+                    summary: "test",
+                    body: "You are a test assistant.",
+                },
+                CompatibilitySnapshot {
+                    settings_files: vec![],
+                    settings: serde_json::Value::Null,
+                    skills: vec![],
+                    memory_files: vec![],
+                    memory: String::new(),
+                    mcp_servers: std::collections::BTreeMap::new(),
+                },
+                PathBuf::from("/tmp"),
+                sessions_dir,
+            )
+        }
+
+        #[test]
+        fn transcript_snapshot_user_and_assistant_text_only() {
+            let mut session = Session::new(PathBuf::from("/tmp/test"));
+            session.push(Role::User, "What is 2+2?");
+            session.push(Role::Assistant, "The answer is 4.");
+
+            assert_eq!(
+                render_session(&session, false),
+                "You: What is 2+2?\nClawedCode: The answer is 4."
+            );
+        }
+
+        #[test]
+        fn transcript_snapshot_hides_system_and_thinking_by_default() {
+            let mut session = Session::new(PathBuf::from("/tmp/test"));
+            session.push(Role::System, "You should not see this.");
+            session.push(Role::User, "Hello");
+            session.push_blocks(
+                Role::Assistant,
+                vec![
+                    ContentBlock::thinking("Let me think about this."),
+                    ContentBlock::text("Hi there."),
+                ],
+            );
+
+            assert_eq!(render_session(&session, false), "You: Hello\nClawedCode: Hi there.");
+        }
+
+        #[test]
+        fn transcript_snapshot_shows_thinking_when_enabled() {
+            let mut session = Session::new(PathBuf::from("/tmp/test"));
+            session.push(Role::User, "Hello");
+            session.push_blocks(
+                Role::Assistant,
+                vec![
+                    ContentBlock::thinking("Let me think about this."),
+                    ContentBlock::text("Hi there."),
+                ],
+            );
+
+            assert_eq!(
+                render_session(&session, true),
+                "You: Hello\n[thinking] Let me think about this.\n\nClawedCode: Hi there."
+            );
+        }
+
+        #[test]
+        fn transcript_snapshot_includes_tool_lines_but_not_system_messages() {
+            let mut session = Session::new(PathBuf::from("/tmp/test"));
+            session.push(Role::System, "You should not see this.");
+            session.push(Role::User, "Read the file.");
+            session.push_blocks(
+                Role::Assistant,
+                vec![ContentBlock::tool_use(
+                    "tool-1",
+                    "read_file",
+                    serde_json::json!({"path": "test.txt"}),
+                )],
+            );
+            session.push_blocks(
+                Role::Tool,
+                vec![ContentBlock::tool_result("tool-1", "file contents here")],
+            );
+
+            assert_eq!(
+                render_session(&session, false),
+                "You: Read the file.\n[tool] read_file (id=tool-1) {\"path\":\"test.txt\"}\n[tool_result] tool-1: file contents here"
+            );
+        }
+
+        #[test]
+        fn transcript_snapshot_renders_subagent_summary() {
+            let mut session = Session::new(PathBuf::from("/tmp/test"));
+            session.push_blocks(
+                Role::Assistant,
+                vec![ContentBlock::subagent_summary(
+                    "child-session-123".to_string(),
+                    "Completed the task successfully.".to_string(),
+                )],
+            );
+
+            assert_eq!(
+                render_session(&session, false),
+                "[sub-agent: child-se] Completed the task successfully."
+            );
+        }
+
+        #[test]
+        fn transcript_rebuild_stays_fast_for_small_session() {
+            let mut session = Session::new(PathBuf::from("/tmp/test"));
+            for idx in 0..200 {
+                session.push(Role::User, format!("prompt {idx}"));
+                session.push(Role::Assistant, format!("reply {idx}"));
+            }
+
+            let start = Instant::now();
+            let rendered = render_session(&session, false);
+            let elapsed = start.elapsed();
+
+            assert!(rendered.contains("prompt 199"));
+            assert!(elapsed < Duration::from_secs(2), "elapsed: {elapsed:?}");
+        }
+
+        #[test]
+        fn recent_activity_stays_fast_for_small_session_store() {
+            let root = temp_dir("recent_activity");
+            let sessions_dir = root.join("sessions");
+            fs::create_dir_all(&sessions_dir).unwrap();
+
+            for idx in 0..20 {
+                let mut session = Session::new(PathBuf::from(format!("/tmp/project-{idx}")));
+                session.push(Role::User, format!("recent prompt {idx}"));
+                session.save(&sessions_dir).unwrap();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+
+            let ctx = make_context(sessions_dir.clone());
+            let start = Instant::now();
+            let entries = recent_activity(&ctx, 5);
+            let elapsed = start.elapsed();
+
+            assert!(!entries.is_empty());
+            assert!(elapsed < Duration::from_secs(2), "elapsed: {elapsed:?}");
+
+            fs::remove_dir_all(root).ok();
+        }
+    }
 }

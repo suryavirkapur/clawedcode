@@ -18,8 +18,8 @@ futures-util.workspace = true
 pin-project-lite.workspace = true
 # Use Rustls TLS so our Linux-musl release builds don't need system OpenSSL.
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-webpki-roots"], optional = true }
-clawedcode-mcp = { path = "../clawedcode-mcp", version = "0.0.6" }
-clawedcode-tools = { path = "../clawedcode-tools", version = "0.0.6" }
+clawedcode-mcp = { path = "../clawedcode-mcp", version = "0.0.7" }
+clawedcode-tools = { path = "../clawedcode-tools", version = "0.0.7" }
 
 [features]
 default = []

@@ -10,7 +10,9 @@ readme.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
 serde_json.workspace = true
-clawedcode-core = { path = "../clawedcode-core", version = "0.0.6" }
+uuid.workspace = true
+clawedcode-core = { path = "../clawedcode-core", version = "0.0.7" }

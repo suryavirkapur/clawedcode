@@ -30,8 +30,8 @@ Not done:
 
 - [ ] MCP non-stdio transports
 - [x] Session compaction / context trimming
-- [ ] sub-agents
-- [ ] remote/direct-connect/ssh modes
+- [x] sub-agents
+- [x] remote/direct-connect/ssh modes
 
 ## Phase 1: Bootstrap And Modes
 
@@ -256,11 +256,11 @@ Current status:
 
 ### Deliverables
 
-- [ ] Background task model
-- [ ] Nested session runtime for sub-agents
-- [ ] Parent/child transcript linkage
-- [ ] Progress aggregation
-- [ ] TUI views for task status and retained transcripts
+- [x] Background task model
+- [x] Nested session runtime for sub-agents
+- [x] Parent/child transcript linkage
+- [x] Progress aggregation
+- [x] TUI views for task status and retained transcripts
 
 ### Exit Criteria
 
@@ -270,21 +270,36 @@ cargo run -- run --prompt "investigate two modules in parallel"
 
 Should be able to spawn bounded child work items and merge their outputs back into the main session.
 
+Current status:
+
+- background shell tasks, output retrieval, and stop flow are implemented
+- `Agent`/legacy `Task` now launch forked child sessions that inherit parent context
+- multiple agent tool calls in a single provider turn execute concurrently and return ordered results
+- parent sessions retain child-session linkage while persisted child transcripts remain on disk
+- the TUI surfaces current shell/sub-agent task state through `/tasks`
+
 ## Phase 10: Remote And Alternate Execution Modes
 
 **Goal**: Add the non-local session entrypoints that the upstream bootstrap handles explicitly.
 
 ### Deliverables
 
-- [ ] Headless/SDK mode parity
-- [ ] Direct-connect session model
-- [ ] SSH-backed remote session model
-- [ ] Remote execution config passing
-- [ ] Resume compatibility across execution modes
+- [x] Headless/SDK mode parity
+- [x] Direct-connect session model
+- [x] SSH-backed remote session model
+- [x] Remote execution config passing
+- [x] Resume compatibility across execution modes
 
 ### Exit Criteria
 
 Remote and headless paths should be separate execution modes with explicit runtime boundaries, not bolted onto the local REPL path.
+
+Current status:
+
+- `headless`, `ssh`, `direct-connect`, and `remote` are all separate execution modes
+- `ssh`, `direct-connect`, and `remote` now execute through explicit one-shot headless transport clients instead of local fallback logic
+- mode-specific prompt, cwd, system prompt, thinking, json, and auto-approval flags are forwarded deterministically
+- execution-mode metadata already persists on sessions for local resume/continue paths
 
 ## Phase 11: Hardening
 
@@ -292,12 +307,12 @@ Remote and headless paths should be separate execution modes with explicit runti
 
 ### Deliverables
 
-- [ ] Snapshot tests for transcripts and config resolution
-- [ ] Integration tests for tool approval and execution loops
-- [ ] Streaming/provider failure tests
-- [ ] Session resume regression tests
-- [ ] MCP transport and reconnection tests
-- [ ] Performance checks for startup and render loops
+- [x] Snapshot tests for transcripts and config resolution
+- [x] Integration tests for tool approval and execution loops
+- [x] Streaming/provider failure tests
+- [x] Session resume regression tests
+- [x] MCP transport and reconnection tests
+- [x] Performance checks for startup and render loops
 
 ### Exit Criteria
 

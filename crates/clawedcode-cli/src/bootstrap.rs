@@ -2,10 +2,10 @@ use crate::cli::{Cli, Command};
 use anyhow::{Context, Result};
 use clawedcode_core::{
     compat,
-    config::{AppConfig, default_config_path},
+    config::{default_config_path, AppConfig},
 };
 use std::{fs, path::PathBuf};
-use tracing_subscriber::{EnvFilter, fmt};
+use tracing_subscriber::{fmt, EnvFilter};
 
 #[derive(Debug)]
 pub struct BootstrappedApp {
@@ -56,17 +56,55 @@ pub struct ContinueMode {
     pub yes: bool,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct HeadlessMode;
+#[derive(Debug, Clone)]
+pub struct HeadlessMode {
+    pub prompt: String,
+    pub system_prompt: Option<String>,
+    pub json: bool,
+    pub show_thinking: bool,
+    pub yes: bool,
+    pub output_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DirectConnectMode {
+    pub address: String,
+    pub prompt: Option<String>,
+    pub system_prompt: Option<String>,
+    pub json: bool,
+    pub show_thinking: bool,
+    pub yes: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SshMode {
+    pub target: String,
+    pub prompt: Option<String>,
+    pub system_prompt: Option<String>,
+    pub json: bool,
+    pub show_thinking: bool,
+    pub yes: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteMode {
+    pub orchestrator: String,
+    pub prompt: Option<String>,
+    pub system_prompt: Option<String>,
+    pub json: bool,
+    pub show_thinking: bool,
+    pub yes: bool,
+}
 
 #[derive(Debug, Clone, Default)]
-pub struct DirectConnectMode;
-
-#[derive(Debug, Clone, Default)]
-pub struct SshMode;
-
-#[derive(Debug, Clone, Default)]
-pub struct RemoteMode;
+struct PromptExecutionPayload {
+    prompt: Option<String>,
+    system_prompt: Option<String>,
+    json: bool,
+    show_thinking: bool,
+    yes: bool,
+    output_path: Option<PathBuf>,
+}
 
 pub fn bootstrap(cli: Cli) -> Result<BootstrappedApp> {
     init_tracing();
@@ -83,6 +121,49 @@ pub fn bootstrap(cli: Cli) -> Result<BootstrappedApp> {
 }
 
 pub fn resolve_mode(cli: &Cli) -> Result<ExecutionMode> {
+    let prompt_payload = prompt_payload_from_command(cli.command.as_ref());
+
+    if cli.headless {
+        return Ok(ExecutionMode::Headless(HeadlessMode {
+            prompt: prompt_payload.prompt.unwrap_or_default(),
+            system_prompt: prompt_payload.system_prompt,
+            json: prompt_payload.json,
+            show_thinking: prompt_payload.show_thinking,
+            yes: prompt_payload.yes,
+            output_path: prompt_payload.output_path,
+        }));
+    }
+    if let Some(ref remote_addr) = cli.remote {
+        return Ok(ExecutionMode::Remote(RemoteMode {
+            orchestrator: remote_addr.clone(),
+            prompt: prompt_payload.prompt,
+            system_prompt: prompt_payload.system_prompt,
+            json: prompt_payload.json,
+            show_thinking: prompt_payload.show_thinking,
+            yes: prompt_payload.yes,
+        }));
+    }
+    if let Some(ref address) = cli.direct_connect {
+        return Ok(ExecutionMode::DirectConnect(DirectConnectMode {
+            address: address.clone(),
+            prompt: prompt_payload.prompt,
+            system_prompt: prompt_payload.system_prompt,
+            json: prompt_payload.json,
+            show_thinking: prompt_payload.show_thinking,
+            yes: prompt_payload.yes,
+        }));
+    }
+    if let Some(ref target) = cli.ssh {
+        return Ok(ExecutionMode::Ssh(SshMode {
+            target: target.clone(),
+            prompt: prompt_payload.prompt,
+            system_prompt: prompt_payload.system_prompt,
+            json: prompt_payload.json,
+            show_thinking: prompt_payload.show_thinking,
+            yes: prompt_payload.yes,
+        }));
+    }
+
     let cmd = cli.command.clone().unwrap_or(Command::Tui);
     match cmd {
         Command::Tui => Ok(ExecutionMode::Tui),
@@ -126,12 +207,132 @@ pub fn resolve_mode(cli: &Cli) -> Result<ExecutionMode> {
         Command::Config => Ok(ExecutionMode::Config),
         Command::Compat => Ok(ExecutionMode::Compat),
         Command::Update => Ok(ExecutionMode::Update),
-        Command::Headless => Err(anyhow::anyhow!("headless mode is not yet implemented")),
-        Command::DirectConnect => Err(anyhow::anyhow!(
-            "direct-connect mode is not yet implemented"
-        )),
-        Command::Ssh => Err(anyhow::anyhow!("ssh mode is not yet implemented")),
-        Command::Remote => Err(anyhow::anyhow!("remote mode is not yet implemented")),
+        Command::Headless {
+            prompt,
+            system_prompt,
+            json,
+            show_thinking,
+            yes,
+            output_path,
+        } => Ok(ExecutionMode::Headless(HeadlessMode {
+            prompt: prompt.unwrap_or_default(),
+            system_prompt,
+            json,
+            show_thinking,
+            yes,
+            output_path,
+        })),
+        Command::DirectConnect {
+            address,
+            prompt,
+            system_prompt,
+            json,
+            show_thinking,
+            yes,
+        } => Ok(ExecutionMode::DirectConnect(DirectConnectMode {
+            address,
+            prompt,
+            system_prompt,
+            json,
+            show_thinking,
+            yes,
+        })),
+        Command::Ssh {
+            target,
+            prompt,
+            system_prompt,
+            json,
+            show_thinking,
+            yes,
+        } => Ok(ExecutionMode::Ssh(SshMode {
+            target,
+            prompt,
+            system_prompt,
+            json,
+            show_thinking,
+            yes,
+        })),
+        Command::Remote {
+            orchestrator,
+            prompt,
+            system_prompt,
+            json,
+            show_thinking,
+            yes,
+        } => Ok(ExecutionMode::Remote(RemoteMode {
+            orchestrator,
+            prompt,
+            system_prompt,
+            json,
+            show_thinking,
+            yes,
+        })),
+    }
+}
+
+fn prompt_payload_from_command(command: Option<&Command>) -> PromptExecutionPayload {
+    match command {
+        Some(Command::Run {
+            prompt,
+            system_prompt,
+            json,
+            show_thinking,
+            yes,
+        }) => PromptExecutionPayload {
+            prompt: Some(prompt.clone()),
+            system_prompt: system_prompt.clone(),
+            json: *json,
+            show_thinking: *show_thinking,
+            yes: *yes,
+            output_path: None,
+        },
+        Some(Command::Headless {
+            prompt,
+            system_prompt,
+            json,
+            show_thinking,
+            yes,
+            output_path,
+        }) => PromptExecutionPayload {
+            prompt: prompt.clone(),
+            system_prompt: system_prompt.clone(),
+            json: *json,
+            show_thinking: *show_thinking,
+            yes: *yes,
+            output_path: output_path.clone(),
+        },
+        Some(Command::DirectConnect {
+            prompt,
+            system_prompt,
+            json,
+            show_thinking,
+            yes,
+            ..
+        })
+        | Some(Command::Ssh {
+            prompt,
+            system_prompt,
+            json,
+            show_thinking,
+            yes,
+            ..
+        })
+        | Some(Command::Remote {
+            prompt,
+            system_prompt,
+            json,
+            show_thinking,
+            yes,
+            ..
+        }) => PromptExecutionPayload {
+            prompt: prompt.clone(),
+            system_prompt: system_prompt.clone(),
+            json: *json,
+            show_thinking: *show_thinking,
+            yes: *yes,
+            output_path: None,
+        },
+        _ => PromptExecutionPayload::default(),
     }
 }
 
@@ -284,10 +485,86 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_mode_future_returns_error() {
-        let cli = make_cli(Command::Headless);
-        let err = resolve_mode(&cli).unwrap_err();
-        assert!(err.to_string().contains("not yet implemented"));
+    fn test_resolve_mode_headless() {
+        let cli = make_cli(Command::Headless {
+            prompt: Some("hello".to_string()),
+            system_prompt: Some("be helpful".to_string()),
+            json: true,
+            show_thinking: true,
+            yes: true,
+            output_path: Some(PathBuf::from("/tmp/out")),
+        });
+        let mode = resolve_mode(&cli).unwrap();
+        assert!(matches!(mode, ExecutionMode::Headless(_)));
+        if let ExecutionMode::Headless(headless) = mode {
+            assert_eq!(headless.prompt, "hello");
+            assert_eq!(headless.system_prompt.as_deref(), Some("be helpful"));
+            assert!(headless.json);
+            assert!(headless.show_thinking);
+            assert!(headless.yes);
+            assert_eq!(
+                headless.output_path.as_ref(),
+                Some(&PathBuf::from("/tmp/out"))
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_mode_direct_connect() {
+        let cli = make_cli(Command::DirectConnect {
+            address: "localhost:8080".to_string(),
+            prompt: Some("test".to_string()),
+            system_prompt: None,
+            json: false,
+            show_thinking: true,
+            yes: false,
+        });
+        let mode = resolve_mode(&cli).unwrap();
+        assert!(matches!(mode, ExecutionMode::DirectConnect(_)));
+        if let ExecutionMode::DirectConnect(dc) = mode {
+            assert_eq!(dc.address, "localhost:8080");
+            assert_eq!(dc.prompt.as_deref(), Some("test"));
+        }
+    }
+
+    #[test]
+    fn test_resolve_mode_ssh() {
+        let cli = make_cli(Command::Ssh {
+            target: "user@host".to_string(),
+            prompt: None,
+            system_prompt: Some("ssh context".to_string()),
+            json: true,
+            show_thinking: false,
+            yes: true,
+        });
+        let mode = resolve_mode(&cli).unwrap();
+        assert!(matches!(mode, ExecutionMode::Ssh(_)));
+        if let ExecutionMode::Ssh(ssh) = mode {
+            assert_eq!(ssh.target, "user@host");
+            assert_eq!(ssh.system_prompt.as_deref(), Some("ssh context"));
+            assert!(ssh.json);
+            assert!(!ssh.show_thinking);
+            assert!(ssh.yes);
+        }
+    }
+
+    #[test]
+    fn test_resolve_mode_remote() {
+        let cli = make_cli(Command::Remote {
+            orchestrator: "orchestrator.example.com".to_string(),
+            prompt: Some("remote task".to_string()),
+            system_prompt: None,
+            json: false,
+            show_thinking: true,
+            yes: false,
+        });
+        let mode = resolve_mode(&cli).unwrap();
+        assert!(matches!(mode, ExecutionMode::Remote(_)));
+        if let ExecutionMode::Remote(remote) = mode {
+            assert_eq!(remote.orchestrator, "orchestrator.example.com");
+            assert_eq!(remote.prompt.as_deref(), Some("remote task"));
+            assert!(remote.show_thinking);
+        }
     }
 
     #[test]
@@ -304,5 +581,134 @@ mod tests {
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Tui));
+    }
+
+    #[test]
+    fn test_resolve_mode_hidden_headless_flag() {
+        let cli = Cli {
+            config: None,
+            data_dir: None,
+            cwd: PathBuf::from("."),
+            command: None,
+            headless: true,
+            remote: None,
+            direct_connect: None,
+            ssh: None,
+        };
+        let mode = resolve_mode(&cli).unwrap();
+        assert!(matches!(mode, ExecutionMode::Headless(_)));
+    }
+
+    #[test]
+    fn test_resolve_mode_hidden_remote_flag() {
+        let cli = Cli {
+            config: None,
+            data_dir: None,
+            cwd: PathBuf::from("."),
+            command: None,
+            headless: false,
+            remote: Some("remote.example.com".to_string()),
+            direct_connect: None,
+            ssh: None,
+        };
+        let mode = resolve_mode(&cli).unwrap();
+        assert!(matches!(mode, ExecutionMode::Remote(_)));
+        if let ExecutionMode::Remote(remote) = mode {
+            assert_eq!(remote.orchestrator, "remote.example.com");
+        }
+    }
+
+    #[test]
+    fn test_resolve_mode_hidden_direct_connect_flag() {
+        let cli = Cli {
+            config: None,
+            data_dir: None,
+            cwd: PathBuf::from("."),
+            command: None,
+            headless: false,
+            remote: None,
+            direct_connect: Some("localhost:9000".to_string()),
+            ssh: None,
+        };
+        let mode = resolve_mode(&cli).unwrap();
+        assert!(matches!(mode, ExecutionMode::DirectConnect(_)));
+        if let ExecutionMode::DirectConnect(dc) = mode {
+            assert_eq!(dc.address, "localhost:9000");
+        }
+    }
+
+    #[test]
+    fn test_resolve_mode_hidden_ssh_flag() {
+        let cli = Cli {
+            config: None,
+            data_dir: None,
+            cwd: PathBuf::from("."),
+            command: None,
+            headless: false,
+            remote: None,
+            direct_connect: None,
+            ssh: Some("user@server".to_string()),
+        };
+        let mode = resolve_mode(&cli).unwrap();
+        assert!(matches!(mode, ExecutionMode::Ssh(_)));
+        if let ExecutionMode::Ssh(ssh) = mode {
+            assert_eq!(ssh.target, "user@server");
+        }
+    }
+
+    #[test]
+    fn test_resolve_mode_hidden_flags_take_precedence_over_subcommand() {
+        let cli = Cli {
+            config: None,
+            data_dir: None,
+            cwd: PathBuf::from("."),
+            command: Some(Command::Run {
+                prompt: "hello".to_string(),
+                system_prompt: Some("be helpful".to_string()),
+                json: true,
+                show_thinking: true,
+                yes: true,
+            }),
+            headless: true,
+            remote: None,
+            direct_connect: None,
+            ssh: None,
+        };
+        let mode = resolve_mode(&cli).unwrap();
+        assert!(matches!(mode, ExecutionMode::Headless(_)));
+        if let ExecutionMode::Headless(headless) = mode {
+            assert_eq!(headless.prompt, "hello");
+            assert_eq!(headless.system_prompt.as_deref(), Some("be helpful"));
+            assert!(headless.json);
+            assert!(headless.show_thinking);
+            assert!(headless.yes);
+        }
+    }
+
+    #[test]
+    fn test_resolve_mode_hidden_remote_flag_takes_precedence_over_subcommand() {
+        let cli = Cli {
+            config: None,
+            data_dir: None,
+            cwd: PathBuf::from("."),
+            command: Some(Command::Headless {
+                prompt: Some("hello".to_string()),
+                system_prompt: None,
+                json: false,
+                show_thinking: false,
+                yes: false,
+                output_path: None,
+            }),
+            headless: false,
+            remote: Some("remote.example.com".to_string()),
+            direct_connect: None,
+            ssh: None,
+        };
+        let mode = resolve_mode(&cli).unwrap();
+        assert!(matches!(mode, ExecutionMode::Remote(_)));
+        if let ExecutionMode::Remote(remote) = mode {
+            assert_eq!(remote.orchestrator, "remote.example.com");
+            assert_eq!(remote.prompt.as_deref(), Some("hello"));
+        }
     }
 }

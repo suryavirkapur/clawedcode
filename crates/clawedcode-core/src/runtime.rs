@@ -1,10 +1,17 @@
 use crate::{
+    background_task::{
+        get_background_task, poll_background_task, read_background_task_output,
+        spawn_background_shell, stop_background_task, TASK_OUTPUT_TOOL_NAME, TASK_STOP_TOOL_NAME,
+    },
     compat::CompatibilitySnapshot,
-    config::AppConfig,
+    config::{AppConfig, default_data_dir},
     content::ContentBlock,
     permissions::{PermissionDecision, PermissionEngine, PermissionMode},
     prompt::PromptSpec,
-    session::{Message, Role, Session},
+    session::{Message, Role, Session, SessionMode},
+    subagent::{SubAgentConfig, SubAgentResult, SubAgentRuntime},
+    tasks::execute_task_tool,
+    tool_input::decode_tool_input,
 };
 use clawedcode_api::{
     ApiEvent, BoxedProvider, CompletionRequest, CompletionResponse, create_provider,
@@ -13,12 +20,16 @@ use clawedcode_mcp::{
     McpServerConfig, discover_mcp_resources_sync, discover_mcp_tools_sync, make_mcp_tool_name,
     read_mcp_resource_sync, run_mcp_tool_sync,
 };
-use clawedcode_tools::{Tool, ToolResult, ToolSpec, builtin_tool_instances, builtin_tools};
+use clawedcode_tools::{
+    AGENT_TOOL_NAME, LEGACY_AGENT_TOOL_NAME, Tool, ToolResult, ToolSpec, builtin_tool_instances,
+    builtin_tools,
+};
 use futures_util::StreamExt;
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, HashMap},
     path::PathBuf,
+    time::{Duration, Instant},
 };
 
 struct McpToolInstance {
@@ -237,6 +248,18 @@ struct TurnResult {
     tool_use_records: Vec<ToolUseRecord>,
 }
 
+#[derive(Debug, Clone)]
+struct AgentToolInput {
+    description: String,
+    prompt: String,
+    subagent_type: Option<String>,
+}
+
+enum PreparedAgentExecution {
+    Ready(ContentBlock),
+    Pending(std::thread::JoinHandle<Result<(SubAgentResult, AgentToolInput), String>>),
+}
+
 fn apply_prompt_override(messages: &mut [clawedcode_api::ProviderMessage], prompt_override: &str) {
     let Some(last_user) = messages.iter_mut().rfind(|message| {
         message.role == clawedcode_api::ProviderRole::User
@@ -394,7 +417,11 @@ impl Runtime {
     }
 
     pub fn start_session(&self, cwd: PathBuf) -> Session {
-        let mut session = Session::new(cwd);
+        self.start_session_with_mode(cwd, SessionMode::Interactive)
+    }
+
+    pub fn start_session_with_mode(&self, cwd: PathBuf, mode: SessionMode) -> Session {
+        let mut session = Session::with_mode(cwd, mode);
         session.push(Role::System, self.system_prompt.body);
         session
     }
@@ -487,6 +514,11 @@ impl Runtime {
                                     thinking: thinking.clone(),
                                 }
                             }
+                            crate::content::ContentBlock::SubAgentSummary { child_session_id, summary } => {
+                                clawedcode_api::ProviderContentBlock::Text {
+                                    text: format!("[sub-agent: {}] {}", &child_session_id[..8], summary),
+                                }
+                            }
                         })
                         .collect(),
                 })
@@ -501,8 +533,12 @@ impl Runtime {
         request
     }
 
-    fn max_turns(&self) -> usize {
+    pub fn max_turns(&self) -> usize {
         self.config.runtime.max_turns as usize
+    }
+
+    pub fn permission_mode(&self) -> PermissionMode {
+        self.permission_engine.mode()
     }
 
     fn run_in_runtime<F, T>(&self, f: F) -> T
@@ -749,7 +785,7 @@ impl Runtime {
                     tool_uses.push((
                         tool_use.id.clone(),
                         tool_use.name.clone(),
-                        serde_json::from_str(&tool_use.input).unwrap_or(serde_json::Value::Null),
+                        decode_tool_input(&tool_use.name, &tool_use.input),
                     ));
                 }
                 ApiEvent::ToolResult { tool_result } => {
@@ -819,16 +855,22 @@ impl Runtime {
         }
         session.push_blocks(Role::Assistant, assistant_blocks);
 
+        let mut prepared_agent_executions =
+            self.prepare_parallel_agent_executions(&tool_uses, session);
         let mut tools_executed = 0usize;
         let mut result_blocks: Vec<ContentBlock> = Vec::new();
         for (tool_use_id, tool_name, input) in &tool_uses {
-            let result = self.execute_tool_with_approval(
-                tool_use_id,
-                tool_name,
-                input.clone(),
-                &session.cwd,
-                approval_fn,
-            );
+            let result = if let Some(prepared) = prepared_agent_executions.remove(tool_use_id) {
+                self.finish_prepared_agent_execution(tool_use_id, prepared, session)
+            } else {
+                self.execute_tool_with_approval(
+                    tool_use_id,
+                    tool_name,
+                    input.clone(),
+                    session,
+                    approval_fn,
+                )
+            };
             if let ContentBlock::ToolResult {
                 is_error, content, ..
             } = &result
@@ -853,14 +895,176 @@ impl Runtime {
         }
     }
 
+    fn prepare_parallel_agent_executions(
+        &self,
+        tool_uses: &[(String, String, serde_json::Value)],
+        session: &Session,
+    ) -> HashMap<String, PreparedAgentExecution> {
+        let mut prepared = HashMap::new();
+
+        for (tool_use_id, tool_name, input) in tool_uses {
+            if !is_agent_tool(tool_name) {
+                continue;
+            }
+
+            let parsed = match parse_agent_tool_input(input) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    prepared.insert(
+                        tool_use_id.clone(),
+                        PreparedAgentExecution::Ready(ContentBlock::tool_error(
+                            tool_use_id,
+                            err,
+                        )),
+                    );
+                    continue;
+                }
+            };
+
+            if let Some(error) = self.agent_tool_preflight_error(session) {
+                prepared.insert(
+                    tool_use_id.clone(),
+                    PreparedAgentExecution::Ready(ContentBlock::tool_error(
+                        tool_use_id,
+                        error,
+                    )),
+                );
+                continue;
+            }
+
+            let Some(sessions_dir) = session_store_dir() else {
+                prepared.insert(
+                    tool_use_id.clone(),
+                    PreparedAgentExecution::Ready(ContentBlock::tool_error(
+                        tool_use_id,
+                        "No sessions directory available for Agent/Task execution",
+                    )),
+                );
+                continue;
+            };
+
+            let config = self.config.clone();
+            let system_prompt = self.system_prompt.clone();
+            let compatibility = self.compatibility.clone();
+            let cwd = session.cwd.clone();
+            let parent_snapshot = session.clone();
+            let permission_mode = self.permission_mode();
+            let max_turns = self.max_turns();
+            let parsed_for_thread = parsed.clone();
+
+            prepared.insert(
+                tool_use_id.clone(),
+                PreparedAgentExecution::Pending(std::thread::spawn(move || {
+                    let runtime = SubAgentRuntime::new(
+                        config,
+                        system_prompt,
+                        compatibility,
+                        sessions_dir,
+                        cwd,
+                    );
+                    let result = runtime
+                        .spawn_fork_from_parent(
+                            &parent_snapshot,
+                            SubAgentConfig {
+                                prompt: parsed_for_thread.prompt.clone(),
+                                max_turns,
+                                permission_mode,
+                            },
+                        )
+                        .map_err(|err| err.to_string())?;
+                    Ok((result, parsed_for_thread))
+                })),
+            );
+        }
+
+        prepared
+    }
+
+    fn finish_prepared_agent_execution(
+        &self,
+        tool_use_id: &str,
+        prepared: PreparedAgentExecution,
+        session: &mut Session,
+    ) -> ContentBlock {
+        match prepared {
+            PreparedAgentExecution::Ready(block) => block,
+            PreparedAgentExecution::Pending(handle) => match handle.join() {
+                Ok(Ok((result, input))) => {
+                    session.add_child(result.child_session_id);
+                    ContentBlock::tool_result(
+                        tool_use_id,
+                        render_agent_tool_result(&input, &result),
+                    )
+                }
+                Ok(Err(err)) => ContentBlock::tool_error(tool_use_id, err),
+                Err(_) => ContentBlock::tool_error(tool_use_id, "Agent task panicked"),
+            },
+        }
+    }
+
+    fn agent_tool_preflight_error(&self, session: &Session) -> Option<String> {
+        if session.parent_session_id.is_some() {
+            return Some(
+                "Agent/Task cannot be invoked from within a child sub-agent session".to_string(),
+            );
+        }
+        None
+    }
+
+    fn execute_agent_tool(
+        &self,
+        tool_use_id: &str,
+        input: serde_json::Value,
+        session: &mut Session,
+    ) -> ContentBlock {
+        let parsed = match parse_agent_tool_input(&input) {
+            Ok(parsed) => parsed,
+            Err(err) => return ContentBlock::tool_error(tool_use_id, err),
+        };
+
+        if let Some(error) = self.agent_tool_preflight_error(session) {
+            return ContentBlock::tool_error(tool_use_id, error);
+        }
+
+        let Some(sessions_dir) = session_store_dir() else {
+            return ContentBlock::tool_error(
+                tool_use_id,
+                "No sessions directory available for Agent/Task execution",
+            );
+        };
+
+        let runtime = SubAgentRuntime::new(
+            self.config.clone(),
+            self.system_prompt.clone(),
+            self.compatibility.clone(),
+            sessions_dir,
+            session.cwd.clone(),
+        );
+
+        match runtime.spawn_fork_from_parent(
+            session,
+            SubAgentConfig {
+                prompt: parsed.prompt.clone(),
+                max_turns: self.max_turns(),
+                permission_mode: self.permission_mode(),
+            },
+        ) {
+            Ok(result) => {
+                session.add_child(result.child_session_id);
+                ContentBlock::tool_result(tool_use_id, render_agent_tool_result(&parsed, &result))
+            }
+            Err(err) => ContentBlock::tool_error(tool_use_id, err.to_string()),
+        }
+    }
+
     pub fn execute_tool(
         &self,
         tool_use_id: &str,
         tool_name: &str,
         input: serde_json::Value,
-        cwd: &PathBuf,
+        session: &mut Session,
     ) -> ContentBlock {
-        self.execute_tool_with_approval(tool_use_id, tool_name, input, cwd, &|_, _, _| true)
+        self.execute_tool_with_approval(tool_use_id, tool_name, input, session, &|_, _, _| true)
     }
 
     fn execute_tool_with_approval<A: ?Sized>(
@@ -868,22 +1072,19 @@ impl Runtime {
         tool_use_id: &str,
         tool_name: &str,
         input: serde_json::Value,
-        cwd: &PathBuf,
+        session: &mut Session,
         approval_fn: &A,
     ) -> ContentBlock
     where
         A: Fn(&str, &str, &serde_json::Value) -> bool + Send + Sync,
     {
-        let tool = match self.tool_instances.get(tool_name) {
-            Some(t) => t,
-            None => {
-                return ContentBlock::tool_error(tool_use_id, format!("Unknown tool: {tool_name}"));
-            }
+        let Some((needs_approval, write_like)) = self.tool_policy(tool_name) else {
+            return ContentBlock::tool_error(tool_use_id, format!("Unknown tool: {tool_name}"));
         };
 
         let decision = self
             .permission_engine
-            .decide(tool.needs_approval(), is_write_like(tool_name));
+            .decide(needs_approval, write_like);
 
         match decision {
             PermissionDecision::Deny => ContentBlock::tool_error(
@@ -900,27 +1101,313 @@ impl Runtime {
                         format!("Tool '{tool_name}' denied by user"),
                     );
                 }
-                let result = tool.execute(input, cwd);
-                if result.is_error {
-                    ContentBlock::tool_error(tool_use_id, result.content)
-                } else {
-                    ContentBlock::tool_result(tool_use_id, result.content)
-                }
+                self.execute_tool_inner(tool_use_id, tool_name, input, session)
             }
-            PermissionDecision::Allow => {
-                let result = tool.execute(input, cwd);
-                if result.is_error {
-                    ContentBlock::tool_error(tool_use_id, result.content)
-                } else {
-                    ContentBlock::tool_result(tool_use_id, result.content)
-                }
+            PermissionDecision::Allow => self.execute_tool_inner(tool_use_id, tool_name, input, session),
+        }
+    }
+
+    fn tool_policy(&self, tool_name: &str) -> Option<(bool, bool)> {
+        if let Some(tool) = self.tool_instances.get(tool_name) {
+            return Some((tool.needs_approval(), is_write_like(tool_name)));
+        }
+
+        match tool_name {
+            TASK_OUTPUT_TOOL_NAME => Some((false, false)),
+            TASK_STOP_TOOL_NAME => Some((true, true)),
+            _ if is_agent_tool(tool_name) => Some((false, false)),
+            _ if is_task_store_tool(tool_name) => Some((false, false)),
+            _ => None,
+        }
+    }
+
+    fn execute_tool_inner(
+        &self,
+        tool_use_id: &str,
+        tool_name: &str,
+        input: serde_json::Value,
+        session: &mut Session,
+    ) -> ContentBlock {
+        if is_agent_tool(tool_name) {
+            return self.execute_agent_tool(tool_use_id, input, session);
+        }
+
+        if let Some(result) = execute_task_tool(tool_name, input.clone(), session).unwrap_or_else(
+            |err| {
+                Some(ToolResult {
+                    content: err,
+                    is_error: true,
+                })
+            },
+        ) {
+            return finish_tool_result(tool_use_id, result);
+        }
+
+        if tool_name == TASK_OUTPUT_TOOL_NAME {
+            return execute_task_output_tool(tool_use_id, input);
+        }
+
+        if tool_name == TASK_STOP_TOOL_NAME {
+            return execute_task_stop_tool(tool_use_id, input);
+        }
+
+        if tool_name == "shell"
+            && input
+                .get("run_in_background")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        {
+            return execute_background_shell(tool_use_id, input, session);
+        }
+
+        let tool = match self.tool_instances.get(tool_name) {
+            Some(t) => t,
+            None => {
+                return ContentBlock::tool_error(tool_use_id, format!("Unknown tool: {tool_name}"));
+            }
+        };
+
+        finish_tool_result(tool_use_id, tool.execute(input, &session.cwd))
+    }
+}
+
+fn finish_tool_result(tool_use_id: &str, result: ToolResult) -> ContentBlock {
+    if result.is_error {
+        ContentBlock::tool_error(tool_use_id, result.content)
+    } else {
+        ContentBlock::tool_result(tool_use_id, result.content)
+    }
+}
+
+fn parse_agent_tool_input(input: &serde_json::Value) -> Result<AgentToolInput, String> {
+    let Some(description) = input.get("description").and_then(|value| value.as_str()) else {
+        return Err("Missing 'description' parameter".to_string());
+    };
+    let Some(prompt) = input.get("prompt").and_then(|value| value.as_str()) else {
+        return Err("Missing 'prompt' parameter".to_string());
+    };
+
+    if description.trim().is_empty() {
+        return Err("'description' must not be empty".to_string());
+    }
+    if prompt.trim().is_empty() {
+        return Err("'prompt' must not be empty".to_string());
+    }
+
+    Ok(AgentToolInput {
+        description: description.to_string(),
+        prompt: prompt.to_string(),
+        subagent_type: input
+            .get("subagent_type")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string()),
+    })
+}
+
+fn render_agent_tool_result(input: &AgentToolInput, result: &SubAgentResult) -> String {
+    serde_json::to_string_pretty(&serde_json::json!({
+        "status": "completed",
+        "agent_id": result.child_session_id,
+        "agentId": result.child_session_id,
+        "description": input.description,
+        "prompt": input.prompt,
+        "subagent_type": input.subagent_type,
+        "content": [{
+            "type": "text",
+            "text": result.summary,
+        }],
+        "total_tool_use_count": result.tools_executed,
+        "totalToolUseCount": result.tools_executed,
+    }))
+    .unwrap_or_else(|_| "{\"status\":\"completed\"}".to_string())
+}
+
+fn session_store_dir() -> Option<PathBuf> {
+    std::env::var_os("CLAWEDCODE_DATA_DIR")
+        .map(PathBuf::from)
+        .or_else(default_data_dir)
+        .map(|dir| dir.join("sessions"))
+}
+
+fn execute_background_shell(tool_use_id: &str, input: serde_json::Value, session: &Session) -> ContentBlock {
+    let command = match input.get("command").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return ContentBlock::tool_error(tool_use_id, "Missing 'command' parameter");
+        }
+    };
+    
+    let description = if command.len() > 50 {
+        format!("{}...", &command[..50])
+    } else {
+        command.clone()
+    };
+    
+    match spawn_background_shell(command, description, session.cwd.clone(), &session.id.to_string()) {
+        Ok(task) => {
+            let result = serde_json::json!({
+                "task_id": task.id,
+                "output_file": task.output_file_path.display().to_string(),
+                "status": "running",
+                "message": format!("Background task started: {}", task.id)
+            });
+            ContentBlock::tool_result(tool_use_id, serde_json::to_string_pretty(&result).unwrap_or_default())
+        }
+        Err(e) => ContentBlock::tool_error(tool_use_id, format!("Failed to start background task: {e}")),
+    }
+}
+
+fn execute_task_output_tool(tool_use_id: &str, input: serde_json::Value) -> ContentBlock {
+    let task_id = match input.get("task_id").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return ContentBlock::tool_error(tool_use_id, "Missing 'task_id' parameter");
+        }
+    };
+
+    let block = input.get("block").and_then(|v| v.as_bool()).unwrap_or(true);
+    let timeout_ms = input.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30000);
+
+    let retrieval_status = if block {
+        match wait_for_task_completion(&task_id, timeout_ms) {
+            Ok(status) => status,
+            Err(e) => {
+                return ContentBlock::tool_error(tool_use_id, format!("Failed to poll task: {e}"));
             }
         }
+    } else {
+        if let Err(e) = poll_background_task(&task_id) {
+            return ContentBlock::tool_error(tool_use_id, format!("Failed to poll task: {e}"));
+        }
+        current_retrieval_status(&task_id)
+    };
+
+    match get_background_task(&task_id) {
+        Some(task) => {
+            let output = match read_background_task_output(&task_id) {
+                Ok(o) => o,
+                Err(e) => return ContentBlock::tool_error(tool_use_id, format!("Failed to read output: {e}")),
+            };
+
+            let mut task_json = serde_json::json!({
+                "task_id": task.id,
+                "task_type": task.task_type,
+                "status": background_task_status_name(&task.status),
+                "description": task.description,
+                "output": output,
+            });
+
+            if let Some(ref res) = task.result {
+                task_json["exitCode"] = serde_json::json!(res.code);
+                task_json["interrupted"] = serde_json::json!(res.interrupted);
+            }
+
+            let result = serde_json::json!({
+                "retrieval_status": retrieval_status,
+                "task": task_json,
+            });
+            ContentBlock::tool_result(tool_use_id, serde_json::to_string_pretty(&result).unwrap_or_default())
+        }
+        None => ContentBlock::tool_error(tool_use_id, format!("Task not found: {task_id}")),
+    }
+}
+
+fn execute_task_stop_tool(tool_use_id: &str, input: serde_json::Value) -> ContentBlock {
+    let task_id = match input
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .or_else(|| input.get("shell_id").and_then(|v| v.as_str()))
+    {
+        Some(s) => s.to_string(),
+        None => {
+            return ContentBlock::tool_error(tool_use_id, "Missing 'task_id' parameter");
+        }
+    };
+
+    match get_background_task(&task_id) {
+        Some(task) => {
+            if task.status != crate::background_task::TaskStatus::Running {
+                return ContentBlock::tool_error(
+                    tool_use_id,
+                    format!("Task {} is not running (status: {:?})", task_id, task.status),
+                );
+            }
+            match stop_background_task(&task_id) {
+                Some(stopped_task) => {
+                    let result = serde_json::json!({
+                        "message": format!("Successfully stopped task: {} ({})", task_id, stopped_task.command),
+                        "task_id": stopped_task.id,
+                        "task_type": stopped_task.task_type,
+                        "command": stopped_task.command,
+                        "status": "killed",
+                    });
+                    ContentBlock::tool_result(tool_use_id, serde_json::to_string_pretty(&result).unwrap_or_default())
+                }
+                None => ContentBlock::tool_error(tool_use_id, format!("Failed to stop task {task_id}")),
+            }
+        }
+        None => ContentBlock::tool_error(tool_use_id, format!("Task not found: {task_id}")),
     }
 }
 
 fn is_write_like(tool_name: &str) -> bool {
-    matches!(tool_name, "shell" | "apply_patch")
+    matches!(tool_name, "shell" | "apply_patch" | TASK_STOP_TOOL_NAME)
+}
+
+fn is_task_store_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "TaskCreate" | "TaskList" | "TaskGet" | "TaskUpdate")
+}
+
+fn is_agent_tool(tool_name: &str) -> bool {
+    tool_name == AGENT_TOOL_NAME || tool_name == LEGACY_AGENT_TOOL_NAME
+}
+
+fn background_task_status_name(status: &crate::background_task::TaskStatus) -> &'static str {
+    match status {
+        crate::background_task::TaskStatus::Pending => "pending",
+        crate::background_task::TaskStatus::Running => "running",
+        crate::background_task::TaskStatus::Completed => "completed",
+        crate::background_task::TaskStatus::Failed => "failed",
+        crate::background_task::TaskStatus::Killed => "killed",
+    }
+}
+
+fn current_retrieval_status(task_id: &str) -> &'static str {
+    match get_background_task(task_id) {
+        Some(task)
+            if matches!(
+                task.status,
+                crate::background_task::TaskStatus::Pending | crate::background_task::TaskStatus::Running
+            ) =>
+        {
+            "not_ready"
+        }
+        Some(_) => "success",
+        None => "not_ready",
+    }
+}
+
+fn wait_for_task_completion(task_id: &str, timeout_ms: u64) -> std::io::Result<&'static str> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+
+    loop {
+        poll_background_task(task_id)?;
+        match get_background_task(task_id) {
+            Some(task)
+                if matches!(
+                    task.status,
+                    crate::background_task::TaskStatus::Pending | crate::background_task::TaskStatus::Running
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    return Ok("timeout");
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Some(_) => return Ok("success"),
+            None => return Ok("not_ready"),
+        }
+    }
 }
 
 impl RuntimeOutput {
@@ -941,10 +1428,12 @@ impl RuntimeOutput {
 mod tests {
     use super::*;
     use crate::config::AppConfig;
-    use clawedcode_api::{MockProvider, MockToolProvider};
+    use clawedcode_api::{MockProvider, MockToolProvider, Provider, ProviderError};
+    use futures_util::stream;
     use std::{
         fs,
-        time::{SystemTime, UNIX_EPOCH},
+        pin::Pin,
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     fn make_runtime() -> Runtime {
@@ -993,6 +1482,87 @@ mod tests {
             PermissionMode::Bypass,
             Box::new(MockToolProvider),
         )
+    }
+
+    fn set_temp_data_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("clawed_rt_data_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("CLAWEDCODE_DATA_DIR", &dir) };
+        dir
+    }
+
+    #[derive(Debug, Clone)]
+    struct DualTaskToolProvider;
+
+    impl Provider for DualTaskToolProvider {
+        fn complete(
+            &self,
+            _request: &CompletionRequest,
+        ) -> Pin<
+            Box<dyn std::future::Future<Output = Result<CompletionResponse, ProviderError>> + Send + '_>,
+        > {
+            Box::pin(async {
+                Ok(CompletionResponse {
+                    system_prompt: "test".to_string(),
+                    response: "merged".to_string(),
+                    tool_count: 2,
+                    skill_count: 0,
+                    mcp_server_count: 0,
+                })
+            })
+        }
+
+        fn stream(&self, request: &CompletionRequest) -> clawedcode_api::EventStream {
+            let events = if request_has_tool_result_message(request) {
+                vec![
+                    ApiEvent::MessageDelta {
+                        text: "Merged child results.".to_string(),
+                    },
+                    ApiEvent::Completed,
+                ]
+            } else {
+                vec![
+                    ApiEvent::ToolUse {
+                        tool_use: clawedcode_api::ToolUseEvent {
+                            id: "agent-1".to_string(),
+                            name: LEGACY_AGENT_TOOL_NAME.to_string(),
+                            input: serde_json::json!({
+                                "description": "First task",
+                                "prompt": "hello"
+                            })
+                            .to_string(),
+                        },
+                    },
+                    ApiEvent::ToolUse {
+                        tool_use: clawedcode_api::ToolUseEvent {
+                            id: "agent-2".to_string(),
+                            name: AGENT_TOOL_NAME.to_string(),
+                            input: serde_json::json!({
+                                "description": "Second task",
+                                "prompt": "how are you"
+                            })
+                            .to_string(),
+                        },
+                    },
+                    ApiEvent::Completed,
+                ]
+            };
+
+            Box::pin(stream::iter(
+                events.into_iter().map(Result::<_, ProviderError>::Ok),
+            ))
+        }
+    }
+
+    fn request_has_tool_result_message(request: &CompletionRequest) -> bool {
+        request.messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    clawedcode_api::ProviderContentBlock::ToolResult { .. }
+                )
+            })
+        })
     }
 
     fn temp_python_mcp_server() -> std::path::PathBuf {
@@ -1299,13 +1869,13 @@ while True:
             PermissionMode::Plan,
             Box::new(MockProvider),
         );
-        let session = runtime.start_session(PathBuf::from("/tmp"));
+        let mut session = runtime.start_session(PathBuf::from("/tmp"));
 
         let result = runtime.execute_tool(
             "1",
             "shell",
             serde_json::json!({"command": "echo hi"}),
-            &session.cwd,
+            &mut session,
         );
 
         assert!(matches!(
@@ -1340,13 +1910,13 @@ while True:
         let dir = std::env::temp_dir().join(format!("clawed_rt_test_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("hello.txt"), "hi").unwrap();
-        let session = runtime.start_session(dir.clone());
+        let mut session = runtime.start_session(dir.clone());
 
         let result = runtime.execute_tool(
             "1",
             "read_file",
             serde_json::json!({"path": "hello.txt"}),
-            &session.cwd,
+            &mut session,
         );
 
         if let ContentBlock::ToolResult {
@@ -1428,6 +1998,153 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
     }
 
     #[test]
+    fn runtime_registers_agent_and_task_tools() {
+        let runtime = make_runtime();
+
+        assert!(runtime.tools.iter().any(|tool| tool.name == AGENT_TOOL_NAME));
+        assert!(
+            runtime
+                .tools
+                .iter()
+                .any(|tool| tool.name == LEGACY_AGENT_TOOL_NAME)
+        );
+    }
+
+    #[test]
+    fn agent_tool_persists_child_session_and_links_parent() {
+        let _guard = crate::test_support::env_lock();
+        let data_dir = set_temp_data_dir();
+        let runtime = make_runtime();
+        let mut session = runtime.start_session(std::env::temp_dir());
+
+        let result = runtime.execute_tool(
+            "agent-tool",
+            LEGACY_AGENT_TOOL_NAME,
+            serde_json::json!({
+                "description": "Greeting task",
+                "prompt": "hello"
+            }),
+            &mut session,
+        );
+
+        let child_id = match result {
+            ContentBlock::ToolResult {
+                is_error, content, ..
+            } => {
+                assert!(!is_error, "unexpected tool error: {content}");
+                let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+                assert_eq!(json["status"], "completed");
+                assert_eq!(json["description"], "Greeting task");
+                assert_eq!(json["prompt"], "hello");
+                json["agent_id"].as_str().unwrap().to_string()
+            }
+            other => panic!("expected tool result, got {other:?}"),
+        };
+
+        assert_eq!(session.child_sessions.len(), 1);
+        assert_eq!(session.child_sessions[0].to_string(), child_id);
+        assert!(data_dir.join("sessions").join(format!("{child_id}.json")).exists());
+
+        unsafe { std::env::remove_var("CLAWEDCODE_DATA_DIR") };
+        fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn child_sessions_cannot_spawn_nested_agent_tools() {
+        let runtime = make_runtime();
+        let mut child_session =
+            Session::new_child(PathBuf::from("/tmp"), uuid::Uuid::new_v4());
+        child_session.push(Role::System, "You are a child session.");
+
+        let result = runtime.execute_tool(
+            "nested-agent",
+            AGENT_TOOL_NAME,
+            serde_json::json!({
+                "description": "Nested task",
+                "prompt": "hello"
+            }),
+            &mut child_session,
+        );
+
+        match result {
+            ContentBlock::ToolResult {
+                is_error, content, ..
+            } => {
+                assert!(is_error);
+                assert!(content.contains("child sub-agent session"));
+            }
+            other => panic!("expected tool result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multiple_agent_tool_uses_preserve_original_order() {
+        let _guard = crate::test_support::env_lock();
+        let data_dir = set_temp_data_dir();
+        let config = AppConfig::default();
+        let prompt_spec = PromptSpec {
+            name: "test",
+            summary: "test",
+            body: "You are a test assistant.",
+        };
+        let compat = CompatibilitySnapshot {
+            settings_files: vec![],
+            settings: serde_json::Value::Null,
+            skills: vec![],
+            memory_files: vec![],
+            memory: String::new(),
+            mcp_servers: std::collections::BTreeMap::new(),
+        };
+        let runtime = Runtime::with_provider(
+            config,
+            prompt_spec,
+            compat,
+            PermissionMode::Bypass,
+            Box::new(DualTaskToolProvider),
+        );
+
+        let mut session = runtime.start_session(std::env::temp_dir());
+        let output = runtime.submit(&mut session, "investigate two modules in parallel");
+
+        assert_eq!(output.tools_executed, 2);
+        assert_eq!(session.child_sessions.len(), 2);
+
+        let tool_message = session
+            .messages
+            .iter()
+            .find(|message| {
+                message.role == Role::Tool
+                    && message.content_blocks.len() == 2
+            })
+            .expect("expected tool message with two results");
+
+        let parse_result = |block: &ContentBlock| match block {
+            ContentBlock::ToolResult {
+                is_error, content, ..
+            } => {
+                assert!(!is_error, "unexpected tool error: {content}");
+                serde_json::from_str::<serde_json::Value>(content).unwrap()
+            }
+            other => panic!("expected tool result, got {other:?}"),
+        };
+
+        let first = parse_result(&tool_message.content_blocks[0]);
+        let second = parse_result(&tool_message.content_blocks[1]);
+        assert_eq!(first["description"], "First task");
+        assert_eq!(second["description"], "Second task");
+
+        for child_id in &session.child_sessions {
+            assert!(data_dir
+                .join("sessions")
+                .join(format!("{child_id}.json"))
+                .exists());
+        }
+
+        unsafe { std::env::remove_var("CLAWEDCODE_DATA_DIR") };
+        fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
     fn runtime_registers_and_executes_mcp_stdio_tools() {
         let script_path = temp_python_mcp_server();
 
@@ -1472,11 +2189,12 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
             "expected runtime to surface discovered MCP tool"
         );
 
+        let mut session = runtime.start_session(std::env::current_dir().unwrap());
         let result = runtime.execute_tool(
             "tool-1",
             "mcp__test-server__echo",
             serde_json::json!({"hello": "world"}),
-            &std::env::current_dir().unwrap(),
+            &mut session,
         );
 
         match result {
@@ -1543,11 +2261,12 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
                 .any(|tool| tool.name == "ReadMcpResourceTool")
         );
 
+        let mut session = runtime.start_session(std::env::current_dir().unwrap());
         let list_result = runtime.execute_tool(
             "tool-list",
             "ListMcpResourcesTool",
             serde_json::json!({}),
-            &std::env::current_dir().unwrap(),
+            &mut session,
         );
         match list_result {
             ContentBlock::ToolResult {
@@ -1567,7 +2286,7 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
                 "server": "test-server",
                 "uri": "resource://runtime/test"
             }),
-            &std::env::current_dir().unwrap(),
+            &mut session,
         );
         match read_result {
             ContentBlock::ToolResult {
@@ -1770,5 +2489,724 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
                 .system_prompt_body
                 .contains("Follow the project rule.")
         );
+    }
+
+    #[test]
+    fn background_shell_respects_user_denial() {
+        let _guard = crate::test_support::env_lock();
+        let data_dir = set_temp_data_dir();
+        let config = AppConfig::default();
+        let prompt_spec = PromptSpec {
+            name: "test",
+            summary: "test",
+            body: "You are a test assistant.",
+        };
+        let compat = CompatibilitySnapshot {
+            settings_files: vec![],
+            settings: serde_json::Value::Null,
+            skills: vec![],
+            memory_files: vec![],
+            memory: String::new(),
+            mcp_servers: std::collections::BTreeMap::new(),
+        };
+        let runtime = Runtime::with_provider(
+            config,
+            prompt_spec,
+            compat,
+            PermissionMode::Default,
+            Box::new(MockProvider),
+        );
+        let mut session = runtime.start_session(std::env::temp_dir());
+        let before = crate::background_task::list_background_tasks().len();
+
+        let result = runtime.execute_tool_with_approval(
+            "bg-deny",
+            "shell",
+            serde_json::json!({
+                "command": "sleep 1",
+                "run_in_background": true
+            }),
+            &mut session,
+            &|_, _, _| false,
+        );
+
+        match result {
+            ContentBlock::ToolResult {
+                is_error, content, ..
+            } => {
+                assert!(is_error);
+                assert!(content.contains("denied by user"));
+            }
+            other => panic!("expected tool result, got {other:?}"),
+        }
+
+        let after = crate::background_task::list_background_tasks().len();
+        assert_eq!(before, after);
+
+        unsafe { std::env::remove_var("CLAWEDCODE_DATA_DIR") };
+        fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn task_stop_respects_user_denial() {
+        let _guard = crate::test_support::env_lock();
+        let data_dir = set_temp_data_dir();
+        let config = AppConfig::default();
+        let prompt_spec = PromptSpec {
+            name: "test",
+            summary: "test",
+            body: "You are a test assistant.",
+        };
+        let compat = CompatibilitySnapshot {
+            settings_files: vec![],
+            settings: serde_json::Value::Null,
+            skills: vec![],
+            memory_files: vec![],
+            memory: String::new(),
+            mcp_servers: std::collections::BTreeMap::new(),
+        };
+        let runtime = Runtime::with_provider(
+            config,
+            prompt_spec,
+            compat,
+            PermissionMode::Default,
+            Box::new(MockProvider),
+        );
+        let mut session = runtime.start_session(std::env::temp_dir());
+        let task = crate::background_task::spawn_background_shell(
+            "sleep 5".to_string(),
+            "sleep".to_string(),
+            std::env::temp_dir(),
+            &session.id.to_string(),
+        )
+        .unwrap();
+
+        let result = runtime.execute_tool_with_approval(
+            "stop-deny",
+            "TaskStop",
+            serde_json::json!({ "task_id": task.id }),
+            &mut session,
+            &|_, _, _| false,
+        );
+
+        match result {
+            ContentBlock::ToolResult {
+                is_error, content, ..
+            } => {
+                assert!(is_error);
+                assert!(content.contains("denied by user"));
+            }
+            other => panic!("expected tool result, got {other:?}"),
+        }
+
+        let state = crate::background_task::get_background_task(&task.id).unwrap();
+        assert_eq!(state.status, crate::background_task::TaskStatus::Running);
+        let _ = crate::background_task::stop_background_task(&task.id);
+
+        unsafe { std::env::remove_var("CLAWEDCODE_DATA_DIR") };
+        fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn task_output_reports_not_ready_timeout_then_success() {
+        let _guard = crate::test_support::env_lock();
+        let data_dir = set_temp_data_dir();
+        let config = AppConfig::default();
+        let prompt_spec = PromptSpec {
+            name: "test",
+            summary: "test",
+            body: "You are a test assistant.",
+        };
+        let compat = CompatibilitySnapshot {
+            settings_files: vec![],
+            settings: serde_json::Value::Null,
+            skills: vec![],
+            memory_files: vec![],
+            memory: String::new(),
+            mcp_servers: std::collections::BTreeMap::new(),
+        };
+        let runtime = Runtime::with_provider(
+            config,
+            prompt_spec,
+            compat,
+            PermissionMode::Bypass,
+            Box::new(MockProvider),
+        );
+        let mut session = runtime.start_session(std::env::temp_dir());
+        let task = crate::background_task::spawn_background_shell(
+            "sleep 1; echo done".to_string(),
+            "delayed echo".to_string(),
+            std::env::temp_dir(),
+            &session.id.to_string(),
+        )
+        .unwrap();
+
+        let not_ready = runtime.execute_tool(
+            "task-output-ready",
+            "TaskOutput",
+            serde_json::json!({
+                "task_id": task.id,
+                "block": false
+            }),
+            &mut session,
+        );
+        let timeout = runtime.execute_tool(
+            "task-output-timeout",
+            "TaskOutput",
+            serde_json::json!({
+                "task_id": task.id,
+                "block": true,
+                "timeout": 50
+            }),
+            &mut session,
+        );
+        std::thread::sleep(Duration::from_millis(1200));
+        let success = runtime.execute_tool(
+            "task-output-success",
+            "TaskOutput",
+            serde_json::json!({
+                "task_id": task.id,
+                "block": true,
+                "timeout": 2000
+            }),
+            &mut session,
+        );
+
+        let parse = |block: ContentBlock| match block {
+            ContentBlock::ToolResult {
+                is_error, content, ..
+            } => {
+                assert!(!is_error, "unexpected tool error: {content}");
+                serde_json::from_str::<serde_json::Value>(&content).unwrap()
+            }
+            other => panic!("expected tool result, got {other:?}"),
+        };
+
+        let not_ready_json = parse(not_ready);
+        assert_eq!(not_ready_json["retrieval_status"], "not_ready");
+
+        let timeout_json = parse(timeout);
+        assert_eq!(timeout_json["retrieval_status"], "timeout");
+
+        let success_json = parse(success);
+        assert_eq!(success_json["retrieval_status"], "success");
+        assert_eq!(success_json["task"]["status"], "completed");
+        assert!(success_json["task"]["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("done"));
+
+        unsafe { std::env::remove_var("CLAWEDCODE_DATA_DIR") };
+        fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn background_shell_output_path_is_session_scoped() {
+        let _guard = crate::test_support::env_lock();
+        let data_dir = set_temp_data_dir();
+        let runtime = make_tool_runtime();
+        let mut session_a = runtime.start_session(std::env::temp_dir());
+        let mut session_b = runtime.start_session(std::env::temp_dir());
+
+        let run_bg = |session: &mut Session| {
+            match runtime.execute_tool(
+                "bg-path",
+                "shell",
+                serde_json::json!({
+                    "command": "sleep 2",
+                    "run_in_background": true
+                }),
+                session,
+            ) {
+                ContentBlock::ToolResult {
+                    is_error, content, ..
+                } => {
+                    assert!(!is_error, "unexpected tool error: {content}");
+                    serde_json::from_str::<serde_json::Value>(&content).unwrap()
+                }
+                other => panic!("expected tool result, got {other:?}"),
+            }
+        };
+
+        let a = run_bg(&mut session_a);
+        let b = run_bg(&mut session_b);
+        let a_path = a["output_file"].as_str().unwrap();
+        let b_path = b["output_file"].as_str().unwrap();
+
+        assert!(a_path.contains(&session_a.id.to_string()));
+        assert!(b_path.contains(&session_b.id.to_string()));
+        assert_ne!(a_path, b_path);
+
+        let _ = crate::background_task::stop_background_task(a["task_id"].as_str().unwrap());
+        let _ = crate::background_task::stop_background_task(b["task_id"].as_str().unwrap());
+
+        unsafe { std::env::remove_var("CLAWEDCODE_DATA_DIR") };
+        fs::remove_dir_all(data_dir).ok();
+    }
+
+    struct FailAfterTextProvider;
+
+    impl Provider for FailAfterTextProvider {
+        fn complete(
+            &self,
+            _request: &CompletionRequest,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<CompletionResponse, ProviderError>> + Send + '_>>
+        {
+            Box::pin(async { unreachable!("complete should not be called for streaming test") })
+        }
+
+        fn stream(&self, request: &CompletionRequest) -> clawedcode_api::EventStream {
+            let has_tool_result = request.messages.iter().any(|m| {
+                m.content.iter().any(|b| {
+                    matches!(b, clawedcode_api::ProviderContentBlock::ToolResult { .. })
+                })
+            });
+
+            if has_tool_result {
+                let events = vec![
+                    ApiEvent::MessageDelta { text: "Done.".to_string() },
+                    ApiEvent::Completed,
+                ];
+                Box::pin(stream::iter(events.into_iter().map(Ok)))
+            } else {
+                let events: Vec<Result<ApiEvent, ProviderError>> = vec![
+                    Ok(ApiEvent::ThinkingDelta { text: "Thinking...".to_string() }),
+                    Ok(ApiEvent::MessageDelta { text: "Hello ".to_string() }),
+                    Err(ProviderError::Other {
+                        message: "simulated stream failure".to_string(),
+                    }),
+                ];
+                Box::pin(stream::iter(events.into_iter()))
+            }
+        }
+    }
+
+    #[test]
+    fn provider_stream_failure_preserves_streamed_content() {
+        let config = AppConfig::default();
+        let prompt_spec = PromptSpec {
+            name: "test",
+            summary: "test",
+            body: "You are a test assistant.",
+        };
+        let compat = CompatibilitySnapshot {
+            settings_files: vec![],
+            settings: serde_json::Value::Null,
+            skills: vec![],
+            memory_files: vec![],
+            memory: String::new(),
+            mcp_servers: std::collections::BTreeMap::new(),
+        };
+        let runtime = Runtime::with_provider(
+            config,
+            prompt_spec,
+            compat,
+            PermissionMode::Bypass,
+            Box::new(FailAfterTextProvider),
+        );
+        let mut session = runtime.start_session(PathBuf::from("/tmp"));
+
+        let output: Option<StreamingRuntimeOutput> = runtime.run_in_runtime(async {
+            let mut events: Vec<ApiEvent> = Vec::new();
+            let result = runtime
+                .submit_stream(&mut session, "hello", |e| {
+                    events.push(e.clone());
+                })
+                .await;
+            Some(result)
+        });
+
+        let output = output.expect("stream should return output despite error");
+        assert!(output.thinking.contains("Thinking..."));
+        assert!(output.response.contains("Hello "));
+        assert_eq!(output.tools_executed, 0);
+
+        let assistant_msg = session
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Assistant)
+            .expect("Assistant message should exist");
+        let has_thinking = assistant_msg
+            .content_blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Thinking { .. }));
+        let has_text = assistant_msg
+            .content_blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text { .. }));
+        assert!(has_thinking);
+        assert!(has_text);
+    }
+
+    struct ApprovalTrackingProvider;
+
+    impl Provider for ApprovalTrackingProvider {
+        fn complete(
+            &self,
+            _request: &CompletionRequest,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<CompletionResponse, ProviderError>> + Send + '_>>
+        {
+            Box::pin(async { unreachable!("use stream instead") })
+        }
+
+        fn stream(&self, request: &CompletionRequest) -> clawedcode_api::EventStream {
+            let has_tool_result = request.messages.iter().any(|m| {
+                m.content.iter().any(|b| {
+                    matches!(b, clawedcode_api::ProviderContentBlock::ToolResult { .. })
+                })
+            });
+
+            if has_tool_result {
+                let events = vec![
+                    ApiEvent::MessageDelta { text: "Task completed.".to_string() },
+                    ApiEvent::Completed,
+                ];
+                Box::pin(stream::iter(events.into_iter().map(Ok)))
+            } else {
+                let events = vec![
+                    ApiEvent::ToolUse {
+                        tool_use: clawedcode_api::ToolUseEvent {
+                            id: "tool-approval-1".to_string(),
+                            name: "shell".to_string(),
+                            input: serde_json::json!({
+                                "command": "printf approved"
+                            })
+                            .to_string(),
+                        },
+                    },
+                    ApiEvent::Completed,
+                ];
+                Box::pin(stream::iter(events.into_iter().map(Ok)))
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_tool_use_with_approval_granted_emits_tool_and_response() {
+        let config = AppConfig::default();
+        let prompt_spec = PromptSpec {
+            name: "test",
+            summary: "test",
+            body: "You are a test assistant.",
+        };
+        let compat = CompatibilitySnapshot {
+            settings_files: vec![],
+            settings: serde_json::Value::Null,
+            skills: vec![],
+            memory_files: vec![],
+            memory: String::new(),
+            mcp_servers: std::collections::BTreeMap::new(),
+        };
+        let runtime = Runtime::with_provider(
+            config,
+            prompt_spec,
+            compat,
+            PermissionMode::Default,
+            Box::new(ApprovalTrackingProvider),
+        );
+        let mut session = runtime.start_session(std::env::temp_dir());
+
+        let mut tool_use_seen = false;
+        let mut response_seen = false;
+
+        runtime.run_in_runtime(async {
+            runtime
+                .submit_stream_with_approval(
+                    &mut session,
+                    "read the file",
+                    |event| {
+                        match event {
+                            ApiEvent::ToolUse { .. } => tool_use_seen = true,
+                            ApiEvent::MessageDelta { text } if text.contains("completed") => {
+                                response_seen = true
+                            }
+                            _ => {}
+                        }
+                    },
+                    &|_id, name, _input| {
+                        assert_eq!(name, "shell");
+                        true
+                    },
+                )
+                .await
+        });
+
+        assert!(tool_use_seen, "ToolUse event should be emitted");
+        assert!(response_seen, "Final response delta should be emitted");
+        assert!(session.messages.iter().any(|m| m.role == Role::Tool));
+
+        let has_tool_result = session.messages.iter().any(|m| {
+            m.role == Role::Tool
+                && m.content_blocks.iter().any(|b| {
+                    matches!(b, ContentBlock::ToolResult { is_error: false, content, .. } if content.contains("approved"))
+                })
+        });
+        assert!(has_tool_result, "Tool result should be persisted in session");
+    }
+
+    #[test]
+    fn streaming_tool_use_with_approval_denied_persists_error() {
+        let config = AppConfig::default();
+        let prompt_spec = PromptSpec {
+            name: "test",
+            summary: "test",
+            body: "You are a test assistant.",
+        };
+        let compat = CompatibilitySnapshot {
+            settings_files: vec![],
+            settings: serde_json::Value::Null,
+            skills: vec![],
+            memory_files: vec![],
+            memory: String::new(),
+            mcp_servers: std::collections::BTreeMap::new(),
+        };
+
+        let runtime = Runtime::with_provider(
+            config,
+            prompt_spec,
+            compat,
+            PermissionMode::Default,
+            Box::new(ApprovalTrackingProvider),
+        );
+        let mut session = runtime.start_session(std::env::temp_dir());
+
+        let mut response_seen = false;
+
+        runtime.run_in_runtime(async {
+            runtime
+                .submit_stream_with_approval(
+                    &mut session,
+                    "read the file",
+                    |event| {
+                        if let ApiEvent::MessageDelta { text } = event {
+                            if text.contains("completed") {
+                                response_seen = true;
+                            }
+                        }
+                    },
+                    &|_id, name, _input| {
+                        assert_eq!(name, "shell");
+                        false
+                    },
+                )
+                .await
+        });
+
+        assert!(response_seen, "Final response delta should still be emitted");
+
+        let has_denied_error = session.messages.iter().any(|m| {
+            m.role == Role::Tool
+                && m.content_blocks.iter().any(|b| {
+                    matches!(
+                        b,
+                        ContentBlock::ToolResult { is_error, content, .. }
+                            if *is_error && content.contains("denied")
+                    )
+                })
+        });
+        assert!(has_denied_error, "Denied error should be persisted in session");
+        assert!(session.messages.iter().any(|m| m.role == Role::User));
+    }
+
+    #[test]
+    fn approval_denied_session_still_has_consistent_state() {
+        let config = AppConfig::default();
+        let prompt_spec = PromptSpec {
+            name: "test",
+            summary: "test",
+            body: "You are a test assistant.",
+        };
+        let compat = CompatibilitySnapshot {
+            settings_files: vec![],
+            settings: serde_json::Value::Null,
+            skills: vec![],
+            memory_files: vec![],
+            memory: String::new(),
+            mcp_servers: std::collections::BTreeMap::new(),
+        };
+
+        let runtime = Runtime::with_provider(
+            config,
+            prompt_spec,
+            compat,
+            PermissionMode::Default,
+            Box::new(ApprovalTrackingProvider),
+        );
+        let mut session = runtime.start_session(std::env::temp_dir());
+
+        let mut events_seen: Vec<ApiEvent> = Vec::new();
+        runtime.run_in_runtime(async {
+            runtime
+                .submit_stream_with_approval(
+                    &mut session,
+                    "read the file",
+                    |event| events_seen.push(event.clone()),
+                    &|_id, _name, _input| false,
+                )
+                .await
+        });
+
+        let role_sequence: Vec<_> = session.messages.iter().map(|m| m.role).collect();
+
+        assert!(role_sequence.contains(&Role::User), "Should have user message");
+        assert!(role_sequence.contains(&Role::Assistant), "Should have assistant message");
+        assert!(role_sequence.contains(&Role::Tool), "Should have tool result message");
+
+        let session_json = serde_json::to_string(&session).unwrap();
+        let reparsed: Session = serde_json::from_str(&session_json).unwrap();
+        assert_eq!(reparsed.messages.len(), session.messages.len());
+    }
+
+    mod performance_tests {
+        use super::*;
+        use std::time::Instant;
+
+        #[test]
+        fn runtime_construction_is_fast() {
+            let start = Instant::now();
+            let config = AppConfig::default();
+            let prompt_spec = PromptSpec {
+                name: "test",
+                summary: "test",
+                body: "You are a test assistant.",
+            };
+            let compat = CompatibilitySnapshot {
+                settings_files: vec![],
+                settings: serde_json::Value::Null,
+                skills: vec![],
+                memory_files: vec![],
+                memory: String::new(),
+                mcp_servers: std::collections::BTreeMap::new(),
+            };
+
+            for _ in 0..10 {
+                let _runtime = Runtime::new(config.clone(), prompt_spec.clone(), compat.clone());
+            }
+            let elapsed = start.elapsed();
+
+            assert!(
+                elapsed < Duration::from_millis(500),
+                "runtime construction should be fast, took {:?}",
+                elapsed
+            );
+        }
+
+        #[test]
+        fn session_save_load_is_fast_for_small_sessions() {
+            let dir = std::env::temp_dir().join(format!(
+                "perf_session_{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+
+            let mut session = Session::new(PathBuf::from("/tmp/test"));
+            session.push(Role::System, "System prompt here");
+            session.push(Role::User, "What is 2+2?");
+            session.push(Role::Assistant, "The answer is 4.");
+            session.push(Role::User, "And 3+3?");
+            session.push(Role::Assistant, "That would be 6.");
+
+            let start = Instant::now();
+            for _ in 0..100 {
+                session.save(&dir).unwrap();
+                let loaded = Session::load(&dir, session.id).unwrap();
+                assert_eq!(loaded.messages.len(), 5);
+            }
+            let elapsed = start.elapsed();
+
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "session save/load should be fast, took {:?}",
+                elapsed
+            );
+
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn build_request_is_fast_for_large_history() {
+            let config = AppConfig::default();
+            let prompt_spec = PromptSpec {
+                name: "test",
+                summary: "test",
+                body: "You are a test assistant.",
+            };
+            let compat = CompatibilitySnapshot {
+                settings_files: vec![],
+                settings: serde_json::Value::Null,
+                skills: vec![],
+                memory_files: vec![],
+                memory: String::new(),
+                mcp_servers: std::collections::BTreeMap::new(),
+            };
+            let runtime = Runtime::with_provider(
+                config,
+                prompt_spec,
+                compat,
+                PermissionMode::Default,
+                Box::new(MockProvider),
+            );
+
+            let mut session = runtime.start_session(PathBuf::from("/tmp"));
+            for i in 0..500 {
+                session.push(Role::User, &format!("Question {}", i));
+                session.push(Role::Assistant, &format!("Answer {}", i));
+            }
+
+            let start = Instant::now();
+            for _ in 0..100 {
+                let _request = runtime.build_request(&session);
+            }
+            let elapsed = start.elapsed();
+
+            assert!(
+                elapsed < Duration::from_millis(500),
+                "build_request for 500-message session should be fast, took {:?}",
+                elapsed
+            );
+        }
+
+        #[test]
+        fn session_messages_access_is_fast() {
+            let mut session = Session::new(PathBuf::from("/tmp/test"));
+            session.push(Role::System, "System prompt here");
+            for i in 0..100 {
+                session.push(Role::User, &format!("Question {}", i));
+                session.push(Role::Assistant, &format!("Answer {}", i));
+            }
+
+            let start = Instant::now();
+            for _ in 0..1000 {
+                let count = session.messages.len();
+                let last_user = session.last_user_text();
+                let _ = (count, last_user);
+            }
+            let elapsed = start.elapsed();
+
+            assert!(
+                elapsed < Duration::from_millis(50),
+                "session message access should be fast, took {:?}",
+                elapsed
+            );
+        }
+
+        #[test]
+        fn mcp_discovery_is_bounded_for_empty_servers() {
+            let servers: BTreeMap<String, McpServerConfig> = BTreeMap::new();
+
+            let start = Instant::now();
+            let tools = discover_mcp_tools_sync(&servers);
+            let elapsed = start.elapsed();
+
+            assert!(tools.is_empty());
+            assert!(
+                elapsed < Duration::from_millis(50),
+                "empty discovery should be instant, took {:?}",
+                elapsed
+            );
+        }
     }
 }

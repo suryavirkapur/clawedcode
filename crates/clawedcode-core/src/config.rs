@@ -120,9 +120,41 @@ pub fn default_config_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::AppConfig;
+    use crate::test_support::env_lock;
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("clawed_config_{name}_{unique}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn config_snapshot(config: &AppConfig) -> String {
+        format!(
+            "model={}\nprovider.endpoint={}\nprovider.api_key_env={}\nui.theme={}\nui.show_thinking={}\nruntime.max_turns={}\nruntime.session_history_limit={}\nprompts.default_system_prompt={}\nprompts.default_prompt_pack={}",
+            config.model,
+            config.provider.endpoint.as_deref().unwrap_or("<none>"),
+            config.provider.api_key_env,
+            config.ui.theme,
+            config.ui.show_thinking,
+            config.runtime.max_turns,
+            config.runtime.session_history_limit,
+            config.prompts.default_system_prompt,
+            config.prompts.default_prompt_pack,
+        )
+    }
 
     #[test]
     fn anthropic_model_override_applies_without_config_file() {
+        let _guard = env_lock();
         // SAFETY: tests here are single-threaded and restore env before exit.
         unsafe { std::env::set_var("CLAWEDCODE_PROVIDER", "anthropic") };
         unsafe { std::env::set_var("ANTHROPIC_MODEL", "qwen3.5:4b") };
@@ -132,5 +164,101 @@ mod tests {
 
         unsafe { std::env::remove_var("ANTHROPIC_MODEL") };
         unsafe { std::env::remove_var("CLAWEDCODE_PROVIDER") };
+    }
+
+    #[test]
+    fn config_load_from_file_matches_snapshot() {
+        let _guard = env_lock();
+        unsafe { std::env::remove_var("ANTHROPIC_MODEL") };
+        unsafe { std::env::remove_var("CLAWEDCODE_PROVIDER") };
+
+        let dir = temp_dir("snapshot");
+        let config_path = dir.join("config.toml");
+        fs::write(
+            &config_path,
+            r#"model = "claude-3-opus"
+
+[provider]
+endpoint = "https://api.example.com/v1"
+api_key_env = "MY_PROVIDER_KEY"
+
+[ui]
+theme = "midnight"
+show_thinking = true
+
+[runtime]
+max_turns = 128
+session_history_limit = 1000
+
+[prompts]
+default_system_prompt = "expert-coder"
+default_prompt_pack = "code-review"
+"#,
+        )
+        .unwrap();
+
+        let config = AppConfig::load(Some(&config_path)).expect("config loads");
+        assert_eq!(
+            config_snapshot(&config),
+            "model=claude-3-opus\nprovider.endpoint=https://api.example.com/v1\nprovider.api_key_env=MY_PROVIDER_KEY\nui.theme=midnight\nui.show_thinking=true\nruntime.max_turns=128\nruntime.session_history_limit=1000\nprompts.default_system_prompt=expert-coder\nprompts.default_prompt_pack=code-review"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_env_override_preserves_other_file_values() {
+        let _guard = env_lock();
+        let dir = temp_dir("env_override");
+        let config_path = dir.join("config.toml");
+        fs::write(
+            &config_path,
+            r#"model = "file-model"
+
+[provider]
+endpoint = "https://api.example.com/v1"
+api_key_env = "MY_PROVIDER_KEY"
+
+[ui]
+theme = "file-theme"
+show_thinking = true
+
+[runtime]
+max_turns = 32
+session_history_limit = 99
+
+[prompts]
+default_system_prompt = "custom"
+default_prompt_pack = "review"
+"#,
+        )
+        .unwrap();
+
+        unsafe { std::env::set_var("CLAWEDCODE_PROVIDER", "anthropic") };
+        unsafe { std::env::set_var("ANTHROPIC_MODEL", "env-override-model") };
+
+        let config = AppConfig::load(Some(&config_path)).expect("config loads");
+        assert_eq!(
+            config_snapshot(&config),
+            "model=env-override-model\nprovider.endpoint=https://api.example.com/v1\nprovider.api_key_env=MY_PROVIDER_KEY\nui.theme=file-theme\nui.show_thinking=true\nruntime.max_turns=32\nruntime.session_history_limit=99\nprompts.default_system_prompt=custom\nprompts.default_prompt_pack=review"
+        );
+
+        unsafe { std::env::remove_var("ANTHROPIC_MODEL") };
+        unsafe { std::env::remove_var("CLAWEDCODE_PROVIDER") };
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn default_config_matches_snapshot() {
+        let _guard = env_lock();
+        unsafe { std::env::remove_var("ANTHROPIC_MODEL") };
+        unsafe { std::env::remove_var("CLAWEDCODE_PROVIDER") };
+
+        let missing_path = temp_dir("default").join("missing-config.toml");
+        let config = AppConfig::load(Some(&missing_path)).expect("loads default config");
+        assert_eq!(
+            config_snapshot(&config),
+            "model=gpt-5\nprovider.endpoint=<none>\nprovider.api_key_env=OPENAI_API_KEY\nui.theme=sunrise\nui.show_thinking=false\nruntime.max_turns=64\nruntime.session_history_limit=2000\nprompts.default_system_prompt=core\nprompts.default_prompt_pack=coding"
+        );
     }
 }

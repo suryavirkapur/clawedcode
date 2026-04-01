@@ -74,14 +74,66 @@ pub enum Command {
     Compat,
     /// Update clawedcode using the package manager that installed it.
     Update,
-    /// Headless batch execution mode (not yet implemented).
-    Headless,
-    /// Direct connection to a remote Claude Code instance (not yet implemented).
-    DirectConnect,
-    /// Connect via SSH to a remote host (not yet implemented).
-    Ssh,
-    /// Connect to a remote orchestrator (not yet implemented).
-    Remote,
+    /// Headless batch execution mode (reads from stdin if no --prompt).
+    Headless {
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long)]
+        system_prompt: Option<String>,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        show_thinking: bool,
+        #[arg(long, short = 'y')]
+        yes: bool,
+        #[arg(long)]
+        output_path: Option<PathBuf>,
+    },
+    /// Direct connection to a remote Claude Code instance.
+    DirectConnect {
+        #[arg(long)]
+        address: String,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long)]
+        system_prompt: Option<String>,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        show_thinking: bool,
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Connect via SSH to a remote host.
+    Ssh {
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long)]
+        system_prompt: Option<String>,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        show_thinking: bool,
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Connect to a remote orchestrator.
+    Remote {
+        #[arg(long)]
+        orchestrator: String,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long)]
+        system_prompt: Option<String>,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        show_thinking: bool,
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,10 +175,10 @@ impl Cli {
             Some(Command::Config) => Intent::Config,
             Some(Command::Compat) => Intent::Compat,
             Some(Command::Update) => Intent::Update,
-            Some(Command::Headless) => Intent::Headless,
-            Some(Command::DirectConnect) => Intent::DirectConnect,
-            Some(Command::Ssh) => Intent::Ssh,
-            Some(Command::Remote) => Intent::Remote,
+            Some(Command::Headless { .. }) => Intent::Headless,
+            Some(Command::DirectConnect { .. }) => Intent::DirectConnect,
+            Some(Command::Ssh { .. }) => Intent::Ssh,
+            Some(Command::Remote { .. }) => Intent::Remote,
             None => Intent::Interactive,
         }
     }
@@ -260,25 +312,53 @@ mod tests {
 
     #[test]
     fn test_classify_intent_headless_subcommand() {
-        let cli = make_cli(Some(Command::Headless));
+        let cli = make_cli(Some(Command::Headless {
+            prompt: None,
+            system_prompt: None,
+            json: false,
+            show_thinking: false,
+            yes: false,
+            output_path: None,
+        }));
         assert_eq!(cli.classify_intent(), Intent::Headless);
     }
 
     #[test]
     fn test_classify_intent_direct_connect_subcommand() {
-        let cli = make_cli(Some(Command::DirectConnect));
+        let cli = make_cli(Some(Command::DirectConnect {
+            address: "localhost:8080".to_string(),
+            prompt: None,
+            system_prompt: None,
+            json: false,
+            show_thinking: false,
+            yes: false,
+        }));
         assert_eq!(cli.classify_intent(), Intent::DirectConnect);
     }
 
     #[test]
     fn test_classify_intent_ssh_subcommand() {
-        let cli = make_cli(Some(Command::Ssh));
+        let cli = make_cli(Some(Command::Ssh {
+            target: "user@host".to_string(),
+            prompt: None,
+            system_prompt: None,
+            json: false,
+            show_thinking: false,
+            yes: false,
+        }));
         assert_eq!(cli.classify_intent(), Intent::Ssh);
     }
 
     #[test]
     fn test_classify_intent_remote_subcommand() {
-        let cli = make_cli(Some(Command::Remote));
+        let cli = make_cli(Some(Command::Remote {
+            orchestrator: "orchestrator.example.com".to_string(),
+            prompt: None,
+            system_prompt: None,
+            json: false,
+            show_thinking: false,
+            yes: false,
+        }));
         assert_eq!(cli.classify_intent(), Intent::Remote);
     }
 }

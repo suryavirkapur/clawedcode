@@ -8,6 +8,19 @@ use std::{
 };
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMode {
+    #[default]
+    Interactive,
+    Headless,
+    Resume,
+    Continue,
+    DirectConnect,
+    Ssh,
+    Remote,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: Uuid,
@@ -15,6 +28,14 @@ pub struct Session {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub messages: Vec<Message>,
+    #[serde(default)]
+    pub task_list_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub child_sessions: Vec<Uuid>,
+    #[serde(default)]
+    pub execution_mode: SessionMode,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -90,6 +111,10 @@ pub enum Role {
 
 impl Session {
     pub fn new(cwd: PathBuf) -> Self {
+        Self::with_mode(cwd, SessionMode::Interactive)
+    }
+
+    pub fn with_mode(cwd: PathBuf, mode: SessionMode) -> Self {
         let now = Utc::now();
         Self {
             id: Uuid::new_v4(),
@@ -97,7 +122,45 @@ impl Session {
             created_at: now,
             updated_at: now,
             messages: Vec::new(),
+            task_list_id: String::new(),
+            parent_session_id: None,
+            child_sessions: Vec::new(),
+            execution_mode: mode,
         }
+        .with_default_task_list_id()
+    }
+
+    pub fn new_child(cwd: PathBuf, parent_id: Uuid) -> Self {
+        Self::new_child_with_mode(cwd, parent_id, SessionMode::Interactive)
+    }
+
+    pub fn new_child_with_mode(cwd: PathBuf, parent_id: Uuid, mode: SessionMode) -> Self {
+        Self::new_child_with_task_list(cwd, parent_id, parent_id.to_string(), mode)
+    }
+
+    pub fn new_child_with_task_list(
+        cwd: PathBuf,
+        parent_id: Uuid,
+        task_list_id: impl Into<String>,
+        mode: SessionMode,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::new_v4(),
+            cwd,
+            created_at: now,
+            updated_at: now,
+            messages: Vec::new(),
+            task_list_id: task_list_id.into(),
+            parent_session_id: Some(parent_id),
+            child_sessions: Vec::new(),
+            execution_mode: mode,
+        }
+    }
+
+    pub fn add_child(&mut self, child_id: Uuid) {
+        self.child_sessions.push(child_id);
+        self.updated_at = Utc::now();
     }
 
     pub fn push(&mut self, role: Role, content: impl Into<String>) {
@@ -123,8 +186,9 @@ impl Session {
         let path = base_dir.join(format!("{}.json", session_id));
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        serde_json::from_str(&raw)
-            .with_context(|| format!("failed to parse session from {}", path.display()))
+        let session: Self = serde_json::from_str(&raw)
+            .with_context(|| format!("failed to parse session from {}", path.display()))?;
+        Ok(session.with_default_task_list_id())
     }
 
     pub fn load_by_id(base_dir: &Path, session_id: &str) -> Result<Self> {
@@ -139,6 +203,13 @@ impl Session {
             .rev()
             .find(|m| m.role == Role::User)
             .and_then(|m| m.primary_text())
+    }
+
+    pub fn with_default_task_list_id(mut self) -> Self {
+        if self.task_list_id.is_empty() {
+            self.task_list_id = self.id.to_string();
+        }
+        self
     }
 }
 
@@ -262,6 +333,154 @@ mod tests {
 
         let loaded = Session::load_by_id(&dir, &session.id.to_string()).unwrap();
         assert_eq!(loaded.id, session.id);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_load_roundtrip_with_parent_child_metadata() {
+        let dir = std::env::temp_dir().join(format!("clawed_test_{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let parent_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+        let mut session = Session::new_child(PathBuf::from("/tmp/test"), parent_id);
+        session.add_child(child_id);
+        session.push_blocks(
+            Role::Assistant,
+            vec![ContentBlock::subagent_summary(
+                child_id.to_string(),
+                "Child finished",
+            )],
+        );
+
+        session.save(&dir).unwrap();
+        let loaded = Session::load(&dir, session.id).unwrap();
+
+        assert_eq!(loaded.parent_session_id, Some(parent_id));
+        assert_eq!(loaded.child_sessions, vec![child_id]);
+        assert!(loaded.messages.iter().any(|message| {
+            message
+                .content_blocks
+                .iter()
+                .any(|block| matches!(block, ContentBlock::SubAgentSummary { .. }))
+        }));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn session_default_mode_is_interactive() {
+        let session = Session::new(PathBuf::from("/tmp/test"));
+        assert_eq!(session.execution_mode, SessionMode::Interactive);
+        assert_eq!(session.task_list_id, session.id.to_string());
+    }
+
+    #[test]
+    fn session_with_explicit_mode() {
+        let session = Session::with_mode(PathBuf::from("/tmp/test"), SessionMode::Headless);
+        assert_eq!(session.execution_mode, SessionMode::Headless);
+    }
+
+    #[test]
+    fn session_mode_persists_across_save_load() {
+        let dir = std::env::temp_dir().join(format!("clawed_test_{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut session =
+            Session::with_mode(PathBuf::from("/tmp/test"), SessionMode::DirectConnect);
+        session.push(Role::User, "Hello");
+
+        session.save(&dir).unwrap();
+        let loaded = Session::load(&dir, session.id).unwrap();
+
+        assert_eq!(loaded.execution_mode, SessionMode::DirectConnect);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn session_all_modes_persist() {
+        let dir = std::env::temp_dir().join(format!("clawed_test_{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let modes = vec![
+            SessionMode::Interactive,
+            SessionMode::Headless,
+            SessionMode::Resume,
+            SessionMode::Continue,
+            SessionMode::DirectConnect,
+            SessionMode::Ssh,
+            SessionMode::Remote,
+        ];
+
+        for mode in modes {
+            let mut session = Session::with_mode(PathBuf::from("/tmp/test"), mode.clone());
+            session.push(Role::User, "test");
+            session.save(&dir).unwrap();
+            let loaded = Session::load(&dir, session.id).unwrap();
+            assert_eq!(
+                loaded.execution_mode, mode,
+                "mode {:?} did not persist",
+                mode
+            );
+        }
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn child_session_inherits_mode() {
+        let dir = std::env::temp_dir().join(format!("clawed_test_{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let parent_id = Uuid::new_v4();
+        let mut parent = Session::with_mode(PathBuf::from("/tmp/test"), SessionMode::Headless);
+        parent.push(Role::User, "parent");
+
+        let mut child = Session::new_child_with_mode(
+            PathBuf::from("/tmp/test"),
+            parent_id,
+            SessionMode::Headless,
+        );
+        child.push(Role::User, "child");
+
+        assert_eq!(parent.execution_mode, SessionMode::Headless);
+        assert_eq!(child.execution_mode, SessionMode::Headless);
+        assert_eq!(child.task_list_id, parent_id.to_string());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn old_session_format_loads_with_default_mode() {
+        let dir = std::env::temp_dir().join(format!("clawed_test_{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let session_id = Uuid::new_v4();
+        let path = dir.join(format!("{}.json", session_id));
+
+        let old_json = format!(
+            r#"{{
+  "id": "{}",
+  "cwd": "/tmp/test",
+  "created_at": "2025-01-01T00:00:00Z",
+  "updated_at": "2025-01-01T00:01:00Z",
+  "messages": [
+    {{
+      "role": "system",
+      "content": "You are helpful.",
+      "created_at": "2025-01-01T00:00:00Z"
+    }}
+  ]
+}}"#,
+            session_id
+        );
+
+        fs::write(&path, old_json).unwrap();
+
+        let loaded = Session::load(&dir, session_id).unwrap();
+        assert_eq!(loaded.execution_mode, SessionMode::Interactive);
+        assert_eq!(loaded.task_list_id, session_id.to_string());
 
         fs::remove_dir_all(&dir).ok();
     }
