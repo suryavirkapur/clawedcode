@@ -153,6 +153,44 @@ pub struct Shell;
 
 const SHELL_MAX_OUTPUT_BYTES: usize = 128 * 1024; // 128 KB
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShellCommandSpec {
+    program: String,
+    args: Vec<String>,
+}
+
+fn bash_is_available() -> bool {
+    std::process::Command::new("bash")
+        .arg("--version")
+        .output()
+        .is_ok()
+}
+
+fn shell_command_spec(command: &str, bash_available: bool) -> ShellCommandSpec {
+    if cfg!(windows) {
+        ShellCommandSpec {
+            program: "cmd".to_string(),
+            args: vec!["/C".to_string(), command.to_string()],
+        }
+    } else if bash_available {
+        ShellCommandSpec {
+            program: "bash".to_string(),
+            args: vec!["-lc".to_string(), command.to_string()],
+        }
+    } else {
+        ShellCommandSpec {
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), command.to_string()],
+        }
+    }
+}
+
+fn build_shell_command(spec: &ShellCommandSpec, cwd: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(&spec.program);
+    cmd.args(&spec.args).current_dir(cwd);
+    cmd
+}
+
 impl Tool for Shell {
     fn name(&self) -> &str {
         "shell"
@@ -177,17 +215,8 @@ impl Tool for Shell {
             }
         };
 
-        let mut cmd = if cfg!(windows) {
-            let mut c = std::process::Command::new("cmd");
-            c.arg("/C").arg(command);
-            c
-        } else {
-            let mut c = std::process::Command::new("sh");
-            c.arg("-c").arg(command);
-            c
-        };
-
-        let output = cmd.current_dir(cwd).output();
+        let spec = shell_command_spec(command, bash_is_available());
+        let output = build_shell_command(&spec, cwd).output();
 
         match output {
             Ok(out) => {
@@ -889,6 +918,32 @@ mod tests {
         assert!(result.content.contains("hello"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn shell_command_spec_prefers_bash_when_available() {
+        let spec = shell_command_spec("echo hello", true);
+
+        if cfg!(windows) {
+            assert_eq!(spec.program, "cmd");
+            assert_eq!(spec.args, vec!["/C".to_string(), "echo hello".to_string()]);
+        } else {
+            assert_eq!(spec.program, "bash");
+            assert_eq!(spec.args, vec!["-lc".to_string(), "echo hello".to_string()]);
+        }
+    }
+
+    #[test]
+    fn shell_command_spec_falls_back_to_sh_when_bash_is_unavailable() {
+        let spec = shell_command_spec("echo hello", false);
+
+        if cfg!(windows) {
+            assert_eq!(spec.program, "cmd");
+            assert_eq!(spec.args, vec!["/C".to_string(), "echo hello".to_string()]);
+        } else {
+            assert_eq!(spec.program, "sh");
+            assert_eq!(spec.args, vec!["-c".to_string(), "echo hello".to_string()]);
+        }
     }
 
     #[test]
