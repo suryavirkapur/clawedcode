@@ -3143,6 +3143,144 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
         fs::remove_dir_all(data_dir).ok();
     }
 
+    #[derive(Debug, Clone)]
+    struct StringifiedTaskOutputProvider {
+        task_id: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    impl Provider for StringifiedTaskOutputProvider {
+        fn complete(
+            &self,
+            _request: &CompletionRequest,
+        ) -> Pin<
+            Box<dyn std::future::Future<Output = Result<CompletionResponse, ProviderError>> + Send + '_>,
+        > {
+            Box::pin(async { unreachable!("use stream instead") })
+        }
+
+        fn stream(&self, request: &CompletionRequest) -> clawedcode_api::EventStream {
+            if request_has_tool_result_message(request) {
+                let events = vec![
+                    ApiEvent::MessageDelta {
+                        text: "TaskOutput completed.".to_string(),
+                    },
+                    ApiEvent::Completed,
+                ];
+                return Box::pin(stream::iter(
+                    events.into_iter().map(Result::<_, ProviderError>::Ok),
+                ));
+            }
+
+            let task_id = self
+                .task_id
+                .lock()
+                .expect("task id lock")
+                .clone()
+                .expect("task id set");
+            let input = serde_json::to_string(
+                &serde_json::json!({
+                    "taskId": task_id,
+                    "block": "true",
+                    "timeout": "2000",
+                })
+                .to_string(),
+            )
+            .expect("stringify input");
+
+            let events = vec![
+                ApiEvent::ToolUse {
+                    tool_use: clawedcode_api::ToolUseEvent {
+                        id: "task-output-stream-1".to_string(),
+                        name: "TaskOutput".to_string(),
+                        input,
+                    },
+                },
+                ApiEvent::Completed,
+            ];
+
+            Box::pin(stream::iter(
+                events.into_iter().map(Result::<_, ProviderError>::Ok),
+            ))
+        }
+    }
+
+    #[test]
+    fn task_output_stringified_object_is_decoded_through_stream_loop() {
+        let _guard = crate::test_support::env_lock();
+        let data_dir = set_temp_data_dir();
+        let config = AppConfig::default();
+        let prompt_spec = PromptSpec {
+            name: "test",
+            summary: "test",
+            body: "You are a test assistant.",
+        };
+        let compat = CompatibilitySnapshot {
+            settings_files: vec![],
+            settings: serde_json::Value::Null,
+            skills: vec![],
+            memory_files: vec![],
+            memory: String::new(),
+            mcp_servers: std::collections::BTreeMap::new(),
+        };
+        let task_id = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let runtime = Runtime::with_provider(
+            config,
+            prompt_spec,
+            compat,
+            PermissionMode::Bypass,
+            Box::new(StringifiedTaskOutputProvider {
+                task_id: task_id.clone(),
+            }),
+        );
+        let mut session = runtime.start_session(std::env::temp_dir());
+        let task = crate::background_task::spawn_background_shell(
+            "echo done".to_string(),
+            "immediate echo".to_string(),
+            std::env::temp_dir(),
+            &session.id.to_string(),
+        )
+        .unwrap();
+        *task_id.lock().expect("task id lock") = Some(task.id.clone());
+
+        let output = runtime.run_in_runtime(async {
+            runtime
+                .submit_stream(&mut session, "fetch the output", |_| {})
+                .await
+        });
+
+        assert!(output.response.contains("TaskOutput completed."));
+        assert!(output.tools_executed >= 1);
+
+        let tool_result = session
+            .messages
+            .iter()
+            .find(|message| message.role == Role::Tool)
+            .expect("tool result message");
+        let content = tool_result
+            .content_blocks
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::ToolResult {
+                    content,
+                    is_error: false,
+                    ..
+                } => Some(content.as_str()),
+                _ => None,
+            })
+            .expect("tool result content");
+        let json: serde_json::Value = serde_json::from_str(content).expect("task output json");
+        assert_eq!(json["retrieval_status"], "success");
+        assert!(json["task"]["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("done"));
+
+        let _ = crate::background_task::stop_background_task(&task.id);
+
+        unsafe { std::env::remove_var("CLAWEDCODE_DATA_DIR") };
+        fs::remove_dir_all(data_dir).ok();
+    }
+
     #[test]
     fn background_shell_output_path_is_session_scoped() {
         let _guard = crate::test_support::env_lock();
