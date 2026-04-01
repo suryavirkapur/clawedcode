@@ -24,6 +24,9 @@ pub struct SkillDescriptor {
     pub description: Option<String>,
     pub when_to_use: Option<String>,
     pub path: PathBuf,
+    pub body: String,
+    pub slash_command: String,
+    pub legacy_command: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -89,28 +92,38 @@ fn settings_search_paths(cwd: &Path) -> Vec<PathBuf> {
 }
 
 fn discover_skills(cwd: &Path) -> Result<Vec<SkillDescriptor>> {
-    let mut paths = Vec::new();
+    let mut paths: Vec<(PathBuf, bool)> = Vec::new();
 
     if let Some(home) = claude_home() {
-        paths.push(home.join("skills"));
+        paths.push((home.join("skills"), false));
     }
 
     for ancestor in cwd.ancestors() {
-        paths.push(ancestor.join(".claude").join("skills"));
-        paths.push(ancestor.join(".claude").join("commands"));
+        paths.push((ancestor.join(".claude").join("skills"), false));
+        paths.push((ancestor.join(".claude").join("commands"), true));
     }
 
     let mut discovered = Vec::new();
-    for root in paths {
+    for (root, is_legacy) in paths {
         if !root.exists() {
             continue;
         }
-        discover_skills_in_root(&root, &mut discovered)?;
+        discover_skills_in_root(&root, is_legacy, &mut discovered)?;
     }
 
-    discovered.sort_by(|a, b| a.name.cmp(&b.name).then(a.path.cmp(&b.path)));
-    discovered.dedup_by(|a, b| a.path == b.path);
-    Ok(discovered)
+    let mut unique = Vec::new();
+    for skill in discovered {
+        if unique
+            .iter()
+            .any(|existing: &SkillDescriptor| existing.slash_command == skill.slash_command)
+        {
+            continue;
+        }
+        unique.push(skill);
+    }
+
+    unique.sort_by(|a, b| a.slash_command.cmp(&b.slash_command).then(a.path.cmp(&b.path)));
+    Ok(unique)
 }
 
 fn discover_memory(cwd: &Path) -> Result<(Vec<PathBuf>, String)> {
@@ -214,7 +227,11 @@ fn resolve_include_path(source: &Path, target: &str) -> PathBuf {
         .unwrap_or(target_path)
 }
 
-fn discover_skills_in_root(root: &Path, out: &mut Vec<SkillDescriptor>) -> Result<()> {
+fn discover_skills_in_root(
+    root: &Path,
+    is_legacy: bool,
+    out: &mut Vec<SkillDescriptor>,
+) -> Result<()> {
     for entry in fs::read_dir(root).with_context(|| format!("failed to read {}", root.display()))? {
         let entry = entry?;
         let path = entry.path();
@@ -223,7 +240,7 @@ fn discover_skills_in_root(root: &Path, out: &mut Vec<SkillDescriptor>) -> Resul
         if file_type.is_dir() {
             let skill_md = path.join("SKILL.md");
             if skill_md.exists() {
-                out.push(parse_skill(&skill_md)?);
+                out.push(parse_skill(&skill_md, is_legacy)?);
                 continue;
             }
 
@@ -235,54 +252,93 @@ fn discover_skills_in_root(root: &Path, out: &mut Vec<SkillDescriptor>) -> Resul
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| name.eq_ignore_ascii_case("SKILL.md"))
                 {
-                    out.push(parse_skill(&nested_path)?);
+                    out.push(parse_skill(&nested_path, is_legacy)?);
                     break;
                 }
             }
         } else if path.extension().and_then(|ext| ext.to_str()) == Some("md") {
-            out.push(parse_skill(&path)?);
+            out.push(parse_skill(&path, is_legacy)?);
         }
     }
 
     Ok(())
 }
 
-fn parse_skill(path: &Path) -> Result<SkillDescriptor> {
+fn parse_skill(path: &Path, legacy_command: bool) -> Result<SkillDescriptor> {
     let raw =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let frontmatter = parse_frontmatter(&raw).unwrap_or_default();
-    let fallback_name = path
-        .parent()
-        .and_then(|parent| parent.file_name())
-        .and_then(|name| name.to_str())
-        .or_else(|| path.file_stem().and_then(|name| name.to_str()))
-        .unwrap_or("skill")
-        .to_string();
+    let (frontmatter, body) = parse_frontmatter_and_body(&raw);
+    let fallback_name = if legacy_command {
+        path.file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("skill")
+            .to_string()
+    } else {
+        path.parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            .or_else(|| path.file_stem().and_then(|name| name.to_str()))
+            .unwrap_or("skill")
+            .to_string()
+    };
+
+    let name = frontmatter.name.unwrap_or(fallback_name);
+    let slash_command = slash_command_from_name(&name);
 
     Ok(SkillDescriptor {
-        name: frontmatter.name.unwrap_or(fallback_name),
+        name,
         description: frontmatter.description,
         when_to_use: frontmatter.when_to_use,
         path: path.to_path_buf(),
+        body,
+        slash_command,
+        legacy_command,
     })
 }
 
-fn parse_frontmatter(raw: &str) -> Option<SkillFrontmatter> {
+fn parse_frontmatter_and_body(raw: &str) -> (SkillFrontmatter, String) {
     let mut lines = raw.lines();
-    if lines.next()? != "---" {
-        return None;
+    if lines.next() != Some("---") {
+        return (SkillFrontmatter::default(), raw.trim().to_string());
     }
 
     let mut yaml = String::new();
-    for line in lines {
+    while let Some(line) = lines.next() {
         if line == "---" {
-            return serde_yaml::from_str::<SkillFrontmatter>(&yaml).ok();
+            let frontmatter = serde_yaml::from_str::<SkillFrontmatter>(&yaml).ok();
+            let body = lines.collect::<Vec<&str>>().join("\n").trim().to_string();
+            return (frontmatter.unwrap_or_default(), body);
         }
         yaml.push_str(line);
         yaml.push('\n');
     }
 
-    None
+    (SkillFrontmatter::default(), raw.trim().to_string())
+}
+
+fn slash_command_from_name(name: &str) -> String {
+    let mut rendered = String::from("/");
+    let mut last_was_dash = false;
+
+    for ch in name.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            rendered.push(ch.to_ascii_lowercase());
+            last_was_dash = false;
+        } else if (ch.is_ascii_whitespace() || ch == '-' || ch == '_') && !last_was_dash {
+            rendered.push('-');
+            last_was_dash = true;
+        }
+    }
+
+    while rendered.ends_with('-') {
+        rendered.pop();
+    }
+
+    if rendered == "/" {
+        "/skill".to_string()
+    } else {
+        rendered
+    }
 }
 
 fn discover_mcp_servers(cwd: &Path, settings: &Value) -> Result<BTreeMap<String, McpServerConfig>> {
@@ -354,7 +410,13 @@ fn deep_merge(target: &mut Value, source: Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().expect("env lock")
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -434,6 +496,7 @@ mod tests {
 
     #[test]
     fn discover_memory_merges_layers_in_priority_order() {
+        let _guard = env_lock();
         let root = temp_dir("layers");
         let home = root.join("home");
         let project = root.join("project");
@@ -462,6 +525,55 @@ mod tests {
         let rule_idx = memory.find("rule memory").unwrap();
         assert!(user_idx < project_idx);
         assert!(project_idx < rule_idx);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn parse_skill_strips_frontmatter_and_builds_slash_command() {
+        let root = temp_dir("skill_parse");
+        let skill_dir = root.join("code-review");
+        fs::create_dir_all(&skill_dir).unwrap();
+        let path = skill_dir.join("SKILL.md");
+        fs::write(
+            &path,
+            r#"---
+name: Code Review
+description: Review code changes
+when_to_use: When checking a patch
+---
+
+# Review
+
+Look for regressions first.
+"#,
+        )
+        .unwrap();
+
+        let skill = parse_skill(&path, false).unwrap();
+        assert_eq!(skill.name, "Code Review");
+        assert_eq!(skill.slash_command, "/code-review");
+        assert!(!skill.legacy_command);
+        assert_eq!(skill.description.as_deref(), Some("Review code changes"));
+        assert_eq!(skill.when_to_use.as_deref(), Some("When checking a patch"));
+        assert_eq!(skill.body, "# Review\n\nLook for regressions first.");
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn parse_legacy_command_uses_filename_and_marks_legacy() {
+        let root = temp_dir("legacy_skill");
+        let commands_dir = root.join(".claude").join("commands");
+        fs::create_dir_all(&commands_dir).unwrap();
+        let path = commands_dir.join("review.md");
+        fs::write(&path, "Review the current change carefully.").unwrap();
+
+        let skill = parse_skill(&path, true).unwrap();
+        assert_eq!(skill.name, "review");
+        assert_eq!(skill.slash_command, "/review");
+        assert!(skill.legacy_command);
+        assert_eq!(skill.body, "Review the current change carefully.");
 
         fs::remove_dir_all(root).ok();
     }
@@ -566,6 +678,176 @@ mod tests {
             servers.get("server").and_then(|s| s.command()),
             Some("child-cmd".to_string())
         );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn parse_skill_strips_frontmatter_and_extracts_body() {
+        let root = temp_dir("skill_frontmatter");
+        let skill_md = root.join("My Skill").join("SKILL.md");
+        fs::create_dir_all(skill_md.parent().unwrap()).unwrap();
+        fs::write(
+            &skill_md,
+            r#"---
+name: My Test Skill
+description: A test skill
+when_to_use: Use this for testing
+---
+
+This is the skill body content.
+It should be preserved after frontmatter stripping.
+
+## Section
+
+Some more content here.
+"#,
+        )
+        .unwrap();
+
+        let skill = parse_skill(&skill_md, false).unwrap();
+
+        assert_eq!(skill.name, "My Test Skill");
+        assert_eq!(skill.description, Some("A test skill".to_string()));
+        assert_eq!(skill.when_to_use, Some("Use this for testing".to_string()));
+        assert!(skill.body.contains("This is the skill body content"));
+        assert!(skill.body.contains("## Section"));
+        assert!(!skill.body.contains("---"));
+        assert!(!skill.body.contains("name:"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn parse_skill_without_frontmatter_uses_full_content_as_body() {
+        let root = temp_dir("skill_no_frontmatter");
+        let skill_md = root.join("Simple Skill").join("SKILL.md");
+        fs::create_dir_all(skill_md.parent().unwrap()).unwrap();
+        fs::write(
+            &skill_md,
+            "This is a simple skill without frontmatter.\n\nJust plain markdown content.",
+        )
+        .unwrap();
+
+        let skill = parse_skill(&skill_md, false).unwrap();
+
+        assert_eq!(skill.name, "Simple Skill");
+        assert_eq!(skill.description, None);
+        assert_eq!(
+            skill.body,
+            "This is a simple skill without frontmatter.\n\nJust plain markdown content."
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn parse_skill_computes_stable_slash_command() {
+        let root = temp_dir("skill_slash_name");
+        let skill_md = root.join("My Test Skill").join("SKILL.md");
+        fs::create_dir_all(skill_md.parent().unwrap()).unwrap();
+        fs::write(&skill_md, "---\nname: My Test Skill\n---\nBody").unwrap();
+
+        let skill = parse_skill(&skill_md, false).unwrap();
+
+        assert_eq!(skill.slash_command, "/my-test-skill");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn parse_skill_flags_legacy_commands() {
+        let root = temp_dir("skill_legacy");
+        let legacy_md = root.join("commands").join("Legacy.md");
+        fs::create_dir_all(legacy_md.parent().unwrap()).unwrap();
+        fs::write(&legacy_md, "---\nname: Legacy Command\n---\nLegacy body").unwrap();
+
+        let from_commands = parse_skill(&legacy_md, true).unwrap();
+        assert!(from_commands.legacy_command);
+        assert_eq!(from_commands.slash_command, "/legacy-command");
+
+        let regular_md = root.join("skills").join("Regular.md");
+        fs::create_dir_all(regular_md.parent().unwrap()).unwrap();
+        fs::write(&regular_md, "---\nname: Regular Skill\n---\nRegular body").unwrap();
+
+        let from_skills = parse_skill(&regular_md, false).unwrap();
+        assert!(!from_skills.legacy_command);
+        assert_eq!(from_skills.slash_command, "/regular-skill");
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn discover_skills_marks_legacy_commands() {
+        let _guard = env_lock();
+        let root = temp_dir("discover_legacy");
+        let home = root.join("home");
+        let project = root.join("project");
+
+        fs::create_dir_all(home.join(".claude").join("skills")).unwrap();
+        fs::create_dir_all(project.join(".claude").join("commands")).unwrap();
+
+        fs::write(
+            home.join(".claude").join("skills").join("HomeSkill.md"),
+            "---\nname: Home Skill\n---\nHome body",
+        )
+        .unwrap();
+        fs::write(
+            project
+                .join(".claude")
+                .join("commands")
+                .join("ProjectCmd.md"),
+            "---\nname: Project Command\n---\nProject body",
+        )
+        .unwrap();
+
+        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", home.join(".claude")) };
+        let skills = discover_skills(&project).unwrap();
+        unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
+
+        let home_skill = skills.iter().find(|s| s.name == "Home Skill").unwrap();
+        assert!(!home_skill.legacy_command);
+
+        let project_cmd = skills.iter().find(|s| s.name == "Project Command").unwrap();
+        assert!(project_cmd.legacy_command);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn discover_skills_prefers_nearest_duplicate_slash_command() {
+        let _guard = env_lock();
+        let root = temp_dir("discover_precedence");
+        let home = root.join("home");
+        let project = root.join("project");
+        let nested = project.join("apps").join("api");
+
+        fs::create_dir_all(home.join(".claude").join("commands")).unwrap();
+        fs::create_dir_all(project.join(".claude").join("commands")).unwrap();
+        fs::create_dir_all(nested.clone()).unwrap();
+
+        fs::write(
+            home.join(".claude").join("commands").join("review.md"),
+            "---\nname: Review\n---\nHome review body",
+        )
+        .unwrap();
+        fs::write(
+            project.join(".claude").join("commands").join("review.md"),
+            "---\nname: Review\n---\nProject review body",
+        )
+        .unwrap();
+
+        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", home.join(".claude")) };
+        let skills = discover_skills(&nested).unwrap();
+        unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
+
+        let review_matches: Vec<&SkillDescriptor> = skills
+            .iter()
+            .filter(|skill| skill.slash_command == "/review")
+            .collect();
+        assert_eq!(review_matches.len(), 1);
+        assert_eq!(
+            review_matches[0].path,
+            project.join(".claude").join("commands").join("review.md")
+        );
+        assert_eq!(review_matches[0].body, "Project review body");
 
         fs::remove_dir_all(root).ok();
     }

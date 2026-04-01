@@ -10,13 +10,20 @@ use crate::{
 use clawedcode_api::ApiEvent;
 use futures_util::StreamExt;
 use serde::Serialize;
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 pub struct TuiContext {
+    config: AppConfig,
+    system_prompt: PromptSpec,
     pub runtime: Runtime,
     pub session: Session,
+    cwd: PathBuf,
     pub sessions_dir: PathBuf,
     pub show_thinking: bool,
+    last_compatibility_refresh: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -63,24 +70,39 @@ impl TuiContext {
     ) -> Self {
         let show_thinking = config.ui.show_thinking;
         let runtime = Runtime::with_mode(
-            config,
-            system_prompt,
+            config.clone(),
+            system_prompt.clone(),
             compatibility,
             PermissionMode::Default,
         );
-        let session = runtime.start_session(cwd);
+        let session = runtime.start_session(cwd.clone());
         Self {
+            config,
+            system_prompt,
             runtime,
             session,
+            cwd,
             sessions_dir,
             show_thinking,
+            last_compatibility_refresh: Instant::now(),
         }
     }
 
     pub fn submit_interactive(&mut self, prompt: &str, handler: &mut dyn TuiHandler) {
-        self.session.push(Role::User, prompt);
+        self.submit_interactive_with_prompt_override(prompt, None, handler);
+    }
 
-        let request = self.runtime.build_request(&self.session);
+    pub fn submit_interactive_with_prompt_override(
+        &mut self,
+        visible_prompt: &str,
+        execution_prompt: Option<&str>,
+        handler: &mut dyn TuiHandler,
+    ) {
+        self.session.push(Role::User, visible_prompt);
+
+        let request = self
+            .runtime
+            .build_request_with_prompt_override(&self.session, execution_prompt);
 
         let mut text_accum = String::new();
         let mut thinking_accum = String::new();
@@ -239,6 +261,29 @@ impl TuiContext {
     pub fn skills(&self) -> &[SkillDescriptor] {
         &self.runtime.compatibility.skills
     }
+
+    pub fn refresh_compatibility(&mut self) -> anyhow::Result<()> {
+        let compatibility = crate::compat::discover(&self.cwd)?;
+        self.runtime = Runtime::with_mode(
+            self.config.clone(),
+            self.system_prompt.clone(),
+            compatibility,
+            PermissionMode::Default,
+        );
+        self.last_compatibility_refresh = Instant::now();
+        Ok(())
+    }
+
+    pub fn refresh_compatibility_if_stale(
+        &mut self,
+        min_interval: Duration,
+    ) -> anyhow::Result<bool> {
+        if self.last_compatibility_refresh.elapsed() < min_interval {
+            return Ok(false);
+        }
+        self.refresh_compatibility()?;
+        Ok(true)
+    }
 }
 
 fn run_in_runtime<F, T>(f: F) -> T
@@ -276,6 +321,12 @@ fn is_write_like(tool_name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::compat::CompatibilitySnapshot;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().expect("env lock")
+    }
 
     struct TestHandler {
         events: Vec<TuiEvent>,
@@ -403,5 +454,52 @@ mod tests {
         assert!(is_write_like("apply_patch"));
         assert!(!is_write_like("read_file"));
         assert!(!is_write_like("unknown"));
+    }
+
+    #[test]
+    fn refresh_compatibility_preserves_session() {
+        let mut ctx = make_context();
+        let session_id_before = ctx.session.id;
+        ctx.session.push(Role::User, "test message");
+
+        ctx.refresh_compatibility().unwrap();
+
+        assert_eq!(ctx.session.id, session_id_before);
+        assert_eq!(ctx.session.messages.len(), 2);
+        assert!(ctx.session.messages.iter().any(|m| m.role == Role::User));
+    }
+
+    #[test]
+    fn refresh_compatibility_discovers_new_skills() {
+        let _guard = env_lock();
+        let temp = std::env::temp_dir().join(format!("refresh_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp).unwrap();
+        let config_dir = temp.join(".claude");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        std::fs::write(config_dir.join("settings.json"), r#"{}"#).unwrap();
+
+        std::fs::create_dir_all(config_dir.join("skills")).unwrap();
+        std::fs::write(
+            config_dir.join("skills").join("NewSkill.md"),
+            "---\nname: New Skill\ndescription: A new skill\n---\nSkill body content",
+        )
+        .unwrap();
+
+        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", &config_dir) };
+
+        let mut ctx = make_context();
+        let initial_skills = ctx.skills().len();
+        assert_eq!(initial_skills, 0);
+
+        ctx.refresh_compatibility().unwrap();
+
+        assert!(
+            ctx.skills().iter().any(|s| s.name == "New Skill"),
+            "Expected to find New Skill after refresh"
+        );
+
+        unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
+        std::fs::remove_dir_all(&temp).ok();
     }
 }

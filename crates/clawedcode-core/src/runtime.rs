@@ -237,6 +237,22 @@ struct TurnResult {
     tool_use_records: Vec<ToolUseRecord>,
 }
 
+fn apply_prompt_override(messages: &mut [clawedcode_api::ProviderMessage], prompt_override: &str) {
+    let Some(last_user) = messages.iter_mut().rfind(|message| {
+        message.role == clawedcode_api::ProviderRole::User
+            && message
+                .content
+                .iter()
+                .any(|block| matches!(block, clawedcode_api::ProviderContentBlock::Text { .. }))
+    }) else {
+        return;
+    };
+
+    last_user.content = vec![clawedcode_api::ProviderContentBlock::Text {
+        text: prompt_override.to_string(),
+    }];
+}
+
 /// Approval callback used in headless mode.
 /// Returns `true` if the tool call is approved, `false` to deny.
 pub type ApprovalFn = Box<dyn Fn(&str, &str, &serde_json::Value) -> bool + Send + Sync>;
@@ -416,14 +432,24 @@ impl Runtime {
     }
 
     pub fn build_request(&self, session: &Session) -> CompletionRequest {
+        self.build_request_with_prompt_override(session, None)
+    }
+
+    pub fn build_request_with_prompt_override(
+        &self,
+        session: &Session,
+        prompt_override: Option<&str>,
+    ) -> CompletionRequest {
         let limit = self.config.runtime.session_history_limit;
         let messages = Self::trim_session_messages(&session.messages, limit);
-        CompletionRequest {
+        let mut request = CompletionRequest {
             model: self.config.model.clone(),
             prompt_pack: self.config.prompts.default_prompt_pack.clone(),
             system_prompt_name: self.system_prompt.name.to_string(),
             system_prompt_body: self.effective_system_prompt_body(),
-            prompt: session.last_user_text().unwrap_or_default().to_string(),
+            prompt: prompt_override
+                .unwrap_or_else(|| session.last_user_text().unwrap_or_default())
+                .to_string(),
             messages: messages
                 .iter()
                 .map(|m| clawedcode_api::ProviderMessage {
@@ -468,7 +494,11 @@ impl Runtime {
             tools: self.tools.clone(),
             skill_count: self.compatibility.skills.len(),
             mcp_servers: self.compatibility.mcp_servers.clone(),
+        };
+        if let Some(prompt_override) = prompt_override {
+            apply_prompt_override(&mut request.messages, prompt_override);
         }
+        request
     }
 
     fn max_turns(&self) -> usize {
@@ -531,7 +561,50 @@ impl Runtime {
     {
         session.push(Role::User, prompt);
         let rt_output = self.run_in_runtime(async {
-            self.submit_loop_with_approval(session, &mut |_| {}, approval_fn)
+            self.submit_loop_with_approval(session, &mut |_| {}, approval_fn, None)
+                .await
+        });
+
+        RuntimeOutput {
+            session_id: rt_output.session_id,
+            system_prompt: rt_output.system_prompt,
+            response: rt_output.response.clone(),
+            tool_count: rt_output.tool_count,
+            skill_count: rt_output.skill_count,
+            mcp_server_count: rt_output.mcp_server_count,
+            tools_executed: rt_output.tools_executed,
+        }
+    }
+
+    /// Submit where the visible prompt in the session (transcript) differs from the
+    /// provider-facing prompt. The override persists for the full tool-call loop.
+    pub fn submit_with_visible_prompt(
+        &self,
+        session: &mut Session,
+        visible_prompt: &str,
+        provider_prompt: &str,
+    ) -> RuntimeOutput {
+        self.submit_with_visible_prompt_and_approval(
+            session,
+            visible_prompt,
+            provider_prompt,
+            &|_, _, _| true,
+        )
+    }
+
+    pub fn submit_with_visible_prompt_and_approval<A: ?Sized>(
+        &self,
+        session: &mut Session,
+        visible_prompt: &str,
+        provider_prompt: &str,
+        approval_fn: &A,
+    ) -> RuntimeOutput
+    where
+        A: Fn(&str, &str, &serde_json::Value) -> bool + Send + Sync,
+    {
+        session.push(Role::User, visible_prompt);
+        let rt_output = self.run_in_runtime(async {
+            self.submit_loop_with_approval(session, &mut |_| {}, approval_fn, Some(provider_prompt))
                 .await
         });
 
@@ -575,7 +648,7 @@ impl Runtime {
         A: Fn(&str, &str, &serde_json::Value) -> bool + Send + Sync,
     {
         session.push(Role::User, prompt);
-        self.submit_loop_with_approval(session, &mut on_event, approval_fn)
+        self.submit_loop_with_approval(session, &mut on_event, approval_fn, None)
             .await
     }
 
@@ -588,7 +661,7 @@ impl Runtime {
     where
         F: FnMut(&ApiEvent),
     {
-        self.submit_loop_with_approval(session, on_event, &|_, _, _| true)
+        self.submit_loop_with_approval(session, on_event, &|_, _, _| true, None)
             .await
     }
 
@@ -597,6 +670,7 @@ impl Runtime {
         session: &mut Session,
         on_event: &mut F,
         approval_fn: &A,
+        prompt_override: Option<&str>,
     ) -> StreamingRuntimeOutput
     where
         F: FnMut(&ApiEvent),
@@ -608,7 +682,7 @@ impl Runtime {
         let mut total_tools_executed = 0usize;
 
         for _turn in 0..self.max_turns() {
-            let request = self.build_request(session);
+            let request = self.build_request_with_prompt_override(session, prompt_override);
             let stream = self.provider.stream(&request);
 
             let turn_result = self
@@ -1040,6 +1114,39 @@ while True:
 
         assert!(!output.response.is_empty());
         assert!(output.response.contains("Hello"));
+    }
+
+    #[test]
+    fn submit_with_visible_prompt_uses_provider_override_but_persists_visible_text() {
+        let runtime = make_runtime();
+        let mut session = runtime.start_session(PathBuf::from("/tmp"));
+
+        let output = runtime.submit_with_visible_prompt(&mut session, "/review", "hello");
+
+        assert_eq!(session.last_user_text(), Some("/review"));
+        assert!(
+            output.response.contains("Hello"),
+            "expected provider-facing prompt override to shape the response"
+        );
+
+        let request = runtime.build_request(&session);
+        assert_eq!(request.prompt, "/review");
+
+        let overridden_request =
+            runtime.build_request_with_prompt_override(&session, Some("hello"));
+        assert_eq!(overridden_request.prompt, "hello");
+        let last_user_text = overridden_request
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == clawedcode_api::ProviderRole::User)
+            .and_then(|message| {
+                message.content.iter().find_map(|block| match block {
+                    clawedcode_api::ProviderContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+            });
+        assert_eq!(last_user_text, Some("hello"));
     }
 
     #[test]

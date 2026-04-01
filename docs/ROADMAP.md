@@ -229,8 +229,8 @@ Current status:
 ### Deliverables
 
 - [x] Slash-command registry for built-ins
-- [ ] Skill-backed command discovery
-- [ ] Dynamic command reload on file changes
+- [x] Skill-backed command discovery
+- [x] Dynamic command reload in the TUI
 - [ ] Command filtering by mode and environment
 - [ ] Plugin-safe command registration boundaries
 
@@ -246,7 +246,9 @@ Current status:
 
 - built-in slash commands are available in the TUI (`/help`, `/clear`, `/update`)
 - install-aware self-update is available through `clawedcode update` and `/update`
-- skill-backed and dynamic command discovery are still pending
+- discovered skills now surface as executable slash commands
+- the TUI refreshes discovered commands while the user is typing a slash command
+- command filtering and plugin-safe registration boundaries are still pending
 
 ## Phase 9: Sub-Agents And Background Tasks
 
