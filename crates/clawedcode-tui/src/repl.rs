@@ -1,4 +1,5 @@
 use anyhow::Result;
+use clawedcode_core::compat::SkillDescriptor;
 use clawedcode_core::content::ContentBlock;
 use clawedcode_core::interactive::{ApprovalRequest, TuiContext, TuiEvent, TuiHandler};
 use clawedcode_core::session::{Message, Role, Session};
@@ -128,6 +129,10 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     let mut last_area = Rect::default();
 
     loop {
+        if input_buffer.trim_start().starts_with('/') {
+            let _ = ctx.refresh_compatibility_if_stale(Duration::from_millis(500));
+        }
+
         terminal.draw(|frame| {
             let area = frame.area();
             last_area = area;
@@ -658,15 +663,23 @@ fn handle_slash_command(
         prompt.split_whitespace().next().unwrap_or(prompt)
     };
 
+    if let Err(err) = ctx.refresh_compatibility() {
+        handler.push_overlay(format!("[warn] Failed to refresh commands: {err}"));
+    }
+
     match command {
         "/help" => {
             handler.push_overlay("[info] Commands:");
             for entry in all_command_entries(ctx) {
                 handler.push_overlay(format!("[info] {:<18} {}", entry.name, entry.description));
             }
+            let _ = ctx.save_session();
+            return Ok(true);
         }
         "/clear" => {
             handler.overlay_lines.clear();
+            let _ = ctx.save_session();
+            return Ok(true);
         }
         "/update" => match clawedcode_core::update::run_self_update() {
             Ok(outcome) => {
@@ -680,19 +693,9 @@ fn handle_slash_command(
             }
         },
         other => {
-            if let Some(skill) = ctx
-                .skills()
-                .iter()
-                .find(|skill| skill_command_name(&skill.name) == other)
-            {
-                handler.push_overlay(format!(
-                    "[info] Skill command discovered: {}",
-                    skill_command_name(&skill.name)
-                ));
-                if let Some(description) = &skill.description {
-                    handler.push_overlay(format!("[info] {description}"));
-                }
-                handler.push_overlay(format!("[info] Path: {}", skill.path.display()));
+            if let Some(skill) = find_skill_command(ctx, other) {
+                execute_skill_command(ctx, handler, prompt, skill);
+                return Ok(true);
             } else {
                 handler.push_overlay(format!("[info] Unknown command `{other}`. Use `/help`."));
             }
@@ -701,6 +704,34 @@ fn handle_slash_command(
 
     let _ = ctx.save_session();
     Ok(true)
+}
+
+fn execute_skill_command(
+    ctx: &mut TuiContext,
+    handler: &mut ReplHandler,
+    visible_prompt: &str,
+    skill: SkillDescriptor,
+) {
+    if !skill_is_executable(&skill) {
+        handler.push_overlay(format!(
+            "[info] Skill '{}' has no content",
+            skill.slash_command
+        ));
+        return;
+    }
+
+    let args = visible_prompt
+        .strip_prefix(&skill.slash_command)
+        .map(str::trim)
+        .unwrap_or_default();
+    let execution_prompt = build_skill_execution_prompt(&skill, args);
+    handler.push_overlay(format!("[info] Executing skill: {}", skill.slash_command));
+
+    ctx.submit_interactive_with_prompt_override(visible_prompt, Some(&execution_prompt), handler);
+
+    if let Some(req) = check_for_pending_approval(ctx) {
+        handler.push_overlay(format!("[warn] Tool '{}' requires approval", req.tool_name));
+    }
 }
 
 fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
@@ -722,9 +753,13 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
         },
     ];
 
-    for skill in ctx.skills() {
+    for skill in ctx
+        .skills()
+        .iter()
+        .filter(|skill| skill_is_executable(skill))
+    {
         entries.push(CommandEntry {
-            name: skill_command_name(&skill.name),
+            name: skill.slash_command.clone(),
             description: skill
                 .description
                 .clone()
@@ -750,12 +785,40 @@ fn filtered_command_entries(ctx: &TuiContext, input_buffer: &str) -> Vec<Command
         .collect()
 }
 
-fn skill_command_name(name: &str) -> String {
-    format!("/{}", name.trim().replace(' ', "-").to_ascii_lowercase())
-}
-
 fn is_write_like(tool_name: &str) -> bool {
     matches!(tool_name, "shell" | "apply_patch")
+}
+
+fn find_skill_command(ctx: &TuiContext, command: &str) -> Option<SkillDescriptor> {
+    ctx.skills()
+        .iter()
+        .find(|skill| skill_is_executable(skill) && skill.slash_command == command)
+        .cloned()
+}
+
+fn skill_is_executable(skill: &SkillDescriptor) -> bool {
+    skill.slash_command.starts_with('/') && !skill.body.trim().is_empty()
+}
+
+fn build_skill_execution_prompt(skill: &SkillDescriptor, args: &str) -> String {
+    let args = args.trim();
+    let argument_text = if args.is_empty() {
+        "No explicit arguments were provided. Infer the likely task from the skill and ask for clarification only if required.".to_string()
+    } else {
+        format!("User arguments:\n{args}")
+    };
+
+    format!(
+        "The user invoked the slash command {command}.\nTreat the following skill as active instructions for this response only.\n\nSkill name: {name}\nDescription: {description}\nWhen to use: {when}\nLegacy command: {legacy}\nPath: {path}\n\nSkill body:\n{body}\n\n{args}",
+        command = skill.slash_command,
+        name = skill.name,
+        description = skill.description.as_deref().unwrap_or(""),
+        when = skill.when_to_use.as_deref().unwrap_or(""),
+        legacy = if skill.legacy_command { "yes" } else { "no" },
+        path = skill.path.display(),
+        body = skill.body,
+        args = argument_text,
+    )
 }
 
 fn provider_label() -> &'static str {

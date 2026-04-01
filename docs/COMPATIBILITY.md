@@ -156,7 +156,7 @@ discover_skills(cwd) → Skill[]:
                 elif entry.ext == ".md":
                     parse as skill
     
-    return deduplicate(skills, by: path)
+    return deduplicate(skills, by: slash_command, first_match_wins)
 ```
 
 ### 2.6 Parsing
