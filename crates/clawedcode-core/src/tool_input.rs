@@ -8,7 +8,11 @@ pub fn decode_tool_input(tool_name: &str, raw: &str) -> Value {
 
     match serde_json::from_str::<Value>(raw) {
         Ok(Value::Null) => json!({}),
-        Ok(Value::String(value)) => normalize_builtin_value(tool_name, Value::String(value)),
+        Ok(Value::String(value)) => {
+            unwrap_stringified_json_object(&value)
+                .map(|value| normalize_builtin_value(tool_name, value))
+                .unwrap_or_else(|| normalize_builtin_value(tool_name, Value::String(value)))
+        }
         Ok(value) => normalize_builtin_value(tool_name, value),
         Err(_) => coerce_single_string_builtin(tool_name, raw).unwrap_or(Value::Null),
     }
@@ -42,6 +46,23 @@ fn normalize_builtin_value(tool_name: &str, value: Value) -> Value {
         }
         other => other,
     }
+}
+
+fn unwrap_stringified_json_object(raw: &str) -> Option<Value> {
+    let mut candidate = raw.trim().to_string();
+
+    for _ in 0..2 {
+        let parsed = serde_json::from_str::<Value>(&candidate).ok()?;
+        match parsed {
+            Value::Object(map) => return Some(Value::Object(map)),
+            Value::String(next) if next.trim() != candidate => {
+                candidate = next;
+            }
+            _ => return None,
+        }
+    }
+
+    None
 }
 
 fn unwrap_nested_builtin_payload(tool_name: &str, raw: &str) -> Option<Value> {
@@ -111,6 +132,24 @@ mod tests {
     #[test]
     fn unknown_tool_with_malformed_input_returns_null() {
         let input = decode_tool_input("unknown_tool", "not-json");
+        assert_eq!(input, Value::Null);
+    }
+
+    #[test]
+    fn unknown_tool_plain_json_object_still_works() {
+        let input = decode_tool_input("unknown_tool", r#"{"command":"ls -la"}"#);
+        assert_eq!(input, json!({"command": "ls -la"}));
+    }
+
+    #[test]
+    fn unknown_tool_double_stringified_object_becomes_object() {
+        let input = decode_tool_input("unknown_tool", r#""{\"command\":\"ls -la\"}""#);
+        assert_eq!(input, json!({"command": "ls -la"}));
+    }
+
+    #[test]
+    fn unknown_tool_malformed_text_still_returns_null() {
+        let input = decode_tool_input("unknown_tool", "ls -la");
         assert_eq!(input, Value::Null);
     }
 
