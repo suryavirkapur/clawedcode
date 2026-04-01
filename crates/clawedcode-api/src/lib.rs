@@ -594,6 +594,23 @@ pub mod anthropic_provider {
             .collect()
     }
 
+    pub(crate) fn initial_tool_input_buffer(input: &serde_json::Value) -> String {
+        match input {
+            serde_json::Value::Null => String::new(),
+            serde_json::Value::Object(map) if map.is_empty() => String::new(),
+            serde_json::Value::String(text) if text.trim().is_empty() => String::new(),
+            other => serde_json::to_string(other).unwrap_or_default(),
+        }
+    }
+
+    pub(crate) fn finalize_tool_input_buffer(input: String) -> String {
+        if input.trim().is_empty() {
+            "{}".to_string()
+        } else {
+            input
+        }
+    }
+
     impl Provider for AnthropicProvider {
         fn complete(
             &self,
@@ -862,12 +879,9 @@ pub mod anthropic_provider {
                                         .as_str()
                                         .unwrap_or("")
                                         .to_string();
-                                    let input = event["content_block"]["input"].clone();
-                                    let input_str = if input.is_null() {
-                                        String::new()
-                                    } else {
-                                        serde_json::to_string(&input).unwrap_or_default()
-                                    };
+                                    let input =
+                                        initial_tool_input_buffer(&event["content_block"]["input"]);
+                                    let input_str = input;
                                     current_tool_use = Some((id, name, input_str));
                                 } else if cb_type == "thinking" {
                                     if let Some(t) = event["content_block"]["thinking"].as_str() {
@@ -918,11 +932,7 @@ pub mod anthropic_provider {
                             }
                             "content_block_stop" => {
                                 if let Some((id, name, input)) = current_tool_use.take() {
-                                    let input = if input.trim().is_empty() {
-                                        "{}".to_string()
-                                    } else {
-                                        input
-                                    };
+                                    let input = finalize_tool_input_buffer(input);
                                     let _ = tx
                                         .send(Ok(ApiEvent::ToolUse {
                                             tool_use: ToolUseEvent { id, name, input },
@@ -1163,7 +1173,9 @@ mod tests {
 
     #[cfg(feature = "anthropic")]
     mod anthropic_tests {
-        use crate::anthropic_provider::normalize_anthropic_endpoint;
+        use crate::anthropic_provider::{
+            finalize_tool_input_buffer, initial_tool_input_buffer, normalize_anthropic_endpoint,
+        };
 
         #[test]
         fn test_normalize_anthropic_endpoint_base_url() {
@@ -1195,6 +1207,27 @@ mod tests {
                 normalize_anthropic_endpoint("https://api.anthropic.com"),
                 "https://api.anthropic.com/v1/messages"
             );
+        }
+
+        #[test]
+        fn initial_tool_input_buffer_drops_empty_object() {
+            assert_eq!(
+                initial_tool_input_buffer(&serde_json::json!({})),
+                String::new()
+            );
+        }
+
+        #[test]
+        fn initial_tool_input_buffer_keeps_non_empty_object() {
+            assert_eq!(
+                initial_tool_input_buffer(&serde_json::json!({"command": "ls -la"})),
+                r#"{"command":"ls -la"}"#
+            );
+        }
+
+        #[test]
+        fn finalize_tool_input_buffer_defaults_empty_to_object() {
+            assert_eq!(finalize_tool_input_buffer(String::new()), "{}");
         }
     }
 }

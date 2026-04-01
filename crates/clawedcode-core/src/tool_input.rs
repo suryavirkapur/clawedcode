@@ -1,5 +1,7 @@
 use serde_json::{json, Value};
 
+const MAX_BUILTIN_NORMALIZATION_DEPTH: usize = 3;
+
 pub fn decode_tool_input(tool_name: &str, raw: &str) -> Value {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -32,20 +34,88 @@ fn normalize_builtin_value(tool_name: &str, value: Value) -> Value {
         return value;
     };
 
+    normalize_builtin_value_inner(tool_name, key, value, 0)
+}
+
+fn normalize_builtin_value_inner(
+    tool_name: &str,
+    key: &str,
+    value: Value,
+    depth: usize,
+) -> Value {
+    if depth >= MAX_BUILTIN_NORMALIZATION_DEPTH {
+        return value;
+    }
+
     match value {
         Value::String(raw) => {
             unwrap_nested_builtin_payload(tool_name, &raw).unwrap_or_else(|| json!({ key: raw }))
         }
-        Value::Object(map) => {
-            if let Some(Value::String(raw)) = map.get(key) {
-                if let Some(unwrapped) = unwrap_nested_builtin_payload(tool_name, raw) {
-                    return unwrapped;
+        Value::Array(items) => {
+            if items.len() == 1 {
+                let item = items[0].clone();
+                let normalized = normalize_builtin_value_inner(tool_name, key, item, depth + 1);
+                if contains_builtin_key(key, &normalized) {
+                    return normalized;
                 }
             }
+            Value::Array(items)
+        }
+        Value::Object(map) => {
+            if let Some(value) = map.get(key) {
+                match value {
+                    Value::String(raw) => {
+                        if let Some(unwrapped) = unwrap_nested_builtin_payload(tool_name, raw) {
+                            return normalize_builtin_value_inner(
+                                tool_name,
+                                key,
+                                unwrapped,
+                                depth + 1,
+                            );
+                        }
+                        return json!({ key: raw });
+                    }
+                    other => {
+                        let normalized = normalize_builtin_value_inner(
+                            tool_name,
+                            key,
+                            other.clone(),
+                            depth + 1,
+                        );
+                        if contains_builtin_key(key, &normalized) {
+                            return normalized;
+                        }
+                    }
+                }
+            }
+
+            if map.len() == 1 {
+                let (wrapper_key, inner) = map.iter().next().unwrap();
+                if is_common_wrapper_key(wrapper_key) {
+                    let normalized = normalize_builtin_value_inner(
+                        tool_name,
+                        key,
+                        inner.clone(),
+                        depth + 1,
+                    );
+                    if contains_builtin_key(key, &normalized) {
+                        return normalized;
+                    }
+                }
+            }
+
             Value::Object(map)
         }
         other => other,
     }
+}
+
+fn contains_builtin_key(key: &str, value: &Value) -> bool {
+    matches!(value, Value::Object(map) if map.contains_key(key))
+}
+
+fn is_common_wrapper_key(key: &str) -> bool {
+    matches!(key, "arguments" | "args" | "input" | "tool_input" | "payload")
 }
 
 fn unwrap_stringified_json_object(raw: &str) -> Option<Value> {
@@ -118,6 +188,18 @@ mod tests {
     }
 
     #[test]
+    fn shell_single_element_array_of_string_is_unwrapped() {
+        let input = decode_tool_input("shell", r#"["ls -la"]"#);
+        assert_eq!(input, json!({"command": "ls -la"}));
+    }
+
+    #[test]
+    fn shell_common_wrapper_object_is_unwrapped() {
+        let input = decode_tool_input("shell", r#"{"arguments":{"command":"ls -la"}}"#);
+        assert_eq!(input, json!({"command": "ls -la"}));
+    }
+
+    #[test]
     fn empty_input_becomes_empty_object() {
         let input = decode_tool_input("shell", "   ");
         assert_eq!(input, json!({}));
@@ -162,6 +244,12 @@ mod tests {
     #[test]
     fn read_file_raw_string_becomes_path_object() {
         let input = decode_tool_input("read_file", "/tmp/test.txt");
+        assert_eq!(input, json!({"path": "/tmp/test.txt"}));
+    }
+
+    #[test]
+    fn read_file_single_element_array_of_string_is_unwrapped() {
+        let input = decode_tool_input("read_file", r#"["/tmp/test.txt"]"#);
         assert_eq!(input, json!({"path": "/tmp/test.txt"}));
     }
 
