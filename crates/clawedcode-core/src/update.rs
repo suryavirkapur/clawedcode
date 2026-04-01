@@ -134,7 +134,10 @@ mod tests {
     #[test]
     fn detect_install_method_marks_local_debug_build() {
         let path = PathBuf::from("/tmp/clawedcode/target/debug/clawedcode");
-        assert_eq!(detect_install_method_from_path(&path), InstallMethod::LocalBuild);
+        assert_eq!(
+            detect_install_method_from_path(&path),
+            InstallMethod::LocalBuild
+        );
     }
 
     #[test]

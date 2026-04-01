@@ -265,20 +265,7 @@ fn mock_complete_response(request: &CompletionRequest) -> CompletionResponse {
         };
     }
 
-    let response = format!(
-        "Model: {}\nPrompt pack: {}\nSystem prompt: {}\nTools: {}\nSkills discovered: {}\nMCP servers discovered: {}\n\nRequest queued for the execution loop.\n\nNext priorities:\n1. Parse instructions into an explicit task graph.\n2. Resolve tool approvals before execution.\n3. Stream structured updates into the terminal UI.",
-        request.model,
-        request.prompt_pack,
-        request.system_prompt_name,
-        request
-            .tools
-            .iter()
-            .map(|tool| tool.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", "),
-        request.skill_count,
-        request.mcp_servers.len(),
-    );
+    let response = mock_plain_reply(request);
 
     CompletionResponse {
         system_prompt: request.system_prompt_name.clone(),
@@ -326,45 +313,44 @@ fn mock_stream_events(request: &CompletionRequest) -> Vec<ApiEvent> {
         ];
     }
 
-    let tool_names: Vec<&str> = request.tools.iter().map(|t| t.name.as_ref()).collect();
-
     vec![
         ApiEvent::ThinkingDelta {
-            text: "Let me start by analyzing the request.".to_string(),
+            text: "Thinking about how to help...".to_string(),
         },
         ApiEvent::MessageDelta {
-            text: format!(
-                "Model: {}\nPrompt pack: {}\nSystem prompt: {}\nTools: {}\nSkills discovered: {}\nMCP servers discovered: {}\n",
-                request.model,
-                request.prompt_pack,
-                request.system_prompt_name,
-                tool_names.join(", "),
-                request.skill_count,
-                request.mcp_servers.len(),
-            ),
-        },
-        ApiEvent::MessageDelta {
-            text: "\nRequest queued for the execution loop.\n\nNext priorities:\n".to_string(),
-        },
-        ApiEvent::MessageDelta {
-            text: "1. Parse instructions into an explicit task graph.\n".to_string(),
-        },
-        ApiEvent::MessageDelta {
-            text: "2. Resolve tool approvals before execution.\n".to_string(),
-        },
-        ApiEvent::MessageDelta {
-            text: "3. Stream structured updates into the terminal UI.".to_string(),
+            text: mock_plain_reply(request),
         },
         ApiEvent::Usage {
             usage: UsageEvent {
-                input_tokens: 120,
-                output_tokens: 85,
+                input_tokens: 80,
+                output_tokens: 40,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
             },
         },
         ApiEvent::Completed,
     ]
+}
+
+fn mock_plain_reply(request: &CompletionRequest) -> String {
+    let prompt = request.prompt.trim().to_ascii_lowercase();
+
+    if prompt.is_empty() {
+        return "Hello! How can I help you today?".to_string();
+    }
+
+    if ["hello", "hi", "hey"]
+        .iter()
+        .any(|greeting| prompt == *greeting)
+    {
+        return "Hello! How can I assist you today?".to_string();
+    }
+
+    if prompt.contains("how are you") {
+        return "I'm doing well, thank you! What can I help you with?".to_string();
+    }
+
+    "I received your message. To get started with real AI-powered assistance, configure a provider like Claude or Ollama.".to_string()
 }
 
 fn wants_read_cargo_toml(prompt: &str) -> bool {

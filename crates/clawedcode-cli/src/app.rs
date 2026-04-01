@@ -52,7 +52,10 @@ pub async fn execute(boot: BootstrappedApp) -> Result<()> {
         }
         ExecutionMode::Config => {
             let prompt_names = builtin_prompts().iter().map(|item| item.name).collect();
-            let tool_names = builtin_tools().iter().map(|item| item.name.clone()).collect();
+            let tool_names = builtin_tools()
+                .iter()
+                .map(|item| item.name.clone())
+                .collect();
             let payload = ResolvedConfig {
                 config: &config,
                 builtin_prompts: prompt_names,

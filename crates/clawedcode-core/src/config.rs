@@ -49,7 +49,7 @@ impl Default for AppConfig {
             },
             ui: UiConfig {
                 theme: "sunrise".to_string(),
-                show_thinking: true,
+                show_thinking: false,
             },
             runtime: RuntimeConfig {
                 max_turns: 64,

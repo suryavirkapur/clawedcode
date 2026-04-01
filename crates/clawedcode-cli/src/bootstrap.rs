@@ -139,7 +139,7 @@ pub fn init_tracing() {
     let _ = fmt()
         .with_env_filter(
             EnvFilter::from_default_env()
-                .add_directive("clawedcode=info".parse().expect("valid directive")),
+                .add_directive("clawedcode=warn".parse().expect("valid directive")),
         )
         .with_target(false)
         .compact()
