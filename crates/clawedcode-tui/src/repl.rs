@@ -1021,146 +1021,165 @@ fn handle_slash_command(
         handler.push_overlay(format!("[warn] Failed to refresh commands: {err}"));
     }
 
-    match command {
-        "/help" => {
-            handler.push_overlay("[info] Commands:");
-            for entry in all_command_entries(ctx) {
-                handler.push_overlay(format!("[info] {:<18} {}", entry.name, entry.description));
-            }
-            let _ = ctx.save_session();
-            return Ok(true);
-        }
-        "/clear" => {
-            handler.overlay_lines.clear();
-            let _ = ctx.save_session();
-            return Ok(true);
-        }
-        "/update" => {
-            let install_method = clawedcode_core::update::detect_install_method();
-            if !update_is_supported(install_method) {
-                let msg = match install_method {
-                    InstallMethod::LocalBuild => "[info] Self-update is not supported for local builds. Install via cargo or npm to enable updates.".to_string(),
-                    InstallMethod::Unknown => "[info] Could not determine install method. Set CLAWEDCODE_INSTALL_METHOD to cargo or npm.".to_string(),
-                    _ => "[info] Self-update is not available.".to_string(),
-                };
-                handler.push_overlay(msg);
-            } else {
-                match clawedcode_core::update::run_self_update() {
-                    Ok(outcome) => {
+    match find_visible_command_entry(ctx, command) {
+        Some(entry) => match entry.source {
+            CommandSource::BuiltIn => match entry.name.as_str() {
+                "/help" => {
+                    handler.push_overlay("[info] Commands:");
+                    for entry in visible_command_entries(ctx) {
                         handler.push_overlay(format!(
-                            "[info] Updated clawedcode via {:?} using `{}`",
-                            outcome.method, outcome.command
+                            "[info] {:<18} {}",
+                            entry.name, entry.description
                         ));
                     }
-                    Err(err) => {
-                        handler.push_overlay(format!("[info] Update failed: {err}"));
-                    }
-                }
-            }
-        }
-        "/task" => {
-            let task_prompt = prompt
-                .strip_prefix("/task")
-                .map(str::trim)
-                .unwrap_or_default();
-            if task_prompt.is_empty() {
-                handler.push_overlay(
-                    "[info] Usage: /task <prompt>. Provide a prompt for the sub-agent.".to_string(),
-                );
-            } else {
-                handler.push_overlay(format!(
-                    "[info] Starting background sub-agent: {}...",
-                    truncate_for_display(task_prompt, 50)
-                ));
-                match ctx.spawn_subagent_background(task_prompt) {
-                    Ok(result) => {
-                        handler.push_overlay(format!(
-                            "[info] Sub-agent queued (session: {}, status: running)",
-                            &result.child_session_id.to_string()[..8],
-                        ));
-                    }
-                    Err(err) => {
-                        handler.push_overlay(format!("[error] Sub-agent failed: {err}"));
-                    }
-                }
-            }
-            let _ = ctx.save_session();
-            return Ok(true);
-        }
-        "/tasks" => {
-            handler.push_overlay("[info] Background tasks:");
-            for line in background_task_lines(ctx) {
-                handler.push_overlay(format!("[info] {line}"));
-            }
-            let _ = ctx.save_session();
-            return Ok(true);
-        }
-        "/sessions" => {
-            let sessions = list_saved_sessions(ctx, 8);
-            if sessions.is_empty() {
-                handler.push_overlay("[info] No saved sessions found.");
-            } else {
-                handler.push_overlay("[info] Recent sessions:");
-                for session in sessions {
-                    handler.push_overlay(format!("[info] {}", format_saved_session_line(&session)));
-                }
-            }
-            let _ = ctx.save_session();
-            return Ok(true);
-        }
-        "/tools" => {
-            let lines = tool_surface_lines(ctx);
-            handler.push_overlay(format!(
-                "[info] Tools: built-in={}, skills={}, mcp={}",
-                built_in_tool_count(ctx),
-                ctx.skills().len(),
-                mcp_tool_count(ctx)
-            ));
-            for line in lines {
-                handler.push_overlay(format!("[info] {line}"));
-            }
-            let _ = ctx.save_session();
-            return Ok(true);
-        }
-        "/fork" => {
-            let prefix = prompt
-                .strip_prefix("/fork")
-                .map(str::trim)
-                .unwrap_or_default();
-            if prefix.is_empty() {
-                handler.push_overlay("[info] Usage: /fork <session-id-or-prefix>".to_string());
-                let _ = ctx.save_session();
-                return Ok(true);
-            }
-
-            let _ = ctx.save_session();
-            match resolve_saved_session(ctx, prefix) {
-                Ok(source) => {
-                    let forked = Session::fork_from(&source);
-                    let source_id = source.id.to_string();
-                    let forked_id = forked.id.to_string();
-                    let source_short = short_session_id(&source_id).to_string();
-                    let forked_short = short_session_id(&forked_id).to_string();
-                    ctx.replace_session(forked);
                     let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/clear" => {
                     handler.overlay_lines.clear();
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/update" => {
+                    let install_method = clawedcode_core::update::detect_install_method();
+                    if !update_is_supported(install_method) {
+                        let msg = match install_method {
+                            InstallMethod::LocalBuild => "[info] Self-update is not supported for local builds. Install via cargo or npm to enable updates.".to_string(),
+                            InstallMethod::Unknown => "[info] Could not determine install method. Set CLAWEDCODE_INSTALL_METHOD to cargo or npm.".to_string(),
+                            _ => "[info] Self-update is not available.".to_string(),
+                        };
+                        handler.push_overlay(msg);
+                    } else {
+                        match clawedcode_core::update::run_self_update() {
+                            Ok(outcome) => {
+                                handler.push_overlay(format!(
+                                    "[info] Updated clawedcode via {:?} using `{}`",
+                                    outcome.method, outcome.command
+                                ));
+                            }
+                            Err(err) => {
+                                handler.push_overlay(format!("[info] Update failed: {err}"));
+                            }
+                        }
+                    }
+                }
+                "/task" => {
+                    let task_prompt = prompt
+                        .strip_prefix("/task")
+                        .map(str::trim)
+                        .unwrap_or_default();
+                    if task_prompt.is_empty() {
+                        handler.push_overlay(
+                            "[info] Usage: /task <prompt>. Provide a prompt for the sub-agent.".to_string(),
+                        );
+                    } else {
+                        handler.push_overlay(format!(
+                            "[info] Starting background sub-agent: {}...",
+                            truncate_for_display(task_prompt, 50)
+                        ));
+                        match ctx.spawn_subagent_background(task_prompt) {
+                            Ok(result) => {
+                                handler.push_overlay(format!(
+                                    "[info] Sub-agent queued (session: {}, status: running)",
+                                    &result.child_session_id.to_string()[..8],
+                                ));
+                            }
+                            Err(err) => {
+                                handler.push_overlay(format!("[error] Sub-agent failed: {err}"));
+                            }
+                        }
+                    }
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/tasks" => {
+                    handler.push_overlay("[info] Background tasks:");
+                    for line in background_task_lines(ctx) {
+                        handler.push_overlay(format!("[info] {line}"));
+                    }
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/sessions" => {
+                    let sessions = list_saved_sessions(ctx, 8);
+                    if sessions.is_empty() {
+                        handler.push_overlay("[info] No saved sessions found.");
+                    } else {
+                        handler.push_overlay("[info] Recent sessions:");
+                        for session in sessions {
+                            handler.push_overlay(format!(
+                                "[info] {}",
+                                format_saved_session_line(&session)
+                            ));
+                        }
+                    }
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/tools" => {
+                    let lines = tool_surface_lines(ctx);
                     handler.push_overlay(format!(
-                        "[info] Forked session {source_short} into new session {forked_short}"
+                        "[info] Tools: built-in={}, skills={}, mcp={}",
+                        built_in_tool_count(ctx),
+                        ctx.skills().len(),
+                        mcp_tool_count(ctx)
+                    ));
+                    for line in lines {
+                        handler.push_overlay(format!("[info] {line}"));
+                    }
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/fork" => {
+                    let prefix = prompt
+                        .strip_prefix("/fork")
+                        .map(str::trim)
+                        .unwrap_or_default();
+                    if prefix.is_empty() {
+                        handler.push_overlay("[info] Usage: /fork <session-id-or-prefix>".to_string());
+                        let _ = ctx.save_session();
+                        return Ok(true);
+                    }
+
+                    let _ = ctx.save_session();
+                    match resolve_saved_session(ctx, prefix) {
+                        Ok(source) => {
+                            let forked = Session::fork_from(&source);
+                            let source_id = source.id.to_string();
+                            let forked_id = forked.id.to_string();
+                            let source_short = short_session_id(&source_id).to_string();
+                            let forked_short = short_session_id(&forked_id).to_string();
+                            ctx.replace_session(forked);
+                            let _ = ctx.save_session();
+                            handler.overlay_lines.clear();
+                            handler.push_overlay(format!(
+                                "[info] Forked session {source_short} into new session {forked_short}"
+                            ));
+                        }
+                        Err(err) => {
+                            handler.push_overlay(format!("[error] {err}"));
+                        }
+                    }
+                    return Ok(true);
+                }
+                _ => {
+                    handler.push_overlay(format!(
+                        "[info] Unknown command `{command}`. Use `/help`."
                     ));
                 }
-                Err(err) => {
-                    handler.push_overlay(format!("[error] {err}"));
+            },
+            CommandSource::Skill => {
+                if let Some(skill) = find_skill_command(ctx, command) {
+                    execute_skill_command(ctx, handler, prompt, skill, active_turn);
+                    return Ok(true);
                 }
+                handler.push_overlay(format!(
+                    "[info] Unknown command `{command}`. Use `/help`."
+                ));
             }
-            return Ok(true);
-        }
-        other => {
-            if let Some(skill) = find_skill_command(ctx, other) {
-                execute_skill_command(ctx, handler, prompt, skill, active_turn);
-                return Ok(true);
-            } else {
-                handler.push_overlay(format!("[info] Unknown command `{other}`. Use `/help`."));
-            }
+        },
+        None => {
+            handler.push_overlay(format!("[info] Unknown command `{command}`. Use `/help`."));
         }
     }
 
@@ -1254,6 +1273,16 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
 
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     entries
+}
+
+fn visible_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
+    all_command_entries(ctx)
+}
+
+fn find_visible_command_entry(ctx: &TuiContext, command: &str) -> Option<CommandEntry> {
+    visible_command_entries(ctx)
+        .into_iter()
+        .find(|entry| entry.name == command)
 }
 
 fn filtered_command_entries(ctx: &TuiContext, input_buffer: &str) -> Vec<CommandEntry> {
@@ -1641,6 +1670,60 @@ fn restore_terminal() -> Result<()> {
 #[cfg(test)]
 mod command_policy_tests {
     use super::*;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::{Mutex, MutexGuard, OnceLock},
+    };
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        match LOCK.get_or_init(|| Mutex::new(())).lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("clawed_tui_policy_{name}_{unique}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn make_context_at(cwd: PathBuf, sessions_dir: PathBuf) -> TuiContext {
+        TuiContext::new(
+            clawedcode_core::config::AppConfig::default(),
+            clawedcode_core::prompt::PromptSpec {
+                name: "test",
+                summary: "test",
+                body: "You are a test assistant.",
+            },
+            clawedcode_core::compat::CompatibilitySnapshot {
+                settings_files: vec![],
+                settings: serde_json::Value::Null,
+                skills: vec![],
+                memory_files: vec![],
+                memory: String::new(),
+                mcp_servers: std::collections::BTreeMap::new(),
+            },
+            cwd,
+            sessions_dir,
+        )
+    }
+
+    fn write_skill(root: &Path, file_name: &str, name: &str, body: &str) {
+        let skills_dir = root.join(".claude").join("skills");
+        fs::create_dir_all(&skills_dir).expect("create skills dir");
+        fs::write(
+            skills_dir.join(file_name),
+            format!("---\nname: {name}\n---\n{body}"),
+        )
+        .expect("write skill");
+    }
 
     #[test]
     fn test_is_reserved_command() {
@@ -1797,6 +1880,105 @@ mod command_policy_tests {
         assert!(command_is_visible(&entry, InstallMethod::Cargo));
         assert!(command_is_visible(&entry, InstallMethod::LocalBuild));
         assert!(command_is_visible(&entry, InstallMethod::Unknown));
+    }
+
+    #[test]
+    fn manual_update_does_not_execute_when_hidden() {
+        let _guard = env_lock();
+        unsafe { std::env::set_var("CLAWEDCODE_INSTALL_METHOD", "local") };
+
+        let root = temp_dir("manual_update_hidden");
+        let project = root.join("project");
+        let sessions_dir = root.join("sessions");
+        fs::create_dir_all(&project).expect("create project dir");
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        let mut ctx = make_context_at(project, sessions_dir);
+        let mut handler = ReplHandler::new(false);
+        let mut active_turn = None;
+
+        handle_slash_command(&mut ctx, &mut handler, "/update", &mut active_turn).unwrap();
+
+        assert!(active_turn.is_none());
+        assert!(
+            handler
+                .overlay_lines
+                .iter()
+                .any(|line| line.contains("Unknown command `/update`"))
+        );
+        assert!(
+            handler
+                .overlay_lines
+                .iter()
+                .all(|line| !line.contains("Updated clawedcode"))
+        );
+
+        unsafe { std::env::remove_var("CLAWEDCODE_INSTALL_METHOD") };
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn manual_invalid_skill_does_not_execute() {
+        let _guard = env_lock();
+        let root = temp_dir("manual_invalid_skill");
+        let project = root.join("project");
+        let sessions_dir = root.join("sessions");
+        fs::create_dir_all(&project).expect("create project dir");
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        write_skill(&project, "HiddenSkill.md", "Hidden Skill", "   ");
+
+        let mut ctx = make_context_at(project, sessions_dir);
+        let mut handler = ReplHandler::new(false);
+        let mut active_turn = None;
+
+        handle_slash_command(
+            &mut ctx,
+            &mut handler,
+            "/hidden-skill",
+            &mut active_turn,
+        )
+        .unwrap();
+
+        assert!(active_turn.is_none());
+        assert!(
+            handler
+                .overlay_lines
+                .iter()
+                .any(|line| line.contains("Unknown command `/hidden-skill`"))
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn help_only_lists_visible_commands() {
+        let _guard = env_lock();
+        unsafe { std::env::set_var("CLAWEDCODE_INSTALL_METHOD", "local") };
+
+        let root = temp_dir("help_visible_commands");
+        let project = root.join("project");
+        let sessions_dir = root.join("sessions");
+        fs::create_dir_all(&project).expect("create project dir");
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        write_skill(&project, "VisibleSkill.md", "Visible Skill", "Use this skill.");
+        write_skill(&project, "HiddenSkill.md", "Hidden Skill", "   ");
+
+        let mut ctx = make_context_at(project, sessions_dir);
+        let mut handler = ReplHandler::new(false);
+        let mut active_turn = None;
+
+        handle_slash_command(&mut ctx, &mut handler, "/help", &mut active_turn).unwrap();
+
+        let rendered = handler.overlay_lines.join("\n");
+        assert!(rendered.contains("[info] Commands:"));
+        assert!(rendered.contains("/help"));
+        assert!(rendered.contains("/clear"));
+        assert!(rendered.contains("[info] /task"));
+        assert!(rendered.contains("/visible-skill"));
+        assert!(!rendered.contains("/update"));
+        assert!(!rendered.contains("/hidden-skill"));
+
+        unsafe { std::env::remove_var("CLAWEDCODE_INSTALL_METHOD") };
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
