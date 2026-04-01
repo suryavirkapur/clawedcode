@@ -4,6 +4,10 @@ use clawedcode_core::background_task::{list_background_tasks, TaskStatus as Shel
 use clawedcode_core::compat::SkillDescriptor;
 use clawedcode_core::content::ContentBlock;
 use clawedcode_core::interactive::{ApprovalRequest, TuiContext, TuiEvent, TuiHandler};
+use clawedcode_core::onboarding::{
+    increment_project_onboarding_seen_count, maybe_mark_project_onboarding_complete,
+    onboarding_steps, should_show_project_onboarding,
+};
 use clawedcode_core::session::{Message, Role, Session, SessionMode};
 use clawedcode_core::subagent::{
     list_subagent_tasks_for_parent, SubAgentTaskState, SubAgentTaskStatus,
@@ -392,6 +396,7 @@ struct ActiveTurn {
 fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     let mut handler = ReplHandler::new(ctx.show_thinking);
     handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
+    maybe_mark_project_onboarding_complete(&ctx.session().cwd);
 
     let mut input_buffer = String::new();
     let mut cursor_pos: usize = 0;
@@ -399,10 +404,18 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     let mut awaiting_approval: Option<ApprovalRequest> = None;
     let mut active_turn: Option<ActiveTurn> = None;
     let mut last_area = Rect::default();
+    let mut onboarding_seen_recorded = false;
 
     loop {
         integrate_completed_subagents(ctx, &mut handler);
         drain_turn_events(ctx, &mut handler, &mut active_turn, &mut awaiting_approval);
+
+        if ctx.session().messages.is_empty() && !onboarding_seen_recorded {
+            if should_show_project_onboarding(&ctx.session().cwd) {
+                increment_project_onboarding_seen_count(&ctx.session().cwd);
+            }
+            onboarding_seen_recorded = true;
+        }
 
         if input_buffer.trim_start().starts_with('/') {
             let _ = ctx.refresh_compatibility_if_stale(Duration::from_millis(500));
@@ -760,16 +773,28 @@ fn welcome_left_lines(ctx: &TuiContext) -> Vec<Line<'static>> {
 }
 
 fn welcome_right_lines(ctx: &TuiContext) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        section_title("Tips for getting started"),
-        Line::from("Run /init to create a CLAUDE.md file with instructions for ClawedCode."),
-    ];
+    let mut lines = if should_show_project_onboarding(&ctx.session().cwd) {
+        let mut lines = vec![section_title("Getting started")];
+        for step in onboarding_steps(&ctx.session().cwd)
+            .into_iter()
+            .filter(|step| step.is_enabled)
+        {
+            let prefix = if step.is_complete { "[x]" } else { "[ ]" };
+            lines.push(Line::from(format!("{prefix} {}", step.text)));
+        }
+        lines
+    } else {
+        vec![
+            section_title("Tips for getting started"),
+            Line::from("Run /init to create a CLAUDE.md file with instructions for ClawedCode."),
+        ]
+    };
 
     if launched_in_home(&ctx.session().cwd) {
         lines.push(Line::from(
             "Note: You have launched clawedcode in your home directory. For the best experience, launch it in a project directory instead.",
         ));
-    } else {
+    } else if !should_show_project_onboarding(&ctx.session().cwd) {
         lines.push(Line::from(
             "Type /help to inspect built-in commands and discovered skills.",
         ));
@@ -967,6 +992,7 @@ fn drain_turn_events(
                 }
                 TurnWorkerEvent::Finished(session) => {
                     ctx.replace_session(session);
+                    maybe_mark_project_onboarding_complete(&ctx.session().cwd);
                     handler.clear_live_turn();
                     handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
                     let _ = ctx.save_session();
@@ -1983,6 +2009,61 @@ mod command_policy_tests {
         assert!(!rendered.contains("/hidden-skill"));
 
         unsafe { std::env::remove_var("CLAWEDCODE_INSTALL_METHOD") };
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn dashboard_shows_onboarding_for_empty_workspace() {
+        let _guard = env_lock();
+        let root = temp_dir("dashboard_onboarding_empty");
+        let project = root.join("project");
+        let sessions_dir = root.join("sessions");
+        let data_dir = root.join("data");
+        fs::create_dir_all(&project).expect("create project dir");
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        fs::create_dir_all(&data_dir).expect("create data dir");
+        unsafe { std::env::set_var("CLAWEDCODE_DATA_DIR", &data_dir) };
+
+        let ctx = make_context_at(project, sessions_dir);
+        let rendered = welcome_right_lines(&ctx)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Getting started"));
+        assert!(rendered.contains("Ask ClawedCode to create a new app or clone a repository"));
+        assert!(!rendered.contains("Tips for getting started"));
+
+        unsafe { std::env::remove_var("CLAWEDCODE_DATA_DIR") };
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn dashboard_shows_default_tips_after_claudemd_exists() {
+        let _guard = env_lock();
+        let root = temp_dir("dashboard_onboarding_complete");
+        let project = root.join("project");
+        let sessions_dir = root.join("sessions");
+        let data_dir = root.join("data");
+        fs::create_dir_all(&project).expect("create project dir");
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        fs::create_dir_all(&data_dir).expect("create data dir");
+        fs::write(project.join("CLAUDE.md"), "rules").expect("write CLAUDE.md");
+        unsafe { std::env::set_var("CLAWEDCODE_DATA_DIR", &data_dir) };
+        clawedcode_core::onboarding::maybe_mark_project_onboarding_complete(&project);
+
+        let ctx = make_context_at(project, sessions_dir);
+        let rendered = welcome_right_lines(&ctx)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Tips for getting started"));
+        assert!(!rendered.contains("Getting started"));
+
+        unsafe { std::env::remove_var("CLAWEDCODE_DATA_DIR") };
         fs::remove_dir_all(root).ok();
     }
 
