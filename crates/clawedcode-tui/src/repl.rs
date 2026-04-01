@@ -1,12 +1,14 @@
 use anyhow::Result;
+use clawedcode_api::ApiEvent;
 use clawedcode_core::background_task::{list_background_tasks, TaskStatus as ShellTaskStatus};
 use clawedcode_core::compat::SkillDescriptor;
 use clawedcode_core::content::ContentBlock;
 use clawedcode_core::interactive::{ApprovalRequest, TuiContext, TuiEvent, TuiHandler};
-use clawedcode_core::session::{Message, Role, Session};
+use clawedcode_core::session::{Message, Role, Session, SessionMode};
 use clawedcode_core::subagent::{
     list_subagent_tasks_for_parent, SubAgentTaskState, SubAgentTaskStatus,
 };
+use clawedcode_core::tool_input::decode_tool_input;
 use clawedcode_core::update::InstallMethod;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -25,6 +27,8 @@ use std::{
     fs,
     io::{self, stdout},
     path::{Path, PathBuf},
+    sync::{mpsc, Arc, Mutex},
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -32,7 +36,16 @@ const ACCENT: Color = Color::Rgb(224, 122, 95);
 const MUTED: Color = Color::Rgb(150, 150, 150);
 const DASHBOARD_HEIGHT: u16 = 13;
 
-const BUILTIN_COMMANDS: &[&str] = &["/help", "/clear", "/update", "/task", "/tasks"];
+const BUILTIN_COMMANDS: &[&str] = &[
+    "/help",
+    "/clear",
+    "/update",
+    "/task",
+    "/tasks",
+    "/sessions",
+    "/fork",
+    "/tools",
+];
 
 fn is_reserved_command(name: &str) -> bool {
     BUILTIN_COMMANDS.contains(&name)
@@ -99,17 +112,36 @@ struct CommandEntry {
     source: CommandSource,
 }
 
+#[derive(Debug, Clone)]
+struct SavedSessionSummary {
+    id: String,
+    cwd: PathBuf,
+    updated_at: i64,
+    mode: SessionMode,
+    preview: String,
+}
+
 struct ReplHandler {
     transcript_lines: Vec<String>,
     overlay_lines: Vec<String>,
+    live_user_prompt: Option<String>,
+    live_assistant_text: String,
+    live_thinking: String,
+    live_tool_lines: Vec<String>,
+    show_thinking: bool,
     state: AppState,
 }
 
 impl ReplHandler {
-    fn new() -> Self {
+    fn new(show_thinking: bool) -> Self {
         Self {
             transcript_lines: Vec::new(),
             overlay_lines: Vec::new(),
+            live_user_prompt: None,
+            live_assistant_text: String::new(),
+            live_thinking: String::new(),
+            live_tool_lines: Vec::new(),
+            show_thinking,
             state: AppState::Idle,
         }
     }
@@ -123,28 +155,97 @@ impl ReplHandler {
 
     fn visible_lines(&self) -> Vec<String> {
         let mut lines = self.transcript_lines.clone();
+        lines.extend(self.live_lines());
         lines.extend(self.overlay_lines.iter().cloned());
         lines
     }
 
     fn has_content(&self) -> bool {
-        !self.transcript_lines.is_empty() || !self.overlay_lines.is_empty()
+        !self.transcript_lines.is_empty()
+            || !self.overlay_lines.is_empty()
+            || self.live_user_prompt.is_some()
+            || !self.live_assistant_text.is_empty()
+            || !self.live_thinking.is_empty()
+            || !self.live_tool_lines.is_empty()
     }
 
     fn push_overlay(&mut self, line: impl Into<String>) {
         self.overlay_lines.push(line.into());
+    }
+
+    fn begin_live_turn(&mut self, prompt: impl Into<String>) {
+        self.clear_live_turn();
+        self.live_user_prompt = Some(prompt.into());
+    }
+
+    fn clear_live_turn(&mut self) {
+        self.live_user_prompt = None;
+        self.live_assistant_text.clear();
+        self.live_thinking.clear();
+        self.live_tool_lines.clear();
+    }
+
+    fn live_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+
+        if let Some(prompt) = &self.live_user_prompt {
+            lines.push(format!("You: {prompt}"));
+            lines.push(String::new());
+        }
+
+        if self.show_thinking {
+            let thinking = self.live_thinking.trim();
+            if !thinking.is_empty() {
+                lines.push(format!("[thinking] {thinking}"));
+                lines.push(String::new());
+            }
+        }
+
+        let assistant = self.live_assistant_text.trim();
+        if !assistant.is_empty() {
+            lines.push(format!("ClawedCode: {assistant}"));
+            lines.push(String::new());
+        }
+
+        lines.extend(self.live_tool_lines.iter().cloned());
+
+        while lines.last().is_some_and(|line| line.is_empty()) {
+            lines.pop();
+        }
+
+        lines
     }
 }
 
 impl TuiHandler for ReplHandler {
     fn on_event(&mut self, event: &TuiEvent) {
         match event {
-            TuiEvent::ThinkingDelta { .. }
-            | TuiEvent::MessageDelta { .. }
-            | TuiEvent::ToolUse { .. }
-            | TuiEvent::ToolResult { .. }
-            | TuiEvent::AssistantDone
-            | TuiEvent::TurnComplete => {
+            TuiEvent::ThinkingDelta { text } => {
+                self.live_thinking.push_str(text);
+            }
+            TuiEvent::MessageDelta { text } => {
+                self.live_assistant_text.push_str(text);
+            }
+            TuiEvent::ToolUse { id, name, input } => {
+                self.live_tool_lines.push(format!(
+                    "[tool] {name} (id={id}) {}",
+                    serde_json::to_string(input).unwrap_or_default()
+                ));
+            }
+            TuiEvent::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => {
+                let prefix = if *is_error {
+                    "[tool_error]"
+                } else {
+                    "[tool_result]"
+                };
+                self.live_tool_lines
+                    .push(format!("{prefix} {tool_use_id}: {content}"));
+            }
+            TuiEvent::AssistantDone | TuiEvent::TurnComplete => {
                 self.state = AppState::Idle;
             }
         }
@@ -161,18 +262,33 @@ impl TuiHandler for ReplHandler {
     }
 }
 
+enum TurnWorkerEvent {
+    Ui(TuiEvent),
+    ApprovalRequested(ApprovalRequest),
+    Finished(Session),
+    Failed(String),
+}
+
+struct ActiveTurn {
+    events: mpsc::Receiver<TurnWorkerEvent>,
+    approvals: mpsc::Sender<bool>,
+    _join: thread::JoinHandle<()>,
+}
+
 fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
-    let mut handler = ReplHandler::new();
+    let mut handler = ReplHandler::new(ctx.show_thinking);
     handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
 
     let mut input_buffer = String::new();
     let mut cursor_pos: usize = 0;
     let mut scroll_offset: usize = 0;
     let mut awaiting_approval: Option<ApprovalRequest> = None;
+    let mut active_turn: Option<ActiveTurn> = None;
     let mut last_area = Rect::default();
 
     loop {
         integrate_completed_subagents(ctx, &mut handler);
+        drain_turn_events(ctx, &mut handler, &mut active_turn, &mut awaiting_approval);
 
         if input_buffer.trim_start().starts_with('/') {
             let _ = ctx.refresh_compatibility_if_stale(Duration::from_millis(500));
@@ -266,19 +382,16 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         KeyCode::Char('y') | KeyCode::Char('Y') => {
                             let req = awaiting_approval.take().expect("approval request");
                             handler.push_overlay(format!("[info] Approved '{}'", req.tool_name));
-                            execute_tool_with_approval(ctx, &mut handler, &req, true);
-                            handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
+                            if let Some(turn) = &active_turn {
+                                let _ = turn.approvals.send(true);
+                            }
                         }
                         KeyCode::Char('n') | KeyCode::Char('N') => {
                             let req = awaiting_approval.take().expect("approval request");
                             handler.push_overlay(format!("[info] Denied '{}'", req.tool_name));
-                            let result_block = ContentBlock::tool_error(
-                                &req.tool_use_id,
-                                format!("Tool '{}' denied by user", req.tool_name),
-                            );
-                            ctx.session_mut()
-                                .push_blocks(Role::Tool, vec![result_block]);
-                            handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
+                            if let Some(turn) = &active_turn {
+                                let _ = turn.approvals.send(false);
+                            }
                         }
                         _ => {}
                     }
@@ -296,21 +409,18 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                     KeyCode::Char('q') => {
                         break;
                     }
+                    _ if active_turn.is_some() => {}
                     KeyCode::Enter => {
                         if !input_buffer.trim().is_empty() {
                             let prompt = input_buffer.trim().to_string();
                             input_buffer.clear();
                             cursor_pos = 0;
 
-                            if handle_slash_command(ctx, &mut handler, &prompt)? {
+                            if handle_slash_command(ctx, &mut handler, &prompt, &mut active_turn)? {
                                 handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
                             } else {
-                                ctx.submit_interactive(&prompt, &mut handler);
-                                handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
-                            }
-
-                            if let Some(req) = check_for_pending_approval(ctx) {
-                                awaiting_approval = Some(req);
+                                handler.begin_live_turn(prompt.clone());
+                                active_turn = Some(spawn_turn_worker(ctx, prompt, None));
                             }
                         }
                     }
@@ -343,13 +453,13 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                     }
                     _ => {}
                 }
-
-                scroll_offset = handler
-                    .visible_lines()
-                    .len()
-                    .saturating_sub(chunks[1].height as usize);
             }
         }
+
+        scroll_offset = handler
+            .visible_lines()
+            .len()
+            .saturating_sub(chunks[1].height as usize);
     }
 
     Ok(())
@@ -640,67 +750,142 @@ fn append_message_to_transcript(lines: &mut Vec<String>, msg: &Message, show_thi
     }
 }
 
-fn check_for_pending_approval(ctx: &TuiContext) -> Option<ApprovalRequest> {
-    let session = ctx.session();
-    let last_msg = session.messages.last()?;
-    if last_msg.role != Role::Assistant {
-        return None;
-    }
+fn spawn_turn_worker(
+    ctx: &TuiContext,
+    visible_prompt: String,
+    execution_prompt: Option<String>,
+) -> ActiveTurn {
+    let runtime = ctx.replacement_runtime();
+    let mut session = ctx.cloned_session();
+    let (event_tx, event_rx) = mpsc::channel();
+    let (approval_tx, approval_rx) = mpsc::channel();
+    let approval_rx = Arc::new(Mutex::new(approval_rx));
 
-    for block in &last_msg.content_blocks {
-        if let ContentBlock::ToolUse {
-            id, name, input, ..
-        } = block
-        {
-            if is_write_like(name) {
-                return Some(ApprovalRequest {
-                    tool_use_id: id.clone(),
-                    tool_name: name.clone(),
-                    input: input.clone(),
-                });
+    let join = thread::spawn(move || {
+        let approval_rx = approval_rx.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let tx = event_tx.clone();
+            let approval_fn =
+                move |tool_use_id: &str, tool_name: &str, input: &serde_json::Value| {
+                    if !is_write_like(tool_name) {
+                        return true;
+                    }
+
+                    let request = ApprovalRequest {
+                        tool_use_id: tool_use_id.to_string(),
+                        tool_name: tool_name.to_string(),
+                        input: input.clone(),
+                    };
+
+                    if tx
+                        .send(TurnWorkerEvent::ApprovalRequested(request))
+                        .is_err()
+                    {
+                        return false;
+                    }
+
+                    approval_rx
+                        .lock()
+                        .ok()
+                        .and_then(|rx| rx.recv().ok())
+                        .unwrap_or(false)
+                };
+
+            let tx = event_tx.clone();
+            let runtime_result = {
+                let future = runtime.submit_stream_with_prompt_override_and_approval(
+                    &mut session,
+                    &visible_prompt,
+                    execution_prompt.as_deref(),
+                    |event| {
+                        if let Some(tui_event) = to_tui_event(event) {
+                            let _ = tx.send(TurnWorkerEvent::Ui(tui_event));
+                        }
+                    },
+                    &approval_fn,
+                );
+
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("failed to build tokio runtime");
+                rt.block_on(future)
+            };
+
+            let _ = event_tx.send(TurnWorkerEvent::Ui(TuiEvent::AssistantDone));
+            let _ = event_tx.send(TurnWorkerEvent::Ui(TuiEvent::TurnComplete));
+            let _ = event_tx.send(TurnWorkerEvent::Finished(session));
+            runtime_result
+        }));
+
+        if result.is_err() {
+            let _ = event_tx.send(TurnWorkerEvent::Failed(
+                "interactive turn worker panicked".to_string(),
+            ));
+        }
+    });
+
+    ActiveTurn {
+        events: event_rx,
+        approvals: approval_tx,
+        _join: join,
+    }
+}
+
+fn drain_turn_events(
+    ctx: &mut TuiContext,
+    handler: &mut ReplHandler,
+    active_turn: &mut Option<ActiveTurn>,
+    awaiting_approval: &mut Option<ApprovalRequest>,
+) {
+    let mut finished = false;
+
+    if let Some(turn) = active_turn.as_mut() {
+        while let Ok(event) = turn.events.try_recv() {
+            match event {
+                TurnWorkerEvent::Ui(event) => handler.on_event(&event),
+                TurnWorkerEvent::ApprovalRequested(request) => {
+                    *awaiting_approval = Some(request);
+                    handler.state = AppState::AwaitingApproval;
+                }
+                TurnWorkerEvent::Finished(session) => {
+                    ctx.replace_session(session);
+                    handler.clear_live_turn();
+                    handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
+                    let _ = ctx.save_session();
+                    *awaiting_approval = None;
+                    finished = true;
+                }
+                TurnWorkerEvent::Failed(message) => {
+                    handler.clear_live_turn();
+                    handler.push_overlay(format!("[error] {message}"));
+                    *awaiting_approval = None;
+                    finished = true;
+                }
             }
         }
     }
 
-    None
+    if finished {
+        *active_turn = None;
+    }
 }
 
-fn execute_tool_with_approval(
-    ctx: &mut TuiContext,
-    _handler: &mut ReplHandler,
-    req: &ApprovalRequest,
-    approved: bool,
-) {
-    if approved {
-        let result = ctx.runtime.execute_tool(
-            &req.tool_use_id,
-            &req.tool_name,
-            req.input.clone(),
-            &mut ctx.session,
-        );
-        if let ContentBlock::ToolResult {
-            tool_use_id,
-            content,
-            is_error,
-        } = result
-        {
-            ctx.session_mut().push_blocks(
-                Role::Tool,
-                vec![ContentBlock::ToolResult {
-                    tool_use_id,
-                    content,
-                    is_error,
-                }],
-            );
-        }
-    } else {
-        ctx.session_mut().push_blocks(
-            Role::Tool,
-            vec![ContentBlock::tool_error(
-                &req.tool_use_id,
-                format!("Tool '{}' denied by user", req.tool_name),
-            )],
-        );
+fn to_tui_event(event: &ApiEvent) -> Option<TuiEvent> {
+    match event {
+        ApiEvent::ThinkingDelta { text } => Some(TuiEvent::ThinkingDelta { text: text.clone() }),
+        ApiEvent::MessageDelta { text } => Some(TuiEvent::MessageDelta { text: text.clone() }),
+        ApiEvent::ToolUse { tool_use } => Some(TuiEvent::ToolUse {
+            id: tool_use.id.clone(),
+            name: tool_use.name.clone(),
+            input: decode_tool_input(&tool_use.name, &tool_use.input),
+        }),
+        ApiEvent::ToolResult { tool_result } => Some(TuiEvent::ToolResult {
+            tool_use_id: tool_result.tool_use_id.clone(),
+            content: tool_result.content.clone(),
+            is_error: tool_result.is_error,
+        }),
+        ApiEvent::Usage { .. } | ApiEvent::Completed => None,
     }
 }
 
@@ -708,6 +893,7 @@ fn handle_slash_command(
     ctx: &mut TuiContext,
     handler: &mut ReplHandler,
     prompt: &str,
+    active_turn: &mut Option<ActiveTurn>,
 ) -> Result<bool> {
     if !prompt.starts_with('/') && prompt.trim() != "?" {
         return Ok(false);
@@ -797,9 +983,68 @@ fn handle_slash_command(
             let _ = ctx.save_session();
             return Ok(true);
         }
+        "/sessions" => {
+            let sessions = list_saved_sessions(ctx, 8);
+            if sessions.is_empty() {
+                handler.push_overlay("[info] No saved sessions found.");
+            } else {
+                handler.push_overlay("[info] Recent sessions:");
+                for session in sessions {
+                    handler.push_overlay(format!("[info] {}", format_saved_session_line(&session)));
+                }
+            }
+            let _ = ctx.save_session();
+            return Ok(true);
+        }
+        "/tools" => {
+            let lines = tool_surface_lines(ctx);
+            handler.push_overlay(format!(
+                "[info] Tools: built-in={}, skills={}, mcp={}",
+                built_in_tool_count(ctx),
+                ctx.skills().len(),
+                mcp_tool_count(ctx)
+            ));
+            for line in lines {
+                handler.push_overlay(format!("[info] {line}"));
+            }
+            let _ = ctx.save_session();
+            return Ok(true);
+        }
+        "/fork" => {
+            let prefix = prompt
+                .strip_prefix("/fork")
+                .map(str::trim)
+                .unwrap_or_default();
+            if prefix.is_empty() {
+                handler.push_overlay("[info] Usage: /fork <session-id-or-prefix>".to_string());
+                let _ = ctx.save_session();
+                return Ok(true);
+            }
+
+            let _ = ctx.save_session();
+            match resolve_saved_session(ctx, prefix) {
+                Ok(source) => {
+                    let forked = Session::fork_from(&source);
+                    let source_id = source.id.to_string();
+                    let forked_id = forked.id.to_string();
+                    let source_short = short_session_id(&source_id).to_string();
+                    let forked_short = short_session_id(&forked_id).to_string();
+                    ctx.replace_session(forked);
+                    let _ = ctx.save_session();
+                    handler.overlay_lines.clear();
+                    handler.push_overlay(format!(
+                        "[info] Forked session {source_short} into new session {forked_short}"
+                    ));
+                }
+                Err(err) => {
+                    handler.push_overlay(format!("[error] {err}"));
+                }
+            }
+            return Ok(true);
+        }
         other => {
             if let Some(skill) = find_skill_command(ctx, other) {
-                execute_skill_command(ctx, handler, prompt, skill);
+                execute_skill_command(ctx, handler, prompt, skill, active_turn);
                 return Ok(true);
             } else {
                 handler.push_overlay(format!("[info] Unknown command `{other}`. Use `/help`."));
@@ -816,6 +1061,7 @@ fn execute_skill_command(
     handler: &mut ReplHandler,
     visible_prompt: &str,
     skill: SkillDescriptor,
+    active_turn: &mut Option<ActiveTurn>,
 ) {
     let args = visible_prompt
         .strip_prefix(&skill.slash_command)
@@ -823,12 +1069,12 @@ fn execute_skill_command(
         .unwrap_or_default();
     let execution_prompt = build_skill_execution_prompt(&skill, args);
     handler.push_overlay(format!("[info] Executing skill: {}", skill.slash_command));
-
-    ctx.submit_interactive_with_prompt_override(visible_prompt, Some(&execution_prompt), handler);
-
-    if let Some(req) = check_for_pending_approval(ctx) {
-        handler.push_overlay(format!("[warn] Tool '{}' requires approval", req.tool_name));
-    }
+    handler.begin_live_turn(visible_prompt.to_string());
+    *active_turn = Some(spawn_turn_worker(
+        ctx,
+        visible_prompt.to_string(),
+        Some(execution_prompt),
+    ));
 }
 
 fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
@@ -857,6 +1103,21 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
         CommandEntry {
             name: "/tasks".to_string(),
             description: "Show running and completed background tasks".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/sessions".to_string(),
+            description: "List recent saved sessions".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/fork".to_string(),
+            description: "Fork a saved session into a new interactive session".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/tools".to_string(),
+            description: "Show active built-in, skill, and MCP tools".to_string(),
             source: CommandSource::BuiltIn,
         },
     ];
@@ -1042,7 +1303,25 @@ fn display_path(path: &Path) -> String {
 }
 
 fn recent_activity(ctx: &TuiContext, limit: usize) -> Vec<String> {
-    let Ok(entries) = fs::read_dir(&ctx.sessions_dir) else {
+    load_saved_sessions(&ctx.sessions_dir)
+        .into_iter()
+        .filter(|session| session.id != ctx.session().id)
+        .take(limit)
+        .map(|session| {
+            let summary = session
+                .last_user_text()
+                .map(truncate_summary)
+                .unwrap_or_else(|| "No prompt".to_string());
+            format!(
+                "{summary} ({})",
+                relative_time_label(session.updated_at.timestamp())
+            )
+        })
+        .collect()
+}
+
+fn load_saved_sessions(sessions_dir: &Path) -> Vec<Session> {
+    let Ok(entries) = fs::read_dir(sessions_dir) else {
         return Vec::new();
     };
 
@@ -1058,27 +1337,132 @@ fn recent_activity(ctx: &TuiContext, limit: usize) -> Vec<String> {
         let Ok(session) = serde_json::from_str::<Session>(&raw) else {
             continue;
         };
-        if session.id == ctx.session().id {
-            continue;
-        }
         sessions.push(session);
     }
 
     sessions.sort_by_key(|session| Reverse(session.updated_at.timestamp()));
     sessions
+}
+
+fn list_saved_sessions(ctx: &TuiContext, limit: usize) -> Vec<SavedSessionSummary> {
+    load_saved_sessions(&ctx.sessions_dir)
         .into_iter()
         .take(limit)
         .map(|session| {
-            let summary = session
+            let preview = session
                 .last_user_text()
                 .map(truncate_summary)
                 .unwrap_or_else(|| "No prompt".to_string());
-            format!(
-                "{summary} ({})",
-                relative_time_label(session.updated_at.timestamp())
-            )
+            SavedSessionSummary {
+                id: session.id.to_string(),
+                cwd: session.cwd,
+                updated_at: session.updated_at.timestamp(),
+                mode: session.execution_mode.clone(),
+                preview,
+            }
         })
         .collect()
+}
+
+fn resolve_saved_session(ctx: &TuiContext, prefix: &str) -> Result<Session> {
+    let prefix = prefix.trim();
+    let matches: Vec<Session> = load_saved_sessions(&ctx.sessions_dir)
+        .into_iter()
+        .filter(|session| session.id.to_string().starts_with(prefix))
+        .collect();
+
+    match matches.len() {
+        0 => Err(anyhow::anyhow!("No saved session matches `{prefix}`")),
+        1 => Ok(matches.into_iter().next().unwrap()),
+        _ => Err(anyhow::anyhow!(
+            "Multiple sessions match `{prefix}`. Use a longer prefix."
+        )),
+    }
+}
+
+fn short_session_id(id: &str) -> &str {
+    &id[..8.min(id.len())]
+}
+
+fn session_mode_label(mode: SessionMode) -> &'static str {
+    match mode {
+        SessionMode::Interactive => "interactive",
+        SessionMode::Headless => "headless",
+        SessionMode::Resume => "resume",
+        SessionMode::Continue => "continue",
+        SessionMode::DirectConnect => "direct-connect",
+        SessionMode::Ssh => "ssh",
+        SessionMode::Remote => "remote",
+    }
+}
+
+fn format_saved_session_line(session: &SavedSessionSummary) -> String {
+    format!(
+        "{} {:<14} {:<18} {}",
+        short_session_id(&session.id),
+        session_mode_label(session.mode.clone()),
+        relative_time_label(session.updated_at),
+        truncate_for_display(
+            &format!("{} · {}", display_path(&session.cwd), session.preview),
+            72
+        ),
+    )
+}
+
+fn built_in_tool_count(ctx: &TuiContext) -> usize {
+    ctx.tool_specs()
+        .iter()
+        .filter(|tool| !tool.name.starts_with("mcp__"))
+        .count()
+}
+
+fn mcp_tool_count(ctx: &TuiContext) -> usize {
+    ctx.tool_specs()
+        .iter()
+        .filter(|tool| tool.name.starts_with("mcp__"))
+        .count()
+}
+
+fn tool_surface_lines(ctx: &TuiContext) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    let mut builtins: Vec<_> = ctx
+        .tool_specs()
+        .iter()
+        .filter(|tool| !tool.name.starts_with("mcp__"))
+        .map(|tool| tool.name.clone())
+        .collect();
+    builtins.sort();
+    if !builtins.is_empty() {
+        lines.push(format!("built-in: {}", builtins.join(", ")));
+    }
+
+    let mut skills: Vec<_> = ctx
+        .skills()
+        .iter()
+        .map(|skill| skill.slash_command.clone())
+        .collect();
+    skills.sort();
+    if !skills.is_empty() {
+        lines.push(format!("skills: {}", skills.join(", ")));
+    }
+
+    let mut mcp_tools: Vec<_> = ctx
+        .tool_specs()
+        .iter()
+        .filter(|tool| tool.name.starts_with("mcp__"))
+        .map(|tool| tool.name.clone())
+        .collect();
+    mcp_tools.sort();
+    if !mcp_tools.is_empty() {
+        lines.push(format!("mcp: {}", mcp_tools.join(", ")));
+    }
+
+    if lines.is_empty() {
+        lines.push("No active tools discovered".to_string());
+    }
+
+    lines
 }
 
 fn truncate_summary(text: &str) -> String {
@@ -1153,6 +1537,9 @@ mod command_policy_tests {
         assert!(is_reserved_command("/update"));
         assert!(is_reserved_command("/task"));
         assert!(is_reserved_command("/tasks"));
+        assert!(is_reserved_command("/sessions"));
+        assert!(is_reserved_command("/fork"));
+        assert!(is_reserved_command("/tools"));
         assert!(!is_reserved_command("/code-review"));
         assert!(!is_reserved_command("/my-skill"));
     }
@@ -1163,6 +1550,9 @@ mod command_policy_tests {
         assert!(is_valid_command_name("/clear"));
         assert!(is_valid_command_name("/task"));
         assert!(is_valid_command_name("/tasks"));
+        assert!(is_valid_command_name("/sessions"));
+        assert!(is_valid_command_name("/fork"));
+        assert!(is_valid_command_name("/tools"));
         assert!(is_valid_command_name("/code-review"));
         assert!(is_valid_command_name("/my-skill-123"));
         assert!(is_valid_command_name("/a"));
@@ -1337,6 +1727,53 @@ mod command_policy_tests {
         assert!(line.contains("Inspect two modules"));
     }
 
+    #[test]
+    fn format_saved_session_line_includes_id_mode_and_path() {
+        let summary = SavedSessionSummary {
+            id: "12345678-1234-1234-1234-123456789abc".to_string(),
+            cwd: PathBuf::from("/tmp/project"),
+            updated_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64,
+            mode: SessionMode::Resume,
+            preview: "Continue the task".to_string(),
+        };
+
+        let line = format_saved_session_line(&summary);
+        assert!(line.contains("12345678"));
+        assert!(line.contains("resume"));
+        assert!(line.contains("/tmp/project"));
+        assert!(line.contains("Continue the task"));
+    }
+
+    #[test]
+    fn tool_surface_lines_include_default_builtins() {
+        let ctx = TuiContext::new(
+            clawedcode_core::config::AppConfig::default(),
+            clawedcode_core::prompt::PromptSpec {
+                name: "test",
+                summary: "test",
+                body: "You are a test assistant.",
+            },
+            clawedcode_core::compat::CompatibilitySnapshot {
+                settings_files: vec![],
+                settings: serde_json::Value::Null,
+                skills: vec![],
+                memory_files: vec![],
+                memory: String::new(),
+                mcp_servers: std::collections::BTreeMap::new(),
+            },
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp/sessions"),
+        );
+
+        let lines = tool_surface_lines(&ctx);
+        assert!(built_in_tool_count(&ctx) > 0);
+        assert!(lines.iter().any(|line| line.starts_with("built-in: ")));
+        assert!(lines.iter().any(|line| line.contains("read_file")));
+    }
+
     mod transcript_snapshot_tests {
         use super::*;
         use clawedcode_core::{
@@ -1359,7 +1796,7 @@ mod command_policy_tests {
         }
 
         fn render_session(session: &Session, show_thinking: bool) -> String {
-            let mut handler = ReplHandler::new();
+            let mut handler = ReplHandler::new(show_thinking);
             handler.rebuild_from_session(session, show_thinking);
             handler.visible_lines().join("\n")
         }
@@ -1410,7 +1847,10 @@ mod command_policy_tests {
                 ],
             );
 
-            assert_eq!(render_session(&session, false), "You: Hello\nClawedCode: Hi there.");
+            assert_eq!(
+                render_session(&session, false),
+                "You: Hello\nClawedCode: Hi there."
+            );
         }
 
         #[test]
@@ -1486,6 +1926,102 @@ mod command_policy_tests {
 
             assert!(rendered.contains("prompt 199"));
             assert!(elapsed < Duration::from_secs(2), "elapsed: {elapsed:?}");
+        }
+
+        #[test]
+        fn live_stream_deltas_render_before_turn_commit() {
+            let mut handler = ReplHandler::new(true);
+            handler.begin_live_turn("hello");
+            handler.on_event(&TuiEvent::ThinkingDelta {
+                text: "let me think".to_string(),
+            });
+            handler.on_event(&TuiEvent::MessageDelta {
+                text: "Hi".to_string(),
+            });
+
+            assert_eq!(
+                handler.visible_lines().join("\n"),
+                "You: hello\n\n[thinking] let me think\n\nClawedCode: Hi"
+            );
+        }
+
+        #[test]
+        fn resolve_saved_session_accepts_unique_prefix() {
+            let root = temp_dir("resolve_saved_session_unique");
+            let sessions_dir = root.join("sessions");
+            fs::create_dir_all(&sessions_dir).unwrap();
+
+            let mut first = Session::new(PathBuf::from("/tmp/one"));
+            first.push(Role::User, "first");
+            first.save(&sessions_dir).unwrap();
+
+            let mut second = Session::new(PathBuf::from("/tmp/two"));
+            second.push(Role::User, "second");
+            second.save(&sessions_dir).unwrap();
+
+            let ctx = make_context(sessions_dir.clone());
+            let prefix = &first.id.to_string()[..8];
+            let resolved = resolve_saved_session(&ctx, prefix).unwrap();
+            assert_eq!(resolved.id, first.id);
+
+            fs::remove_dir_all(root).ok();
+        }
+
+        #[test]
+        fn resolve_saved_session_rejects_ambiguous_prefix() {
+            let root = temp_dir("resolve_saved_session_ambiguous");
+            let sessions_dir = root.join("sessions");
+            fs::create_dir_all(&sessions_dir).unwrap();
+
+            let mut first = Session::new(PathBuf::from("/tmp/one"));
+            first.id = uuid::Uuid::parse_str("aaaaaaaa-0000-0000-0000-000000000001").unwrap();
+            first.push(Role::User, "first");
+            first.save(&sessions_dir).unwrap();
+
+            let mut second = Session::new(PathBuf::from("/tmp/two"));
+            second.id = uuid::Uuid::parse_str("aaaaaaaa-0000-0000-0000-000000000002").unwrap();
+            second.push(Role::User, "second");
+            second.save(&sessions_dir).unwrap();
+
+            let ctx = make_context(sessions_dir.clone());
+            let error = resolve_saved_session(&ctx, "aaaaaaaa").unwrap_err();
+            assert!(error.to_string().contains("Multiple sessions match"));
+
+            fs::remove_dir_all(root).ok();
+        }
+
+        #[test]
+        fn fork_command_replaces_active_session_with_new_interactive_copy() {
+            let root = temp_dir("fork_command");
+            let sessions_dir = root.join("sessions");
+            fs::create_dir_all(&sessions_dir).unwrap();
+
+            let mut source = Session::with_mode(PathBuf::from("/tmp/source"), SessionMode::Resume);
+            source.push(Role::User, "original");
+            source.push(Role::Assistant, "reply");
+            source.save(&sessions_dir).unwrap();
+
+            let mut ctx = make_context(sessions_dir.clone());
+            let source_id = source.id;
+            let old_active = ctx.session().id;
+            let mut handler = ReplHandler::new(false);
+            let mut active_turn = None;
+
+            let command = format!("/fork {}", &source_id.to_string()[..8]);
+            let handled =
+                handle_slash_command(&mut ctx, &mut handler, &command, &mut active_turn).unwrap();
+
+            assert!(handled);
+            assert_ne!(ctx.session().id, old_active);
+            assert_ne!(ctx.session().id, source_id);
+            assert_eq!(ctx.session().execution_mode, SessionMode::Interactive);
+            assert_eq!(ctx.session().messages, source.messages);
+            assert!(handler
+                .overlay_lines
+                .iter()
+                .any(|line| line.contains("Forked session")));
+
+            fs::remove_dir_all(root).ok();
         }
 
         #[test]

@@ -13,6 +13,7 @@ use crate::{
     tool_input::decode_tool_input,
 };
 use clawedcode_api::ApiEvent;
+use clawedcode_tools::ToolSpec;
 use futures_util::StreamExt;
 use serde::Serialize;
 use std::{
@@ -258,12 +259,33 @@ impl TuiContext {
         &mut self.session
     }
 
+    pub fn cloned_session(&self) -> Session {
+        self.session.clone()
+    }
+
+    pub fn replacement_runtime(&self) -> Runtime {
+        Runtime::with_mode(
+            self.config.clone(),
+            self.system_prompt.clone(),
+            self.runtime.compatibility.clone(),
+            PermissionMode::Default,
+        )
+    }
+
+    pub fn replace_session(&mut self, session: Session) {
+        self.session = session;
+    }
+
     pub fn model_name(&self) -> &str {
         &self.runtime.config.model
     }
 
     pub fn skills(&self) -> &[SkillDescriptor] {
         &self.runtime.compatibility.skills
+    }
+
+    pub fn tool_specs(&self) -> &[ToolSpec] {
+        self.runtime.tool_specs()
     }
 
     pub fn refresh_compatibility(&mut self) -> anyhow::Result<()> {

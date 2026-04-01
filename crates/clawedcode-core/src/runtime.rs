@@ -37,9 +37,7 @@ struct McpToolInstance {
     description: String,
     server_name: String,
     remote_tool_name: String,
-    command: String,
-    args: Vec<String>,
-    env: BTreeMap<String, String>,
+    config: McpServerConfig,
 }
 
 impl Tool for McpToolInstance {
@@ -57,10 +55,8 @@ impl Tool for McpToolInstance {
 
     fn execute(&self, input: serde_json::Value, _cwd: &std::path::Path) -> ToolResult {
         match run_mcp_tool_sync(
+            &self.config,
             &self.server_name,
-            &self.command,
-            &self.args,
-            &self.env,
             &self.remote_tool_name,
             input,
         ) {
@@ -164,17 +160,14 @@ impl Tool for ReadMcpResourceToolInstance {
             };
         };
 
-        let Some(McpServerConfig::Stdio {
-            command, args, env, ..
-        }) = self.servers.get(server_name)
-        else {
+        let Some(config) = self.servers.get(server_name) else {
             return ToolResult {
                 content: format!("Server \"{server_name}\" not found"),
                 is_error: true,
             };
         };
 
-        match read_mcp_resource_sync(server_name, command, args, env, uri) {
+        match read_mcp_resource_sync(config, server_name, uri) {
             Ok(contents) => {
                 let text = contents.iter().find_map(|content| content.text.clone());
                 ToolResult {
@@ -281,6 +274,10 @@ fn apply_prompt_override(messages: &mut [clawedcode_api::ProviderMessage], promp
 pub type ApprovalFn = Box<dyn Fn(&str, &str, &serde_json::Value) -> bool + Send + Sync>;
 
 impl Runtime {
+    pub fn tool_specs(&self) -> &[ToolSpec] {
+        &self.tools
+    }
+
     pub fn new(
         config: AppConfig,
         system_prompt: PromptSpec,
@@ -323,12 +320,14 @@ impl Runtime {
         let mut tools = builtin_tools();
 
         for (server_name, discovered_tools) in discover_mcp_tools_sync(&compatibility.mcp_servers) {
-            let Some(McpServerConfig::Stdio {
-                command, args, env, ..
-            }) = compatibility.mcp_servers.get(&server_name)
-            else {
+            let Some(config) = compatibility.mcp_servers.get(&server_name) else {
                 continue;
             };
+
+            let is_supported = matches!(config, McpServerConfig::Stdio { .. } | McpServerConfig::Http { .. });
+            if !is_supported {
+                continue;
+            }
 
             for discovered in discovered_tools {
                 let full_name = make_mcp_tool_name(&server_name, &discovered.name);
@@ -348,9 +347,7 @@ impl Runtime {
                         description,
                         server_name: server_name.clone(),
                         remote_tool_name: discovered.name,
-                        command: command.clone(),
-                        args: args.clone(),
-                        env: env.clone(),
+                        config: config.clone(),
                     }),
                 );
             }
@@ -685,6 +682,23 @@ impl Runtime {
     {
         session.push(Role::User, prompt);
         self.submit_loop_with_approval(session, &mut on_event, approval_fn, None)
+            .await
+    }
+
+    pub async fn submit_stream_with_prompt_override_and_approval<F, A>(
+        &self,
+        session: &mut Session,
+        visible_prompt: &str,
+        execution_prompt: Option<&str>,
+        mut on_event: F,
+        approval_fn: &A,
+    ) -> StreamingRuntimeOutput
+    where
+        F: FnMut(&ApiEvent),
+        A: Fn(&str, &str, &serde_json::Value) -> bool + Send + Sync,
+    {
+        session.push(Role::User, visible_prompt);
+        self.submit_loop_with_approval(session, &mut on_event, approval_fn, execution_prompt)
             .await
     }
 
@@ -1432,7 +1446,10 @@ mod tests {
     use futures_util::stream;
     use std::{
         fs,
+        io::{BufRead, BufReader, Read, Write},
+        net::TcpListener,
         pin::Pin,
+        thread,
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
@@ -1489,6 +1506,44 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         unsafe { std::env::set_var("CLAWEDCODE_DATA_DIR", &dir) };
         dir
+    }
+
+    fn start_mock_http_mcp_server(responses: Vec<String>) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind");
+        let addr = listener.local_addr().expect("failed to get addr");
+
+        let handle = thread::spawn(move || {
+            for response_body in responses {
+                let (mut stream, _) = listener.accept().expect("failed to accept");
+                let mut reader = BufReader::new(&stream);
+
+                let mut request_body = Vec::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).expect("read line");
+                    if line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                    if line.starts_with("Content-Length:") {
+                        let len: usize = line.split(':').nth(1).unwrap().trim().parse().unwrap();
+                        request_body = vec![0u8; len];
+                    }
+                }
+                if !request_body.is_empty() {
+                    reader.read_exact(&mut request_body).ok();
+                }
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                stream.write_all(response.as_bytes()).ok();
+                stream.flush().ok();
+            }
+        });
+
+        (format!("http://127.0.0.1:{}", addr.port()), handle)
     }
 
     #[derive(Debug, Clone)]
@@ -2209,6 +2264,80 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
         }
 
         fs::remove_file(script_path).ok();
+    }
+
+    #[test]
+    fn runtime_registers_and_executes_mcp_http_tools() {
+        let responses = vec![
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"test","version":"1.0"}}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"HTTP echo","inputSchema":{"type":"object"}}]}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"test","version":"1.0"}}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resources":[]}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"test","version":"1.0"}}}"#.to_string(),
+            r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\"hello\":\"world\"}"}]}}"#.to_string(),
+        ];
+        let (url, handle) = start_mock_http_mcp_server(responses);
+
+        let config = AppConfig::default();
+        let prompt_spec = PromptSpec {
+            name: "test",
+            summary: "test",
+            body: "You are a test assistant.",
+        };
+        let mut mcp_servers = std::collections::BTreeMap::new();
+        mcp_servers.insert(
+            "http-server".to_string(),
+            McpServerConfig::Http {
+                r#type: "http".to_string(),
+                url,
+                headers: std::collections::BTreeMap::new(),
+            },
+        );
+        let compat = CompatibilitySnapshot {
+            settings_files: vec![],
+            settings: serde_json::Value::Null,
+            skills: vec![],
+            memory_files: vec![],
+            memory: String::new(),
+            mcp_servers,
+        };
+
+        let runtime = Runtime::with_provider(
+            config,
+            prompt_spec,
+            compat,
+            PermissionMode::Bypass,
+            Box::new(MockProvider),
+        );
+
+        assert!(
+            runtime
+                .tools
+                .iter()
+                .any(|tool| tool.name == "mcp__http-server__echo"),
+            "expected runtime to surface discovered HTTP MCP tool"
+        );
+
+        let mut session = runtime.start_session(std::env::current_dir().unwrap());
+        let result = runtime.execute_tool(
+            "tool-1",
+            "mcp__http-server__echo",
+            serde_json::json!({"hello": "world"}),
+            &mut session,
+        );
+
+        match result {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                assert!(!is_error);
+                assert!(content.contains("hello"));
+                assert!(content.contains("world"));
+            }
+            other => panic!("expected tool result, got {other:?}"),
+        }
+
+        handle.join().ok();
     }
 
     #[test]

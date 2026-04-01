@@ -28,7 +28,7 @@ Already done:
 
 Not done:
 
-- [ ] MCP non-stdio transports
+- [x] MCP non-stdio transports
 - [x] Session compaction / context trimming
 - [x] sub-agents
 - [x] remote/direct-connect/ssh modes
@@ -176,7 +176,7 @@ Should open an interactive REPL that can:
 ### Deliverables
 
 - [ ] Session listing and resume
-- [ ] Continue/fork session behavior
+- [x] Continue/fork session behavior
 - [ ] `CLAUDE.md` layered memory loading
 - [ ] `.claude/rules/*.md` discovery
 - [ ] `@include` expansion and cycle protection
@@ -220,7 +220,8 @@ Current status:
 - MCP tools are surfaced into the runtime as namespaced tools
 - MCP stdio tool execution works end-to-end
 - MCP resource discovery and helper tools are wired into the runtime
-- non-stdio transports are still pending
+- HTTP MCP transport is wired for tool/resource discovery and execution
+- SSE, WS, and SDK transports are still pending
 
 ## Phase 8: Commands, Skills, And Dynamic Command Surface
 

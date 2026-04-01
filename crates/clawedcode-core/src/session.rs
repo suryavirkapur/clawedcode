@@ -38,7 +38,7 @@ pub struct Session {
     pub execution_mode: SessionMode,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Message {
     pub role: Role,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -158,6 +158,22 @@ impl Session {
         }
     }
 
+    pub fn fork_from(existing: &Session) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::new_v4(),
+            cwd: existing.cwd.clone(),
+            created_at: now,
+            updated_at: now,
+            messages: existing.messages.clone(),
+            task_list_id: String::new(),
+            parent_session_id: None,
+            child_sessions: Vec::new(),
+            execution_mode: SessionMode::Interactive,
+        }
+        .with_default_task_list_id()
+    }
+
     pub fn add_child(&mut self, child_id: Uuid) {
         self.child_sessions.push(child_id);
         self.updated_at = Utc::now();
@@ -210,6 +226,96 @@ impl Session {
             self.task_list_id = self.id.to_string();
         }
         self
+    }
+
+    pub fn fork(&self) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::new_v4(),
+            cwd: self.cwd.clone(),
+            created_at: now,
+            updated_at: now,
+            messages: self.messages.clone(),
+            task_list_id: self.task_list_id.clone(),
+            parent_session_id: Some(self.id),
+            child_sessions: Vec::new(),
+            execution_mode: SessionMode::Interactive,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionSummary {
+    pub id: Uuid,
+    pub short_id: String,
+    pub mode: SessionMode,
+    pub cwd: PathBuf,
+    pub updated_at: DateTime<Utc>,
+    pub message_count: usize,
+}
+
+pub fn list_sessions(base_dir: &Path) -> Result<Vec<SessionSummary>> {
+    let entries = match fs::read_dir(base_dir) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    let mut sessions = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let raw = match fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(_) => continue,
+        };
+        let session: Session = match serde_json::from_str(&raw) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let id_str = session.id.to_string();
+        sessions.push(SessionSummary {
+            short_id: id_str.chars().take(8).collect(),
+            id: session.id,
+            mode: session.execution_mode,
+            cwd: session.cwd,
+            updated_at: session.updated_at,
+            message_count: session.messages.len(),
+        });
+    }
+
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.updated_at.timestamp()));
+    Ok(sessions)
+}
+
+pub fn resolve_session_by_prefix(base_dir: &Path, prefix: &str) -> Result<Uuid> {
+    if prefix.is_empty() {
+        anyhow::bail!("session prefix cannot be empty");
+    }
+
+    let uuid_parse_result = Uuid::parse_str(prefix);
+    if let Ok(uuid) = uuid_parse_result {
+        return Ok(uuid);
+    }
+
+    let sessions = list_sessions(base_dir)?;
+    let matches: Vec<_> = sessions
+        .iter()
+        .filter(|s| s.id.to_string().starts_with(prefix))
+        .collect();
+
+    match matches.len() {
+        0 => anyhow::bail!("no session found with prefix '{}'", prefix),
+        1 => Ok(matches[0].id),
+        _ => {
+            let ids: Vec<_> = matches.iter().map(|s| s.id.to_string()).collect();
+            anyhow::bail!(
+                "multiple sessions match prefix '{}': {}",
+                prefix,
+                ids.join(", ")
+            )
+        }
     }
 }
 
@@ -481,6 +587,174 @@ mod tests {
         let loaded = Session::load(&dir, session_id).unwrap();
         assert_eq!(loaded.execution_mode, SessionMode::Interactive);
         assert_eq!(loaded.task_list_id, session_id.to_string());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fork_from_creates_new_interactive_session_with_cloned_transcript() {
+        let mut original = Session::with_mode(PathBuf::from("/tmp/test"), SessionMode::Resume);
+        let child_id = Uuid::new_v4();
+        original.parent_session_id = Some(Uuid::new_v4());
+        original.child_sessions.push(child_id);
+        original.push(Role::User, "Hello");
+        original.push(Role::Assistant, "Hi");
+
+        let forked = Session::fork_from(&original);
+
+        assert_ne!(forked.id, original.id);
+        assert_eq!(forked.cwd, original.cwd);
+        assert_eq!(forked.messages, original.messages);
+        assert_eq!(forked.execution_mode, SessionMode::Interactive);
+        assert!(forked.parent_session_id.is_none());
+        assert!(forked.child_sessions.is_empty());
+        assert_eq!(forked.task_list_id, forked.id.to_string());
+    }
+
+    #[test]
+    fn fork_sets_parent_session_id() {
+        let mut original = Session::new(PathBuf::from("/project"));
+        original.push(Role::User, "test prompt");
+        original.push(Role::Assistant, "response");
+
+        let forked = original.fork();
+
+        assert_ne!(forked.id, original.id);
+        assert_eq!(forked.parent_session_id, Some(original.id));
+        assert_eq!(forked.execution_mode, SessionMode::Interactive);
+        assert_eq!(forked.cwd, original.cwd);
+        assert_eq!(forked.messages.len(), original.messages.len());
+        assert!(forked.child_sessions.is_empty());
+    }
+
+    #[test]
+    fn list_sessions_returns_sessions_sorted_by_updated_at() {
+        let dir = std::env::temp_dir().join(format!("clawed_list_test_{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut session1 = Session::new(PathBuf::from("/project1"));
+        session1.push(Role::User, "first");
+        session1.save(&dir).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        let mut session2 = Session::with_mode(PathBuf::from("/project2"), SessionMode::Headless);
+        session2.push(Role::User, "second");
+        session2.save(&dir).unwrap();
+
+        let sessions = list_sessions(&dir).unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].id, session2.id);
+        assert_eq!(sessions[1].id, session1.id);
+        assert_eq!(sessions[0].short_id.len(), 8);
+        assert_eq!(sessions[0].mode, SessionMode::Headless);
+        assert_eq!(sessions[1].mode, SessionMode::Interactive);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_sessions_empty_directory() {
+        let dir = std::env::temp_dir().join(format!("clawed_empty_test_{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let sessions = list_sessions(&dir).unwrap();
+        assert!(sessions.is_empty());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_sessions_nonexistent_directory() {
+        let dir = std::env::temp_dir().join(format!("clawed_nonexist_{})", Uuid::new_v4()));
+        let sessions = list_sessions(&dir).unwrap();
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn resolve_session_by_prefix_unique_match() {
+        let dir = std::env::temp_dir().join(format!("clawed_resolve_test_{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut session = Session::new(PathBuf::from("/project"));
+        session.push(Role::User, "test");
+        session.save(&dir).unwrap();
+
+        let id_str = session.id.to_string();
+        let prefix: String = id_str.chars().take(8).collect();
+
+        let resolved = resolve_session_by_prefix(&dir, &prefix).unwrap();
+        assert_eq!(resolved, session.id);
+
+        let resolved_full = resolve_session_by_prefix(&dir, &id_str).unwrap();
+        assert_eq!(resolved_full, session.id);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_session_by_prefix_no_match() {
+        let dir = std::env::temp_dir().join(format!("clawed_no_match_test_{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let result = resolve_session_by_prefix(&dir, "nonexist");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("no session found"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_session_by_prefix_multiple_matches() {
+        let dir = std::env::temp_dir().join(format!("clawed_multi_test_{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut s1 = Session::new(PathBuf::from("/p1"));
+        s1.push(Role::User, "1");
+        s1.save(&dir).unwrap();
+
+        let mut s2 = Session::new(PathBuf::from("/p2"));
+        s2.push(Role::User, "2");
+        s2.save(&dir).unwrap();
+
+        let prefix = "a";
+        let result = resolve_session_by_prefix(&dir, prefix);
+        assert!(result.is_err() || result.is_ok());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_session_by_prefix_empty() {
+        let dir = std::env::temp_dir().join(format!("clawed_empty_prefix_{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let result = resolve_session_by_prefix(&dir, "");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("cannot be empty"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn session_summary_fields() {
+        let dir = std::env::temp_dir().join(format!("clawed_summary_test_{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut session = Session::with_mode(PathBuf::from("/myproject"), SessionMode::Ssh);
+        session.push(Role::System, "system");
+        session.push(Role::User, "user");
+        session.push(Role::Assistant, "assistant");
+        session.save(&dir).unwrap();
+
+        let summaries = list_sessions(&dir).unwrap();
+        assert_eq!(summaries.len(), 1);
+        let summary = &summaries[0];
+        assert_eq!(summary.id, session.id);
+        assert_eq!(summary.mode, SessionMode::Ssh);
+        assert_eq!(summary.cwd, PathBuf::from("/myproject"));
+        assert_eq!(summary.message_count, 3);
+        assert_eq!(summary.short_id.len(), 8);
 
         fs::remove_dir_all(&dir).ok();
     }

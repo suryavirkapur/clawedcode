@@ -11,7 +11,7 @@ default-members = ["crates/clawedcode-cli"]
 resolver = "3"
 
 [workspace.package]
-version = "0.0.7"
+version = "0.0.8"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
@@ -38,3 +38,4 @@ uuid = { version = "1.18.1", features = ["serde", "v4"] }
 futures-core = "0.3"
 futures-util = "0.3"
 pin-project-lite = "0.2"
+reqwest = { version = "0.12", features = ["blocking", "json"] }

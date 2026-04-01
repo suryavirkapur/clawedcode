@@ -1,3 +1,4 @@
+use reqwest::blocking::Client as BlockingHttpClient;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -72,6 +73,100 @@ pub fn make_mcp_tool_name(server_name: &str, tool_name: &str) -> String {
     format!("{}{}", prefix, normalize_name_for_mcp(tool_name))
 }
 
+fn parse_tool_specs(result: &Value) -> Vec<McpToolSpec> {
+    result
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| {
+                    let name = t.get("name")?.as_str()?.to_string();
+                    let description = t
+                        .get("description")
+                        .and_then(|d| d.as_str())
+                        .map(String::from);
+                    let input_schema = t
+                        .get("inputSchema")
+                        .cloned()
+                        .unwrap_or(serde_json::json!({}));
+                    Some(McpToolSpec {
+                        name,
+                        description,
+                        input_schema,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_tool_call_text(result: &Value) -> Result<String, String> {
+    result
+        .get("content")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|item| item.get("text"))
+        .and_then(|t| t.as_str())
+        .map(String::from)
+        .ok_or_else(|| "invalid response format".into())
+}
+
+fn parse_resources(server_name: &str, result: &Value) -> Vec<McpResource> {
+    result
+        .get("resources")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    Some(McpResource {
+                        uri: item.get("uri")?.as_str()?.to_string(),
+                        name: item.get("name")?.as_str()?.to_string(),
+                        mime_type: item
+                            .get("mimeType")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string),
+                        description: item
+                            .get("description")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string),
+                        server: server_name.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_resource_contents(result: &Value) -> Vec<McpResourceContent> {
+    result
+        .get("contents")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    Some(McpResourceContent {
+                        uri: item.get("uri")?.as_str()?.to_string(),
+                        mime_type: item
+                            .get("mimeType")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string),
+                        text: item
+                            .get("text")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string),
+                        blob: item
+                            .get("blob")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 struct SyncIoBridge {
     child: Child,
     stdin: ChildStdin,
@@ -131,6 +226,26 @@ impl fmt::Debug for McpStdioClient {
     }
 }
 
+pub struct McpHttpClient {
+    server_name: String,
+    url: String,
+    client: BlockingHttpClient,
+    headers: BTreeMap<String, String>,
+    initialized: bool,
+    next_id: u64,
+}
+
+impl fmt::Debug for McpHttpClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("McpHttpClient")
+            .field("server_name", &self.server_name)
+            .field("url", &self.url)
+            .field("initialized", &self.initialized)
+            .field("next_id", &self.next_id)
+            .finish()
+    }
+}
+
 impl McpStdioClient {
     pub fn new(
         server_name: String,
@@ -165,7 +280,7 @@ impl McpStdioClient {
                 "capabilities": {},
                 "clientInfo": {
                     "name": "clawedcode",
-                    "version": "0.0.3"
+                    "version": env!("CARGO_PKG_VERSION")
                 }
             }
         });
@@ -263,33 +378,7 @@ impl McpStdioClient {
             return Err("not initialized".into());
         }
         let result = self.request("tools/list", serde_json::json!({}))?;
-
-        let tools = result
-            .get("tools")
-            .and_then(|t| t.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|t| {
-                        let name = t.get("name")?.as_str()?.to_string();
-                        let description = t
-                            .get("description")
-                            .and_then(|d| d.as_str())
-                            .map(String::from);
-                        let input_schema = t
-                            .get("inputSchema")
-                            .cloned()
-                            .unwrap_or(serde_json::json!({}));
-                        Some(McpToolSpec {
-                            name,
-                            description,
-                            input_schema,
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        Ok(tools)
+        Ok(parse_tool_specs(&result))
     }
 
     pub fn call_tool(&mut self, tool_name: &str, arguments: Value) -> Result<String, String> {
@@ -303,15 +392,7 @@ impl McpStdioClient {
                 "arguments": arguments
             }),
         )?;
-
-        result
-            .get("content")
-            .and_then(|c| c.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|item| item.get("text"))
-            .and_then(|t| t.as_str())
-            .map(String::from)
-            .ok_or_else(|| "invalid response format".into())
+        parse_tool_call_text(&result)
     }
 
     pub fn list_resources(&mut self) -> Result<Vec<McpResource>, String> {
@@ -320,32 +401,7 @@ impl McpStdioClient {
         }
 
         let result = self.request("resources/list", serde_json::json!({}))?;
-        let resources = result
-            .get("resources")
-            .and_then(|value| value.as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| {
-                        Some(McpResource {
-                            uri: item.get("uri")?.as_str()?.to_string(),
-                            name: item.get("name")?.as_str()?.to_string(),
-                            mime_type: item
-                                .get("mimeType")
-                                .and_then(|value| value.as_str())
-                                .map(str::to_string),
-                            description: item
-                                .get("description")
-                                .and_then(|value| value.as_str())
-                                .map(str::to_string),
-                            server: self.server_name.clone(),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        Ok(resources)
+        Ok(parse_resources(&self.server_name, &result))
     }
 
     pub fn read_resource(&mut self, uri: &str) -> Result<Vec<McpResourceContent>, String> {
@@ -354,38 +410,138 @@ impl McpStdioClient {
         }
 
         let result = self.request("resources/read", serde_json::json!({ "uri": uri }))?;
-        let contents = result
-            .get("contents")
-            .and_then(|value| value.as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| {
-                        Some(McpResourceContent {
-                            uri: item.get("uri")?.as_str()?.to_string(),
-                            mime_type: item
-                                .get("mimeType")
-                                .and_then(|value| value.as_str())
-                                .map(str::to_string),
-                            text: item
-                                .get("text")
-                                .and_then(|value| value.as_str())
-                                .map(str::to_string),
-                            blob: item
-                                .get("blob")
-                                .and_then(|value| value.as_str())
-                                .map(str::to_string),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        Ok(contents)
+        Ok(parse_resource_contents(&result))
     }
 
     pub fn server_name(&self) -> &str {
         &self.server_name
+    }
+
+    pub fn is_initialized(&self) -> bool {
+        self.initialized
+    }
+}
+
+impl McpHttpClient {
+    pub fn new(
+        server_name: String,
+        url: String,
+        headers: BTreeMap<String, String>,
+    ) -> Result<Self, String> {
+        let client = BlockingHttpClient::builder()
+            .build()
+            .map_err(|e| format!("failed to build HTTP client: {e}"))?;
+        let mut http = Self {
+            server_name,
+            url,
+            client,
+            headers,
+            initialized: false,
+            next_id: 1,
+        };
+        http.initialize()?;
+        Ok(http)
+    }
+
+    fn next_request_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    fn initialize(&mut self) -> Result<(), String> {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": self.next_request_id(),
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "clawedcode",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }
+        });
+
+        let _ = self.send_request(&request)?;
+        self.initialized = true;
+        Ok(())
+    }
+
+    fn send_request(&self, body: &Value) -> Result<Value, String> {
+        let mut request = self.client.post(&self.url).json(body);
+        for (name, value) in &self.headers {
+            request = request.header(name, value);
+        }
+
+        let response = request
+            .send()
+            .map_err(|e| format!("HTTP MCP request failed: {e}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!("HTTP MCP request failed with status {status}"));
+        }
+
+        response
+            .json::<Value>()
+            .map_err(|e| format!("HTTP MCP response parse error: {e}"))
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": self.next_request_id(),
+            "method": method,
+            "params": params,
+        });
+        let response = self.send_request(&request)?;
+        if let Some(error) = response.get("error") {
+            let message = error
+                .get("message")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown MCP error");
+            return Err(message.to_string());
+        }
+        Ok(response.get("result").cloned().unwrap_or(Value::Null))
+    }
+
+    pub fn list_tools(&mut self) -> Result<Vec<McpToolSpec>, String> {
+        if !self.initialized {
+            return Err("not initialized".into());
+        }
+        let result = self.request("tools/list", serde_json::json!({}))?;
+        Ok(parse_tool_specs(&result))
+    }
+
+    pub fn call_tool(&mut self, tool_name: &str, arguments: Value) -> Result<String, String> {
+        if !self.initialized {
+            return Err("not initialized".into());
+        }
+        let result = self.request(
+            "tools/call",
+            serde_json::json!({
+                "name": tool_name,
+                "arguments": arguments
+            }),
+        )?;
+        parse_tool_call_text(&result)
+    }
+
+    pub fn list_resources(&mut self) -> Result<Vec<McpResource>, String> {
+        if !self.initialized {
+            return Err("not initialized".into());
+        }
+        let result = self.request("resources/list", serde_json::json!({}))?;
+        Ok(parse_resources(&self.server_name, &result))
+    }
+
+    pub fn read_resource(&mut self, uri: &str) -> Result<Vec<McpResourceContent>, String> {
+        if !self.initialized {
+            return Err("not initialized".into());
+        }
+        let result = self.request("resources/read", serde_json::json!({ "uri": uri }))?;
+        Ok(parse_resource_contents(&result))
     }
 
     pub fn is_initialized(&self) -> bool {
@@ -405,11 +561,10 @@ pub fn discover_mcp_tools_sync(
     let mut result: BTreeMap<String, Vec<McpToolSpec>> = BTreeMap::new();
 
     for (name, config) in servers {
-        if let McpServerConfig::Stdio {
-            command, args, env, ..
-        } = config
-        {
-            match McpStdioClient::new(name.clone(), command, args, env) {
+        match config {
+            McpServerConfig::Stdio {
+                command, args, env, ..
+            } => match McpStdioClient::new(name.clone(), command, args, env) {
                 Ok(ref mut client) => {
                     if let Ok(tools) = client.list_tools() {
                         result.insert(name.clone(), tools);
@@ -418,7 +573,20 @@ pub fn discover_mcp_tools_sync(
                 Err(e) => {
                     eprintln!("failed to connect to MCP server {}: {}", name, e);
                 }
+            },
+            McpServerConfig::Http { url, headers, .. } => {
+                match McpHttpClient::new(name.clone(), url.clone(), headers.clone()) {
+                    Ok(ref mut client) => {
+                        if let Ok(tools) = client.list_tools() {
+                            result.insert(name.clone(), tools);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("failed to connect to MCP HTTP server {}: {}", name, e);
+                    }
+                }
             }
+            _ => {}
         }
     }
 
@@ -426,15 +594,25 @@ pub fn discover_mcp_tools_sync(
 }
 
 pub fn run_mcp_tool_sync(
+    config: &McpServerConfig,
     server_name: &str,
-    command: &str,
-    args: &[String],
-    env: &BTreeMap<String, String>,
     tool_name: &str,
     arguments: Value,
 ) -> Result<String, String> {
-    let mut client = McpStdioClient::new(server_name.to_string(), command, args, env)?;
-    client.call_tool(tool_name, arguments)
+    match config {
+        McpServerConfig::Stdio {
+            command, args, env, ..
+        } => {
+            let mut client = McpStdioClient::new(server_name.to_string(), command, args, env)?;
+            client.call_tool(tool_name, arguments)
+        }
+        McpServerConfig::Http { url, headers, .. } => {
+            let mut client =
+                McpHttpClient::new(server_name.to_string(), url.clone(), headers.clone())?;
+            client.call_tool(tool_name, arguments)
+        }
+        _ => Err("unsupported MCP server type".to_string()),
+    }
 }
 
 pub fn discover_mcp_resources_sync(
@@ -443,11 +621,10 @@ pub fn discover_mcp_resources_sync(
     let mut result = BTreeMap::new();
 
     for (name, config) in servers {
-        if let McpServerConfig::Stdio {
-            command, args, env, ..
-        } = config
-        {
-            match McpStdioClient::new(name.clone(), command, args, env) {
+        match config {
+            McpServerConfig::Stdio {
+                command, args, env, ..
+            } => match McpStdioClient::new(name.clone(), command, args, env) {
                 Ok(ref mut client) => {
                     if let Ok(resources) = client.list_resources() {
                         result.insert(name.clone(), resources);
@@ -456,22 +633,44 @@ pub fn discover_mcp_resources_sync(
                 Err(e) => {
                     eprintln!("failed to connect to MCP server {}: {}", name, e);
                 }
+            },
+            McpServerConfig::Http { url, headers, .. } => {
+                match McpHttpClient::new(name.clone(), url.clone(), headers.clone()) {
+                    Ok(ref mut client) => {
+                        if let Ok(resources) = client.list_resources() {
+                            result.insert(name.clone(), resources);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("failed to connect to MCP HTTP server {}: {}", name, e);
+                    }
+                }
             }
+            _ => {}
         }
     }
-
     result
 }
 
 pub fn read_mcp_resource_sync(
+    config: &McpServerConfig,
     server_name: &str,
-    command: &str,
-    args: &[String],
-    env: &BTreeMap<String, String>,
     uri: &str,
 ) -> Result<Vec<McpResourceContent>, String> {
-    let mut client = McpStdioClient::new(server_name.to_string(), command, args, env)?;
-    client.read_resource(uri)
+    match config {
+        McpServerConfig::Stdio {
+            command, args, env, ..
+        } => {
+            let mut client = McpStdioClient::new(server_name.to_string(), command, args, env)?;
+            client.read_resource(uri)
+        }
+        McpServerConfig::Http { url, headers, .. } => {
+            let mut client =
+                McpHttpClient::new(server_name.to_string(), url.clone(), headers.clone())?;
+            client.read_resource(uri)
+        }
+        _ => Err("unsupported MCP server type".to_string()),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -793,11 +992,15 @@ while True:
     #[test]
     fn run_mcp_tool_sync_integration() {
         let script_path = temp_python_mcp_server();
+        let config = McpServerConfig::Stdio {
+            r#type: Some("stdio".to_string()),
+            command: "python3".to_string(),
+            args: vec![script_path.to_str().unwrap().to_string()],
+            env: BTreeMap::new(),
+        };
         let result = run_mcp_tool_sync(
+            &config,
             "test-server",
-            "python3",
-            &[script_path.to_str().unwrap().to_string()],
-            &BTreeMap::new(),
             "echo",
             serde_json::json!({"foo": "bar"}),
         )
@@ -894,14 +1097,14 @@ while True:
     #[test]
     fn read_mcp_resource_sync_integration() {
         let script_path = temp_python_mcp_server();
-        let contents = read_mcp_resource_sync(
-            "test-server",
-            "python3",
-            &[script_path.to_str().unwrap().to_string()],
-            &BTreeMap::new(),
-            "resource://test/hello",
-        )
-        .expect("failed to read resource");
+        let config = McpServerConfig::Stdio {
+            r#type: Some("stdio".to_string()),
+            command: "python3".to_string(),
+            args: vec![script_path.to_str().unwrap().to_string()],
+            env: BTreeMap::new(),
+        };
+        let contents = read_mcp_resource_sync(&config, "test-server", "resource://test/hello")
+            .expect("failed to read resource");
         assert_eq!(contents.len(), 1);
         assert_eq!(contents[0].text.as_deref(), Some("Hello from MCP resource"));
 
@@ -993,11 +1196,15 @@ exit 0
         fn mcp_tool_execution_returns_clean_error_on_transport_failure() {
             let exiting_script = temp_exiting_mcp_server();
 
+            let config = McpServerConfig::Stdio {
+                r#type: Some("stdio".to_string()),
+                command: exiting_script.to_str().unwrap().to_string(),
+                args: vec![],
+                env: BTreeMap::new(),
+            };
             let result = run_mcp_tool_sync(
+                &config,
                 "exiting-server",
-                exiting_script.to_str().unwrap(),
-                &[],
-                &BTreeMap::new(),
                 "test_tool",
                 serde_json::json!({}),
             );
@@ -1059,13 +1266,13 @@ exit 0
 
         #[test]
         fn mcp_read_resource_handles_missing_server() {
-            let result = read_mcp_resource_sync(
-                "missing-server",
-                "/nonexistent/server",
-                &[],
-                &BTreeMap::new(),
-                "resource://test/data",
-            );
+            let config = McpServerConfig::Stdio {
+                r#type: Some("stdio".to_string()),
+                command: "/nonexistent/server".to_string(),
+                args: vec![],
+                env: BTreeMap::new(),
+            };
+            let result = read_mcp_resource_sync(&config, "missing-server", "resource://test/data");
 
             assert!(result.is_err());
             assert!(!result.unwrap_err().is_empty());
@@ -1104,6 +1311,229 @@ exit 0
             assert_eq!(content.uri, "file://test");
             assert_eq!(content.text, Some("hello world".to_string()));
             assert!(content.blob.is_none());
+        }
+    }
+
+    mod http_tests {
+        use super::*;
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        fn start_mock_http_server(
+            responses: Vec<(String, String)>,
+        ) -> (String, thread::JoinHandle<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind");
+            let addr = listener.local_addr().expect("failed to get addr");
+            let port = addr.port();
+
+            let handle = thread::spawn(move || {
+                for (_, response_body) in responses {
+                    let (mut stream, _) = listener.accept().expect("failed to accept");
+                    let mut reader = BufReader::new(&stream);
+
+                    let mut request_body = Vec::new();
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).expect("read line");
+                        if line == "\r\n" || line == "\n" {
+                            break;
+                        }
+                        if line.starts_with("Content-Length:") {
+                            let len: usize =
+                                line.split(':').nth(1).unwrap().trim().parse().unwrap();
+                            request_body = vec![0u8; len];
+                        }
+                    }
+                    if !request_body.is_empty() {
+                        reader.read_exact(&mut request_body).ok();
+                    }
+
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        response_body.len(),
+                        response_body
+                    );
+                    stream.write_all(response.as_bytes()).ok();
+                    stream.flush().ok();
+                }
+            });
+
+            (format!("http://127.0.0.1:{}", port), handle)
+        }
+
+        #[test]
+        fn mcp_http_client_lists_tools() {
+            let responses = vec![
+                ("".to_string(), r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"test","version":"1.0"}}}"#.to_string()),
+                ("".to_string(), r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"Echo tool","inputSchema":{"type":"object"}}]}}"#.to_string()),
+            ];
+
+            let (url, handle) = start_mock_http_server(responses);
+            let mut client = McpHttpClient::new("test-http".to_string(), url, BTreeMap::new())
+                .expect("failed to create client");
+
+            assert!(client.is_initialized());
+            let tools = client.list_tools().expect("failed to list tools");
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0].name, "echo");
+
+            handle.join().ok();
+        }
+
+        #[test]
+        fn mcp_http_client_calls_tool() {
+            let responses = vec![
+                ("".to_string(), r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"test","version":"1.0"}}}"#.to_string()),
+                ("".to_string(), r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"Hello"}]}}"#.to_string()),
+            ];
+
+            let (url, handle) = start_mock_http_server(responses);
+            let mut client = McpHttpClient::new("test-http".to_string(), url, BTreeMap::new())
+                .expect("failed to create client");
+
+            let result = client
+                .call_tool("echo", serde_json::json!({}))
+                .expect("failed to call tool");
+            assert_eq!(result, "Hello");
+
+            handle.join().ok();
+        }
+
+        #[test]
+        fn mcp_http_client_lists_resources() {
+            let responses = vec![
+                ("".to_string(), r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"test","version":"1.0"}}}"#.to_string()),
+                ("".to_string(), r#"{"jsonrpc":"2.0","id":2,"result":{"resources":[{"uri":"test://resource","name":"Test Resource","mimeType":"text/plain"}]}}"#.to_string()),
+            ];
+
+            let (url, handle) = start_mock_http_server(responses);
+            let mut client = McpHttpClient::new("test-http".to_string(), url, BTreeMap::new())
+                .expect("failed to create client");
+
+            let resources = client.list_resources().expect("failed to list resources");
+            assert_eq!(resources.len(), 1);
+            assert_eq!(resources[0].uri, "test://resource");
+
+            handle.join().ok();
+        }
+
+        #[test]
+        fn mcp_http_client_reads_resource() {
+            let responses = vec![
+                ("".to_string(), r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"test","version":"1.0"}}}"#.to_string()),
+                ("".to_string(), r#"{"jsonrpc":"2.0","id":2,"result":{"contents":[{"uri":"test://resource","text":"content here"}]}}"#.to_string()),
+            ];
+
+            let (url, handle) = start_mock_http_server(responses);
+            let mut client = McpHttpClient::new("test-http".to_string(), url, BTreeMap::new())
+                .expect("failed to create client");
+
+            let contents = client
+                .read_resource("test://resource")
+                .expect("failed to read resource");
+            assert_eq!(contents.len(), 1);
+            assert_eq!(contents[0].text.as_deref(), Some("content here"));
+
+            handle.join().ok();
+        }
+
+        #[test]
+        fn discover_mcp_tools_sync_http_server() {
+            let responses = vec![
+                ("".to_string(), r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"test","version":"1.0"}}}"#.to_string()),
+                ("".to_string(), r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"http_tool","description":"HTTP tool","inputSchema":{"type":"object"}}]}}"#.to_string()),
+            ];
+            let (url, handle) = start_mock_http_server(responses);
+
+            let mut servers = BTreeMap::new();
+            servers.insert(
+                "http-server".to_string(),
+                McpServerConfig::Http {
+                    r#type: "http".to_string(),
+                    url: url.clone(),
+                    headers: BTreeMap::new(),
+                },
+            );
+
+            let tools = discover_mcp_tools_sync(&servers);
+            assert!(tools.contains_key("http-server"));
+            let http_tools = tools.get("http-server").unwrap();
+            assert_eq!(http_tools.len(), 1);
+            assert_eq!(http_tools[0].name, "http_tool");
+
+            handle.join().ok();
+        }
+
+        #[test]
+        fn run_mcp_tool_sync_http() {
+            let responses = vec![
+                ("".to_string(), r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"test","version":"1.0"}}}"#.to_string()),
+                ("".to_string(), r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"HTTP tool result"}]}}"#.to_string()),
+            ];
+            let (url, handle) = start_mock_http_server(responses);
+
+            let config = McpServerConfig::Http {
+                r#type: "http".to_string(),
+                url,
+                headers: BTreeMap::new(),
+            };
+
+            let result =
+                run_mcp_tool_sync(&config, "http-server", "test_tool", serde_json::json!({}))
+                    .expect("failed to run tool");
+            assert_eq!(result, "HTTP tool result");
+
+            handle.join().ok();
+        }
+
+        #[test]
+        fn discover_mcp_resources_sync_http_server() {
+            let responses = vec![
+                ("".to_string(), r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"test","version":"1.0"}}}"#.to_string()),
+                ("".to_string(), r#"{"jsonrpc":"2.0","id":2,"result":{"resources":[{"uri":"http://resource","name":"HTTP Resource"}]}}"#.to_string()),
+            ];
+            let (url, handle) = start_mock_http_server(responses);
+
+            let mut servers = BTreeMap::new();
+            servers.insert(
+                "http-server".to_string(),
+                McpServerConfig::Http {
+                    r#type: "http".to_string(),
+                    url: url.clone(),
+                    headers: BTreeMap::new(),
+                },
+            );
+
+            let resources = discover_mcp_resources_sync(&servers);
+            assert!(resources.contains_key("http-server"));
+            let http_resources = resources.get("http-server").unwrap();
+            assert_eq!(http_resources.len(), 1);
+            assert_eq!(http_resources[0].uri, "http://resource");
+
+            handle.join().ok();
+        }
+
+        #[test]
+        fn read_mcp_resource_sync_http() {
+            let responses = vec![
+                ("".to_string(), r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"test","version":"1.0"}}}"#.to_string()),
+                ("".to_string(), r#"{"jsonrpc":"2.0","id":2,"result":{"contents":[{"uri":"http://resource","text":"HTTP resource content"}]}}"#.to_string()),
+            ];
+            let (url, handle) = start_mock_http_server(responses);
+
+            let config = McpServerConfig::Http {
+                r#type: "http".to_string(),
+                url,
+                headers: BTreeMap::new(),
+            };
+
+            let contents = read_mcp_resource_sync(&config, "http-server", "http://resource")
+                .expect("failed to read resource");
+            assert_eq!(contents.len(), 1);
+            assert_eq!(contents[0].text.as_deref(), Some("HTTP resource content"));
+
+            handle.join().ok();
         }
     }
 }
