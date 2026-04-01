@@ -121,13 +121,34 @@ struct SavedSessionSummary {
     preview: String,
 }
 
+#[derive(Debug, Clone)]
+enum LiveToolEventState {
+    Use {
+        name: String,
+        input: serde_json::Value,
+    },
+    PendingApproval,
+    Approved,
+    Denied,
+    Result {
+        content: String,
+        is_error: bool,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct LiveToolEntry {
+    tool_use_id: String,
+    events: Vec<LiveToolEventState>,
+}
+
 struct ReplHandler {
     transcript_lines: Vec<String>,
     overlay_lines: Vec<String>,
     live_user_prompt: Option<String>,
     live_assistant_text: String,
     live_thinking: String,
-    live_tool_lines: Vec<String>,
+    live_tools: Vec<LiveToolEntry>,
     show_thinking: bool,
     state: AppState,
 }
@@ -140,7 +161,7 @@ impl ReplHandler {
             live_user_prompt: None,
             live_assistant_text: String::new(),
             live_thinking: String::new(),
-            live_tool_lines: Vec::new(),
+            live_tools: Vec::new(),
             show_thinking,
             state: AppState::Idle,
         }
@@ -166,7 +187,7 @@ impl ReplHandler {
             || self.live_user_prompt.is_some()
             || !self.live_assistant_text.is_empty()
             || !self.live_thinking.is_empty()
-            || !self.live_tool_lines.is_empty()
+            || !self.live_tools.is_empty()
     }
 
     fn push_overlay(&mut self, line: impl Into<String>) {
@@ -182,7 +203,7 @@ impl ReplHandler {
         self.live_user_prompt = None;
         self.live_assistant_text.clear();
         self.live_thinking.clear();
-        self.live_tool_lines.clear();
+        self.live_tools.clear();
     }
 
     fn live_lines(&self) -> Vec<String> {
@@ -207,7 +228,9 @@ impl ReplHandler {
             lines.push(String::new());
         }
 
-        lines.extend(self.live_tool_lines.iter().cloned());
+        for entry in &self.live_tools {
+            lines.extend(render_live_tool_entry(entry));
+        }
 
         while lines.last().is_some_and(|line| line.is_empty()) {
             lines.pop();
@@ -215,6 +238,101 @@ impl ReplHandler {
 
         lines
     }
+
+    fn record_live_tool_use(
+        &mut self,
+        tool_use_id: impl Into<String>,
+        name: impl Into<String>,
+        input: serde_json::Value,
+    ) {
+        let tool_use_id = tool_use_id.into();
+        let entry = self.live_tool_entry_mut(&tool_use_id);
+        entry.events.push(LiveToolEventState::Use {
+            name: name.into(),
+            input,
+        });
+    }
+
+    fn record_live_tool_pending_approval(&mut self, tool_use_id: &str) {
+        self.live_tool_entry_mut(tool_use_id)
+            .events
+            .push(LiveToolEventState::PendingApproval);
+    }
+
+    fn record_live_tool_approval_decision(&mut self, tool_use_id: &str, approved: bool) {
+        self.live_tool_entry_mut(tool_use_id).events.push(if approved {
+            LiveToolEventState::Approved
+        } else {
+            LiveToolEventState::Denied
+        });
+    }
+
+    fn record_live_tool_result(
+        &mut self,
+        tool_use_id: &str,
+        content: String,
+        is_error: bool,
+    ) {
+        self.live_tool_entry_mut(tool_use_id)
+            .events
+            .push(LiveToolEventState::Result { content, is_error });
+    }
+
+    fn live_tool_entry_mut(&mut self, tool_use_id: &str) -> &mut LiveToolEntry {
+        if let Some(index) = self
+            .live_tools
+            .iter()
+            .position(|entry| entry.tool_use_id == tool_use_id)
+        {
+            return &mut self.live_tools[index];
+        }
+
+        self.live_tools.push(LiveToolEntry {
+            tool_use_id: tool_use_id.to_string(),
+            events: Vec::new(),
+        });
+        self.live_tools
+            .last_mut()
+            .expect("just pushed live tool entry")
+    }
+}
+
+fn render_live_tool_entry(entry: &LiveToolEntry) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    for event in &entry.events {
+        match event {
+            LiveToolEventState::Use { name, input } => {
+                lines.push(format!(
+                    "[tool] {name} (id={}) {}",
+                    entry.tool_use_id,
+                    serde_json::to_string(input).unwrap_or_default()
+                ));
+            }
+            LiveToolEventState::PendingApproval => {
+                lines.push(format!(
+                    "[tool_pending] {} awaiting approval",
+                    entry.tool_use_id
+                ));
+            }
+            LiveToolEventState::Approved => {
+                lines.push(format!("[tool_approved] {} approved", entry.tool_use_id));
+            }
+            LiveToolEventState::Denied => {
+                lines.push(format!("[tool_denied] {} denied", entry.tool_use_id));
+            }
+            LiveToolEventState::Result { content, is_error } => {
+                let prefix = if *is_error {
+                    "[tool_error]"
+                } else {
+                    "[tool_result]"
+                };
+                lines.push(format!("{prefix} {}: {content}", entry.tool_use_id));
+            }
+        }
+    }
+
+    lines
 }
 
 impl TuiHandler for ReplHandler {
@@ -227,23 +345,14 @@ impl TuiHandler for ReplHandler {
                 self.live_assistant_text.push_str(text);
             }
             TuiEvent::ToolUse { id, name, input } => {
-                self.live_tool_lines.push(format!(
-                    "[tool] {name} (id={id}) {}",
-                    serde_json::to_string(input).unwrap_or_default()
-                ));
+                self.record_live_tool_use(id.clone(), name.clone(), input.clone());
             }
             TuiEvent::ToolResult {
                 tool_use_id,
                 content,
                 is_error,
             } => {
-                let prefix = if *is_error {
-                    "[tool_error]"
-                } else {
-                    "[tool_result]"
-                };
-                self.live_tool_lines
-                    .push(format!("{prefix} {tool_use_id}: {content}"));
+                self.record_live_tool_result(tool_use_id, content.clone(), *is_error);
             }
             TuiEvent::AssistantDone | TuiEvent::TurnComplete => {
                 self.state = AppState::Idle;
@@ -382,6 +491,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         KeyCode::Char('y') | KeyCode::Char('Y') => {
                             let req = awaiting_approval.take().expect("approval request");
                             handler.push_overlay(format!("[info] Approved '{}'", req.tool_name));
+                            handler.record_live_tool_approval_decision(&req.tool_use_id, true);
                             if let Some(turn) = &active_turn {
                                 let _ = turn.approvals.send(true);
                             }
@@ -389,6 +499,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         KeyCode::Char('n') | KeyCode::Char('N') => {
                             let req = awaiting_approval.take().expect("approval request");
                             handler.push_overlay(format!("[info] Denied '{}'", req.tool_name));
+                            handler.record_live_tool_approval_decision(&req.tool_use_id, false);
                             if let Some(turn) = &active_turn {
                                 let _ = turn.approvals.send(false);
                             }
@@ -845,6 +956,7 @@ fn drain_turn_events(
             match event {
                 TurnWorkerEvent::Ui(event) => handler.on_event(&event),
                 TurnWorkerEvent::ApprovalRequested(request) => {
+                    handler.record_live_tool_pending_approval(&request.tool_use_id);
                     *awaiting_approval = Some(request);
                     handler.state = AppState::AwaitingApproval;
                 }
@@ -1942,6 +2054,57 @@ mod command_policy_tests {
             assert_eq!(
                 handler.visible_lines().join("\n"),
                 "You: hello\n\n[thinking] let me think\n\nClawedCode: Hi"
+            );
+        }
+
+        #[test]
+        fn live_tool_pending_approval_appears_in_transcript() {
+            let mut handler = ReplHandler::new(false);
+            handler.begin_live_turn("please inspect");
+            handler.on_event(&TuiEvent::ToolUse {
+                id: "tool-1".to_string(),
+                name: "shell".to_string(),
+                input: serde_json::json!({"command": "ls -la"}),
+            });
+            handler.record_live_tool_pending_approval("tool-1");
+
+            assert_eq!(
+                handler.visible_lines().join("\n"),
+                "You: please inspect\n\n[tool] shell (id=tool-1) {\"command\":\"ls -la\"}\n[tool_pending] tool-1 awaiting approval"
+            );
+        }
+
+        #[test]
+        fn live_tool_approval_and_result_update_promptly() {
+            let mut handler = ReplHandler::new(false);
+            handler.begin_live_turn("please inspect");
+            handler.on_event(&TuiEvent::ToolUse {
+                id: "tool-1".to_string(),
+                name: "shell".to_string(),
+                input: serde_json::json!({"command": "ls -la"}),
+            });
+            handler.record_live_tool_pending_approval("tool-1");
+            handler.record_live_tool_approval_decision("tool-1", true);
+            handler.record_live_tool_result("tool-1", "done".to_string(), false);
+
+            assert_eq!(
+                handler.visible_lines().join("\n"),
+                "You: please inspect\n\n[tool] shell (id=tool-1) {\"command\":\"ls -la\"}\n[tool_pending] tool-1 awaiting approval\n[tool_approved] tool-1 approved\n[tool_result] tool-1: done"
+            );
+
+            let mut denied_handler = ReplHandler::new(false);
+            denied_handler.begin_live_turn("please inspect");
+            denied_handler.on_event(&TuiEvent::ToolUse {
+                id: "tool-2".to_string(),
+                name: "shell".to_string(),
+                input: serde_json::json!({"command": "ls -la"}),
+            });
+            denied_handler.record_live_tool_pending_approval("tool-2");
+            denied_handler.record_live_tool_approval_decision("tool-2", false);
+
+            assert_eq!(
+                denied_handler.visible_lines().join("\n"),
+                "You: please inspect\n\n[tool] shell (id=tool-2) {\"command\":\"ls -la\"}\n[tool_pending] tool-2 awaiting approval\n[tool_denied] tool-2 denied"
             );
         }
 
