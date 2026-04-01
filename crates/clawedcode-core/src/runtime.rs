@@ -1166,10 +1166,7 @@ impl Runtime {
         }
 
         if tool_name == "shell"
-            && input
-                .get("run_in_background")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
+            && input_bool_field(&input, &["run_in_background"]).unwrap_or(false)
         {
             return execute_background_shell(tool_use_id, input, session);
         }
@@ -1272,15 +1269,15 @@ fn execute_background_shell(tool_use_id: &str, input: serde_json::Value, session
 }
 
 fn execute_task_output_tool(tool_use_id: &str, input: serde_json::Value) -> ContentBlock {
-    let task_id = match input.get("task_id").and_then(|v| v.as_str()) {
+    let task_id = match input_string_field(&input, &["task_id", "taskId"]) {
         Some(s) => s.to_string(),
         None => {
             return ContentBlock::tool_error(tool_use_id, "Missing 'task_id' parameter");
         }
     };
 
-    let block = input.get("block").and_then(|v| v.as_bool()).unwrap_or(true);
-    let timeout_ms = input.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30000);
+    let block = input_bool_field(&input, &["block"]).unwrap_or(true);
+    let timeout_ms = input_u64_field(&input, &["timeout"]).unwrap_or(30000);
 
     let retrieval_status = if block {
         match wait_for_task_completion(&task_id, timeout_ms) {
@@ -1327,11 +1324,7 @@ fn execute_task_output_tool(tool_use_id: &str, input: serde_json::Value) -> Cont
 }
 
 fn execute_task_stop_tool(tool_use_id: &str, input: serde_json::Value) -> ContentBlock {
-    let task_id = match input
-        .get("task_id")
-        .and_then(|v| v.as_str())
-        .or_else(|| input.get("shell_id").and_then(|v| v.as_str()))
-    {
+    let task_id = match input_string_field(&input, &["task_id", "taskId", "shell_id"]) {
         Some(s) => s.to_string(),
         None => {
             return ContentBlock::tool_error(tool_use_id, "Missing 'task_id' parameter");
@@ -1398,6 +1391,37 @@ fn current_retrieval_status(task_id: &str) -> &'static str {
         }
         Some(_) => "success",
         None => "not_ready",
+    }
+}
+
+fn input_value<'a>(input: &'a serde_json::Value, keys: &[&str]) -> Option<&'a serde_json::Value> {
+    keys.iter().find_map(|key| input.get(key))
+}
+
+fn input_string_field<'a>(input: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+    input_value(input, keys).and_then(|value| value.as_str())
+}
+
+fn input_bool_field(input: &serde_json::Value, keys: &[&str]) -> Option<bool> {
+    let value = input_value(input, keys)?;
+    match value {
+        serde_json::Value::Bool(value) => Some(*value),
+        serde_json::Value::Number(number) => number.as_u64().map(|value| value != 0),
+        serde_json::Value::String(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" => Some(true),
+            "false" | "0" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn input_u64_field(input: &serde_json::Value, keys: &[&str]) -> Option<u64> {
+    let value = input_value(input, keys)?;
+    match value {
+        serde_json::Value::Number(number) => number.as_u64(),
+        serde_json::Value::String(value) => value.trim().parse::<u64>().ok(),
+        _ => None,
     }
 }
 
@@ -2737,6 +2761,116 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
     }
 
     #[test]
+    fn task_stop_accepts_task_id_aliases() {
+        let _guard = crate::test_support::env_lock();
+        let data_dir = set_temp_data_dir();
+        let config = AppConfig::default();
+        let prompt_spec = PromptSpec {
+            name: "test",
+            summary: "test",
+            body: "You are a test assistant.",
+        };
+        let compat = CompatibilitySnapshot {
+            settings_files: vec![],
+            settings: serde_json::Value::Null,
+            skills: vec![],
+            memory_files: vec![],
+            memory: String::new(),
+            mcp_servers: std::collections::BTreeMap::new(),
+        };
+        let runtime = Runtime::with_provider(
+            config,
+            prompt_spec,
+            compat,
+            PermissionMode::Bypass,
+            Box::new(MockProvider),
+        );
+        let mut session = runtime.start_session(std::env::temp_dir());
+        let task_one = crate::background_task::spawn_background_shell(
+            "sleep 5".to_string(),
+            "sleep".to_string(),
+            std::env::temp_dir(),
+            &session.id.to_string(),
+        )
+        .unwrap();
+        let task_two = crate::background_task::spawn_background_shell(
+            "sleep 5".to_string(),
+            "sleep".to_string(),
+            std::env::temp_dir(),
+            &session.id.to_string(),
+        )
+        .unwrap();
+
+        let via_task_id = runtime.execute_tool(
+            "stop-task-id",
+            "TaskStop",
+            serde_json::json!({ "taskId": task_one.id }),
+            &mut session,
+        );
+        let via_shell_id = runtime.execute_tool(
+            "stop-shell-id",
+            "TaskStop",
+            serde_json::json!({ "shell_id": task_two.id }),
+            &mut session,
+        );
+
+        for block in [via_task_id, via_shell_id] {
+            match block {
+                ContentBlock::ToolResult {
+                    is_error, content, ..
+                } => {
+                    assert!(!is_error, "unexpected tool error: {content}");
+                    let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+                    assert_eq!(json["status"], "killed");
+                }
+                other => panic!("expected tool result, got {other:?}"),
+            }
+        }
+
+        let stopped_one = crate::background_task::get_background_task(&task_one.id).unwrap();
+        let stopped_two = crate::background_task::get_background_task(&task_two.id).unwrap();
+        assert_eq!(stopped_one.status, crate::background_task::TaskStatus::Killed);
+        assert_eq!(stopped_two.status, crate::background_task::TaskStatus::Killed);
+
+        unsafe { std::env::remove_var("CLAWEDCODE_DATA_DIR") };
+        fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn background_shell_accepts_stringified_run_in_background() {
+        let _guard = crate::test_support::env_lock();
+        let data_dir = set_temp_data_dir();
+        let runtime = make_tool_runtime();
+        let mut session = runtime.start_session(std::env::temp_dir());
+
+        let result = runtime.execute_tool(
+            "bg-string-bool",
+            "shell",
+            serde_json::json!({
+                "command": "sleep 2",
+                "run_in_background": "true"
+            }),
+            &mut session,
+        );
+
+        match result {
+            ContentBlock::ToolResult {
+                is_error, content, ..
+            } => {
+                assert!(!is_error, "unexpected tool error: {content}");
+                let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+                assert_eq!(json["status"], "running");
+                let task_id = json["task_id"].as_str().unwrap();
+                let _ = crate::background_task::stop_background_task(task_id);
+            }
+            other => panic!("expected tool result, got {other:?}"),
+        }
+
+        unsafe { std::env::remove_var("CLAWEDCODE_DATA_DIR") };
+        fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
     fn task_output_reports_not_ready_timeout_then_success() {
         let _guard = crate::test_support::env_lock();
         let data_dir = set_temp_data_dir();
@@ -2830,6 +2964,186 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
     }
 
     #[test]
+    fn task_output_accepts_camel_case_and_string_fields() {
+        let _guard = crate::test_support::env_lock();
+        let data_dir = set_temp_data_dir();
+        let config = AppConfig::default();
+        let prompt_spec = PromptSpec {
+            name: "test",
+            summary: "test",
+            body: "You are a test assistant.",
+        };
+        let compat = CompatibilitySnapshot {
+            settings_files: vec![],
+            settings: serde_json::Value::Null,
+            skills: vec![],
+            memory_files: vec![],
+            memory: String::new(),
+            mcp_servers: std::collections::BTreeMap::new(),
+        };
+        let runtime = Runtime::with_provider(
+            config,
+            prompt_spec,
+            compat,
+            PermissionMode::Bypass,
+            Box::new(MockProvider),
+        );
+        let mut session = runtime.start_session(std::env::temp_dir());
+        let task = crate::background_task::spawn_background_shell(
+            "sleep 1; echo done".to_string(),
+            "delayed echo".to_string(),
+            std::env::temp_dir(),
+            &session.id.to_string(),
+        )
+        .unwrap();
+
+        let not_ready = runtime.execute_tool(
+            "task-output-camel-not-ready",
+            "TaskOutput",
+            serde_json::json!({
+                "taskId": task.id,
+                "block": "false"
+            }),
+            &mut session,
+        );
+        let timeout = runtime.execute_tool(
+            "task-output-camel-timeout",
+            "TaskOutput",
+            serde_json::json!({
+                "taskId": task.id,
+                "block": "true",
+                "timeout": "50"
+            }),
+            &mut session,
+        );
+        std::thread::sleep(Duration::from_millis(1200));
+        let success = runtime.execute_tool(
+            "task-output-camel-success",
+            "TaskOutput",
+            serde_json::json!({
+                "taskId": task.id,
+                "block": "true",
+                "timeout": "2000"
+            }),
+            &mut session,
+        );
+
+        let parse = |block: ContentBlock| match block {
+            ContentBlock::ToolResult {
+                is_error, content, ..
+            } => {
+                assert!(!is_error, "unexpected tool error: {content}");
+                serde_json::from_str::<serde_json::Value>(&content).unwrap()
+            }
+            other => panic!("expected tool result, got {other:?}"),
+        };
+
+        let not_ready_json = parse(not_ready);
+        assert_eq!(not_ready_json["retrieval_status"], "not_ready");
+
+        let timeout_json = parse(timeout);
+        assert_eq!(timeout_json["retrieval_status"], "timeout");
+
+        let success_json = parse(success);
+        assert_eq!(success_json["retrieval_status"], "success");
+        assert_eq!(success_json["task"]["status"], "completed");
+        assert!(success_json["task"]["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("done"));
+
+        unsafe { std::env::remove_var("CLAWEDCODE_DATA_DIR") };
+        fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn task_output_accepts_compat_string_fields() {
+        let _guard = crate::test_support::env_lock();
+        let data_dir = set_temp_data_dir();
+        let config = AppConfig::default();
+        let prompt_spec = PromptSpec {
+            name: "test",
+            summary: "test",
+            body: "You are a test assistant.",
+        };
+        let compat = CompatibilitySnapshot {
+            settings_files: vec![],
+            settings: serde_json::Value::Null,
+            skills: vec![],
+            memory_files: vec![],
+            memory: String::new(),
+            mcp_servers: std::collections::BTreeMap::new(),
+        };
+        let runtime = Runtime::with_provider(
+            config,
+            prompt_spec,
+            compat,
+            PermissionMode::Bypass,
+            Box::new(MockProvider),
+        );
+        let mut session = runtime.start_session(std::env::temp_dir());
+        let task = crate::background_task::spawn_background_shell(
+            "sleep 1; echo done".to_string(),
+            "delayed echo".to_string(),
+            std::env::temp_dir(),
+            &session.id.to_string(),
+        )
+        .unwrap();
+
+        let not_ready = runtime.execute_tool(
+            "task-output-compat-not-ready",
+            "TaskOutput",
+            serde_json::json!({
+                "taskId": task.id,
+                "block": "false"
+            }),
+            &mut session,
+        );
+
+        match not_ready {
+            ContentBlock::ToolResult {
+                is_error, content, ..
+            } => {
+                assert!(!is_error, "unexpected tool error: {content}");
+                let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+                assert_eq!(json["retrieval_status"], "not_ready");
+            }
+            other => panic!("expected tool result, got {other:?}"),
+        }
+
+        std::thread::sleep(Duration::from_millis(1200));
+
+        let success = runtime.execute_tool(
+            "task-output-compat-success",
+            "TaskOutput",
+            serde_json::json!({
+                "taskId": task.id,
+                "block": "true",
+                "timeout": "2000"
+            }),
+            &mut session,
+        );
+
+        match success {
+            ContentBlock::ToolResult {
+                is_error, content, ..
+            } => {
+                assert!(!is_error, "unexpected tool error: {content}");
+                let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+                assert_eq!(json["retrieval_status"], "success");
+                assert!(json["task"]["output"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("done"));
+            }
+            other => panic!("expected tool result, got {other:?}"),
+        }
+
+        unsafe { std::env::remove_var("CLAWEDCODE_DATA_DIR") };
+        fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
     fn background_shell_output_path_is_session_scoped() {
         let _guard = crate::test_support::env_lock();
         let data_dir = set_temp_data_dir();
@@ -2868,6 +3182,53 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
 
         let _ = crate::background_task::stop_background_task(a["task_id"].as_str().unwrap());
         let _ = crate::background_task::stop_background_task(b["task_id"].as_str().unwrap());
+
+        unsafe { std::env::remove_var("CLAWEDCODE_DATA_DIR") };
+        fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[test]
+    fn shell_run_in_background_accepts_string_and_numeric_truthy_values() {
+        let _guard = crate::test_support::env_lock();
+        let data_dir = set_temp_data_dir();
+        let runtime = make_tool_runtime();
+        let mut session_a = runtime.start_session(std::env::temp_dir());
+        let mut session_b = runtime.start_session(std::env::temp_dir());
+
+        let run_bg = |session: &mut Session, value: serde_json::Value| {
+            match runtime.execute_tool(
+                "bg-compat",
+                "shell",
+                serde_json::json!({
+                    "command": "sleep 5",
+                    "run_in_background": value
+                }),
+                session,
+            ) {
+                ContentBlock::ToolResult {
+                    is_error, content, ..
+                } => {
+                    assert!(!is_error, "unexpected tool error: {content}");
+                    serde_json::from_str::<serde_json::Value>(&content).unwrap()
+                }
+                other => panic!("expected tool result, got {other:?}"),
+            }
+        };
+
+        let string_value = run_bg(&mut session_a, serde_json::Value::String("true".to_string()));
+        let numeric_value = run_bg(&mut session_b, serde_json::Value::Number(1.into()));
+
+        assert_eq!(string_value["status"], "running");
+        assert_eq!(numeric_value["status"], "running");
+        assert!(string_value["task_id"].as_str().is_some());
+        assert!(numeric_value["task_id"].as_str().is_some());
+
+        let _ = crate::background_task::stop_background_task(
+            string_value["task_id"].as_str().unwrap(),
+        );
+        let _ = crate::background_task::stop_background_task(
+            numeric_value["task_id"].as_str().unwrap(),
+        );
 
         unsafe { std::env::remove_var("CLAWEDCODE_DATA_DIR") };
         fs::remove_dir_all(data_dir).ok();
