@@ -429,15 +429,16 @@ fn write_headless_output(path: Option<&std::path::Path>, rendered: &str) -> Resu
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SshCommandSpec {
-    program: OsString,
-    args: Vec<OsString>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 struct TransportOutput {
     stdout: String,
     stderr: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TransportCommandSpec {
+    transport_name: &'static str,
+    program: OsString,
+    args: Vec<OsString>,
 }
 
 fn ssh_binary() -> OsString {
@@ -470,7 +471,11 @@ fn resolve_transport_prompt(prompt: Option<String>) -> Result<String> {
     resolve_transport_prompt_from_reader(prompt, &mut stdin)
 }
 
-fn build_ssh_command_spec(cwd: &Path, ssh_mode: &crate::bootstrap::SshMode, prompt: &str) -> SshCommandSpec {
+fn build_ssh_command_spec(
+    cwd: &Path,
+    ssh_mode: &crate::bootstrap::SshMode,
+    prompt: &str,
+) -> TransportCommandSpec {
     let mut args = vec![
         OsString::from(&ssh_mode.target),
         OsString::from("clawedcode"),
@@ -495,7 +500,8 @@ fn build_ssh_command_spec(cwd: &Path, ssh_mode: &crate::bootstrap::SshMode, prom
         args.push(OsString::from("-y"));
     }
 
-    SshCommandSpec {
+    TransportCommandSpec {
+        transport_name: "ssh",
         program: ssh_binary(),
         args,
     }
@@ -505,7 +511,7 @@ fn build_direct_connect_command_spec(
     cwd: &Path,
     dc_mode: &crate::bootstrap::DirectConnectMode,
     prompt: &str,
-) -> SshCommandSpec {
+) -> TransportCommandSpec {
     let mut args = vec![
         OsString::from(&dc_mode.address),
         OsString::from("clawedcode"),
@@ -530,7 +536,8 @@ fn build_direct_connect_command_spec(
         args.push(OsString::from("-y"));
     }
 
-    SshCommandSpec {
+    TransportCommandSpec {
+        transport_name: "direct-connect",
         program: direct_connect_binary(),
         args,
     }
@@ -540,7 +547,7 @@ fn build_remote_command_spec(
     cwd: &Path,
     remote_mode: &crate::bootstrap::RemoteMode,
     prompt: &str,
-) -> SshCommandSpec {
+) -> TransportCommandSpec {
     let mut args = vec![
         OsString::from(&remote_mode.orchestrator),
         OsString::from("clawedcode"),
@@ -565,25 +572,37 @@ fn build_remote_command_spec(
         args.push(OsString::from("-y"));
     }
 
-    SshCommandSpec {
+    TransportCommandSpec {
+        transport_name: "remote",
         program: remote_binary(),
         args,
     }
 }
 
-fn run_ssh_headless(cwd: &Path, ssh_mode: &crate::bootstrap::SshMode) -> Result<TransportOutput> {
-    let prompt = resolve_transport_prompt(ssh_mode.prompt.clone())?;
-    let spec = build_ssh_command_spec(cwd, ssh_mode, &prompt);
+fn transport_program_display(program: &OsString) -> String {
+    PathBuf::from(program).display().to_string()
+}
 
-    let output = ProcessCommand::new(&spec.program)
-        .args(&spec.args)
-        .output()
-        .with_context(|| {
-            format!(
-                "failed to launch ssh transport via {}",
-                PathBuf::from(&spec.program).display()
-            )
-        })?;
+fn run_transport_command(spec: &TransportCommandSpec) -> Result<TransportOutput> {
+    let output = match ProcessCommand::new(&spec.program).args(&spec.args).output() {
+        Ok(output) => output,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!(
+                "{} transport binary not found: {}",
+                spec.transport_name,
+                transport_program_display(&spec.program)
+            );
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to launch {} transport via {}",
+                    spec.transport_name,
+                    transport_program_display(&spec.program)
+                )
+            });
+        }
+    };
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -594,12 +613,18 @@ fn run_ssh_headless(cwd: &Path, ssh_mode: &crate::bootstrap::SshMode) -> Result<
         } else if !stdout.trim().is_empty() {
             stdout.trim().to_string()
         } else {
-            format!("ssh exited with status {}", output.status)
+            format!("{} exited with status {}", spec.transport_name, output.status)
         };
-        anyhow::bail!("ssh headless transport failed: {detail}");
+        anyhow::bail!("{} transport failed: {detail}", spec.transport_name);
     }
 
     Ok(TransportOutput { stdout, stderr })
+}
+
+fn run_ssh_headless(cwd: &Path, ssh_mode: &crate::bootstrap::SshMode) -> Result<TransportOutput> {
+    let prompt = resolve_transport_prompt(ssh_mode.prompt.clone())?;
+    let spec = build_ssh_command_spec(cwd, ssh_mode, &prompt);
+    run_transport_command(&spec)
 }
 
 fn run_direct_connect_headless(
@@ -608,32 +633,7 @@ fn run_direct_connect_headless(
 ) -> Result<TransportOutput> {
     let prompt = resolve_transport_prompt(dc_mode.prompt.clone())?;
     let spec = build_direct_connect_command_spec(cwd, dc_mode, &prompt);
-
-    let output = ProcessCommand::new(&spec.program)
-        .args(&spec.args)
-        .output()
-        .with_context(|| {
-            format!(
-                "failed to launch direct-connect transport via {}",
-                PathBuf::from(&spec.program).display()
-            )
-        })?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-
-    if !output.status.success() {
-        let detail = if !stderr.trim().is_empty() {
-            stderr.trim().to_string()
-        } else if !stdout.trim().is_empty() {
-            stdout.trim().to_string()
-        } else {
-            format!("direct-connect exited with status {}", output.status)
-        };
-        anyhow::bail!("direct-connect transport failed: {detail}");
-    }
-
-    Ok(TransportOutput { stdout, stderr })
+    run_transport_command(&spec)
 }
 
 fn run_remote_headless(
@@ -642,32 +642,7 @@ fn run_remote_headless(
 ) -> Result<TransportOutput> {
     let prompt = resolve_transport_prompt(remote_mode.prompt.clone())?;
     let spec = build_remote_command_spec(cwd, remote_mode, &prompt);
-
-    let output = ProcessCommand::new(&spec.program)
-        .args(&spec.args)
-        .output()
-        .with_context(|| {
-            format!(
-                "failed to launch remote transport via {}",
-                PathBuf::from(&spec.program).display()
-            )
-        })?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-
-    if !output.status.success() {
-        let detail = if !stderr.trim().is_empty() {
-            stderr.trim().to_string()
-        } else if !stdout.trim().is_empty() {
-            stdout.trim().to_string()
-        } else {
-            format!("remote exited with status {}", output.status)
-        };
-        anyhow::bail!("remote transport failed: {detail}");
-    }
-
-    Ok(TransportOutput { stdout, stderr })
+    run_transport_command(&spec)
 }
 
 async fn execute_direct_connect(
@@ -1174,6 +1149,80 @@ mod tests {
 
         unsafe { std::env::remove_var("CLAWEDCODE_REMOTE_BIN") };
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_ssh_headless_reports_missing_binary() {
+        let _guard = env_lock();
+        unsafe { std::env::set_var("CLAWEDCODE_SSH_BIN", "/tmp/does-not-exist-ssh") };
+
+        let ssh_mode = crate::bootstrap::SshMode {
+            target: "devbox".to_string(),
+            prompt: Some("hello".to_string()),
+            system_prompt: None,
+            json: true,
+            show_thinking: false,
+            yes: true,
+        };
+
+        let err = run_ssh_headless(Path::new("/workspace"), &ssh_mode)
+            .expect_err("missing ssh binary should fail");
+        let message = err.to_string();
+        assert!(message.contains("ssh transport binary not found"));
+        assert!(message.contains("/tmp/does-not-exist-ssh"));
+
+        unsafe { std::env::remove_var("CLAWEDCODE_SSH_BIN") };
+    }
+
+    #[test]
+    fn run_direct_connect_headless_reports_missing_binary() {
+        let _guard = env_lock();
+        unsafe {
+            std::env::set_var(
+                "CLAWEDCODE_DIRECT_CONNECT_BIN",
+                "/tmp/does-not-exist-direct-connect",
+            )
+        };
+
+        let dc_mode = crate::bootstrap::DirectConnectMode {
+            address: "localhost:9000".to_string(),
+            prompt: Some("hello".to_string()),
+            system_prompt: None,
+            json: true,
+            show_thinking: false,
+            yes: true,
+        };
+
+        let err = run_direct_connect_headless(Path::new("/workspace"), &dc_mode)
+            .expect_err("missing direct-connect binary should fail");
+        let message = err.to_string();
+        assert!(message.contains("direct-connect transport binary not found"));
+        assert!(message.contains("/tmp/does-not-exist-direct-connect"));
+
+        unsafe { std::env::remove_var("CLAWEDCODE_DIRECT_CONNECT_BIN") };
+    }
+
+    #[test]
+    fn run_remote_headless_reports_missing_binary() {
+        let _guard = env_lock();
+        unsafe { std::env::set_var("CLAWEDCODE_REMOTE_BIN", "/tmp/does-not-exist-remote") };
+
+        let remote_mode = crate::bootstrap::RemoteMode {
+            orchestrator: "my-orchestrator.local".to_string(),
+            prompt: Some("hello".to_string()),
+            system_prompt: None,
+            json: true,
+            show_thinking: false,
+            yes: true,
+        };
+
+        let err = run_remote_headless(Path::new("/workspace"), &remote_mode)
+            .expect_err("missing remote binary should fail");
+        let message = err.to_string();
+        assert!(message.contains("remote transport binary not found"));
+        assert!(message.contains("/tmp/does-not-exist-remote"));
+
+        unsafe { std::env::remove_var("CLAWEDCODE_REMOTE_BIN") };
     }
 
     use clawedcode_core::compat::CompatibilitySnapshot;
