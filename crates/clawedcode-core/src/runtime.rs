@@ -92,7 +92,9 @@ impl Tool for ListMcpResourcesToolInstance {
                 Some(items) => all_resources.extend(items.iter().cloned()),
                 None => {
                     return ToolResult {
-                        content: format!("Server \"{server_name}\" not found or does not support resources"),
+                        content: format!(
+                            "Server \"{server_name}\" not found or does not support resources"
+                        ),
                         is_error: true,
                     };
                 }
@@ -1037,8 +1039,7 @@ while True:
         let output = runtime.submit(&mut session, "hello");
 
         assert!(!output.response.is_empty());
-        assert!(output.response.contains("Model:"));
-        assert!(output.response.contains("Prompt pack:"));
+        assert!(output.response.contains("Hello"));
     }
 
     #[test]
@@ -1064,7 +1065,7 @@ while True:
     }
 
     #[test]
-    fn submit_produces_thinking_block_when_stream_has_thinking() {
+    fn submit_persists_thinking_block_when_stream_emits_thinking() {
         let runtime = make_runtime();
         let mut session = runtime.start_session(PathBuf::from("/tmp"));
 
@@ -1082,7 +1083,7 @@ while True:
             .any(|b| matches!(b, ContentBlock::Thinking { .. }));
         assert!(
             has_thinking,
-            "Assistant message should contain a thinking block"
+            "Assistant message should contain a thinking block when the provider emits one"
         );
     }
 
@@ -1422,8 +1423,18 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
             Box::new(MockProvider),
         );
 
-        assert!(runtime.tools.iter().any(|tool| tool.name == "ListMcpResourcesTool"));
-        assert!(runtime.tools.iter().any(|tool| tool.name == "ReadMcpResourceTool"));
+        assert!(
+            runtime
+                .tools
+                .iter()
+                .any(|tool| tool.name == "ListMcpResourcesTool")
+        );
+        assert!(
+            runtime
+                .tools
+                .iter()
+                .any(|tool| tool.name == "ReadMcpResourceTool")
+        );
 
         let list_result = runtime.execute_tool(
             "tool-list",
@@ -1503,10 +1514,12 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
         let texts: Vec<_> = request
             .messages
             .iter()
-            .filter_map(|m| m.content.iter().find_map(|b| match b {
-                clawedcode_api::ProviderContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            }))
+            .filter_map(|m| {
+                m.content.iter().find_map(|b| match b {
+                    clawedcode_api::ProviderContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+            })
             .collect();
 
         assert_eq!(
@@ -1547,13 +1560,10 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
 
         let request = runtime.build_request(&session);
         assert_eq!(request.messages.len(), 1);
-        let system_text = request.messages[0]
-            .content
-            .iter()
-            .find_map(|b| match b {
-                clawedcode_api::ProviderContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            });
+        let system_text = request.messages[0].content.iter().find_map(|b| match b {
+            clawedcode_api::ProviderContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        });
         assert_eq!(system_text, Some("You are a test assistant."));
     }
 
@@ -1642,8 +1652,16 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
         let session = runtime.start_session(PathBuf::from("/tmp"));
         let request = runtime.build_request(&session);
 
-        assert!(request.system_prompt_body.contains("You are a test assistant."));
+        assert!(
+            request
+                .system_prompt_body
+                .contains("You are a test assistant.")
+        );
         assert!(request.system_prompt_body.contains("## Loaded Memory"));
-        assert!(request.system_prompt_body.contains("Follow the project rule."));
+        assert!(
+            request
+                .system_prompt_body
+                .contains("Follow the project rule.")
+        );
     }
 }

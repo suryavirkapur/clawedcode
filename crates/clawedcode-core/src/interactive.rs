@@ -1,4 +1,5 @@
 use crate::{
+    compat::SkillDescriptor,
     config::AppConfig,
     content::ContentBlock,
     permissions::PermissionMode,
@@ -15,6 +16,7 @@ pub struct TuiContext {
     pub runtime: Runtime,
     pub session: Session,
     pub sessions_dir: PathBuf,
+    pub show_thinking: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +61,7 @@ impl TuiContext {
         cwd: PathBuf,
         sessions_dir: PathBuf,
     ) -> Self {
+        let show_thinking = config.ui.show_thinking;
         let runtime = Runtime::with_mode(
             config,
             system_prompt,
@@ -70,6 +73,7 @@ impl TuiContext {
             runtime,
             session,
             sessions_dir,
+            show_thinking,
         }
     }
 
@@ -104,20 +108,14 @@ impl TuiContext {
                     ApiEvent::ToolUse { tool_use } => {
                         let input = serde_json::from_str(&tool_use.input)
                             .unwrap_or(serde_json::Value::Null);
-                        tool_uses.push((
-                            tool_use.id.clone(),
-                            tool_use.name.clone(),
-                            input.clone(),
-                        ));
+                        tool_uses.push((tool_use.id.clone(), tool_use.name.clone(), input.clone()));
                         handler.on_event(&TuiEvent::ToolUse {
                             id: tool_use.id.clone(),
                             name: tool_use.name.clone(),
                             input,
                         });
                     }
-                    ApiEvent::ToolResult { .. }
-                    | ApiEvent::Usage { .. }
-                    | ApiEvent::Completed => {}
+                    ApiEvent::ToolResult { .. } | ApiEvent::Usage { .. } | ApiEvent::Completed => {}
                 }
 
                 if matches!(event, ApiEvent::Completed) {
@@ -232,6 +230,14 @@ impl TuiContext {
 
     pub fn session_mut(&mut self) -> &mut Session {
         &mut self.session
+    }
+
+    pub fn model_name(&self) -> &str {
+        &self.runtime.config.model
+    }
+
+    pub fn skills(&self) -> &[SkillDescriptor] {
+        &self.runtime.compatibility.skills
     }
 }
 
@@ -383,7 +389,12 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, TuiEvent::TurnComplete))
         );
-        assert!(ctx.session.messages.iter().any(|m| m.role == Role::Assistant));
+        assert!(
+            ctx.session
+                .messages
+                .iter()
+                .any(|m| m.role == Role::Assistant)
+        );
     }
 
     #[test]
