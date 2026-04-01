@@ -241,6 +241,8 @@ struct TurnResult {
     tool_use_records: Vec<ToolUseRecord>,
 }
 
+const REPEATED_TOOL_LOOP_LIMIT: usize = 4;
+
 #[derive(Debug, Clone)]
 struct AgentToolInput {
     description: String,
@@ -730,6 +732,8 @@ impl Runtime {
         let mut total_thinking = String::new();
         let mut all_tool_use_records: Vec<ToolUseRecord> = Vec::new();
         let mut total_tools_executed = 0usize;
+        let mut repeated_tool_signature: Option<String> = None;
+        let mut repeated_tool_count = 0usize;
 
         for _turn in 0..self.max_turns() {
             let request = self.build_request_with_prompt_override(session, prompt_override);
@@ -739,10 +743,38 @@ impl Runtime {
                 .process_stream_turn(session, stream, on_event, approval_fn)
                 .await;
 
+            if let Some(signature) = repeated_tool_call_signature(&turn_result) {
+                if repeated_tool_signature.as_deref() == Some(signature.as_str()) {
+                    repeated_tool_count += 1;
+                } else {
+                    repeated_tool_signature = Some(signature);
+                    repeated_tool_count = 1;
+                }
+            } else {
+                repeated_tool_signature = None;
+                repeated_tool_count = 0;
+            }
+
             total_text.push_str(&turn_result.text);
             total_thinking.push_str(&turn_result.thinking);
             total_tools_executed += turn_result.tools_executed;
             all_tool_use_records.extend(turn_result.tool_use_records);
+
+            if repeated_tool_count >= REPEATED_TOOL_LOOP_LIMIT {
+                let warning = format!(
+                    "Stopped after {} repeated identical tool calls.",
+                    repeated_tool_count
+                );
+                if !total_text.is_empty() && !total_text.ends_with('\n') {
+                    total_text.push('\n');
+                }
+                total_text.push_str(&warning);
+                on_event(&ApiEvent::MessageDelta {
+                    text: warning.clone(),
+                });
+                session.push(Role::Assistant, &warning);
+                break;
+            }
 
             if !turn_result.has_tool_use {
                 break;
@@ -1180,6 +1212,16 @@ impl Runtime {
 
         finish_tool_result(tool_use_id, tool.execute(input, &session.cwd))
     }
+}
+
+fn repeated_tool_call_signature(turn_result: &TurnResult) -> Option<String> {
+    if turn_result.tool_use_records.len() != 1 {
+        return None;
+    }
+
+    let record = turn_result.tool_use_records.first()?;
+    let input = serde_json::to_string(&record.input).ok()?;
+    Some(format!("{}:{input}", record.name))
 }
 
 fn finish_tool_result(tool_use_id: &str, result: ToolResult) -> ContentBlock {
@@ -3279,6 +3321,156 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
 
         unsafe { std::env::remove_var("CLAWEDCODE_DATA_DIR") };
         fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[derive(Debug, Clone)]
+    struct RepeatingReadFileProvider;
+
+    impl Provider for RepeatingReadFileProvider {
+        fn complete(
+            &self,
+            _request: &CompletionRequest,
+        ) -> Pin<
+            Box<dyn std::future::Future<Output = Result<CompletionResponse, ProviderError>> + Send + '_>,
+        > {
+            Box::pin(async { unreachable!("use stream instead") })
+        }
+
+        fn stream(&self, _request: &CompletionRequest) -> clawedcode_api::EventStream {
+            let events = vec![
+                ApiEvent::ToolUse {
+                    tool_use: clawedcode_api::ToolUseEvent {
+                        id: "repeat-read-file".to_string(),
+                        name: "read_file".to_string(),
+                        input: serde_json::json!({
+                            "path": "loop.txt"
+                        })
+                        .to_string(),
+                    },
+                },
+                ApiEvent::Completed,
+            ];
+            Box::pin(stream::iter(events.into_iter().map(Ok)))
+        }
+    }
+
+    #[test]
+    fn submit_loop_breaks_repeated_identical_tool_calls() {
+        let config = AppConfig::default();
+        let prompt_spec = PromptSpec {
+            name: "test",
+            summary: "test",
+            body: "You are a test assistant.",
+        };
+        let compat = CompatibilitySnapshot {
+            settings_files: vec![],
+            settings: serde_json::Value::Null,
+            skills: vec![],
+            memory_files: vec![],
+            memory: String::new(),
+            mcp_servers: std::collections::BTreeMap::new(),
+        };
+        let runtime = Runtime::with_provider(
+            config,
+            prompt_spec,
+            compat,
+            PermissionMode::Bypass,
+            Box::new(RepeatingReadFileProvider),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("loop.txt"), "loop guard").unwrap();
+        let mut session = runtime.start_session(dir.path().to_path_buf());
+
+        let output = runtime.run_in_runtime(async {
+            runtime
+                .submit_stream(&mut session, "Inspect the file.", |_| {})
+                .await
+        });
+
+        assert!(output.response.contains("Stopped after"));
+        assert_eq!(output.tools_executed, REPEATED_TOOL_LOOP_LIMIT);
+
+        let warning_present = session.messages.iter().any(|message| {
+            message.role == Role::Assistant
+                && message
+                    .content_blocks
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Text { text } if text.contains("Stopped after")))
+        });
+        assert!(warning_present, "loop guard warning should be persisted");
+    }
+
+    #[derive(Debug, Clone)]
+    struct RepeatingNarratedReadFileProvider;
+
+    impl Provider for RepeatingNarratedReadFileProvider {
+        fn complete(
+            &self,
+            _request: &CompletionRequest,
+        ) -> Pin<
+            Box<dyn std::future::Future<Output = Result<CompletionResponse, ProviderError>> + Send + '_>,
+        > {
+            Box::pin(async { unreachable!("use stream instead") })
+        }
+
+        fn stream(&self, _request: &CompletionRequest) -> clawedcode_api::EventStream {
+            let events = vec![
+                ApiEvent::MessageDelta {
+                    text: "Let me try again with the correct format.".to_string(),
+                },
+                ApiEvent::ToolUse {
+                    tool_use: clawedcode_api::ToolUseEvent {
+                        id: "repeat-read-file-with-text".to_string(),
+                        name: "read_file".to_string(),
+                        input: serde_json::json!({
+                            "path": "loop.txt"
+                        })
+                        .to_string(),
+                    },
+                },
+                ApiEvent::Completed,
+            ];
+            Box::pin(stream::iter(events.into_iter().map(Ok)))
+        }
+    }
+
+    #[test]
+    fn submit_loop_breaks_repeated_identical_tool_calls_with_retry_text() {
+        let config = AppConfig::default();
+        let prompt_spec = PromptSpec {
+            name: "test",
+            summary: "test",
+            body: "You are a test assistant.",
+        };
+        let compat = CompatibilitySnapshot {
+            settings_files: vec![],
+            settings: serde_json::Value::Null,
+            skills: vec![],
+            memory_files: vec![],
+            memory: String::new(),
+            mcp_servers: std::collections::BTreeMap::new(),
+        };
+        let runtime = Runtime::with_provider(
+            config,
+            prompt_spec,
+            compat,
+            PermissionMode::Bypass,
+            Box::new(RepeatingNarratedReadFileProvider),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("loop.txt"), "loop guard").unwrap();
+        let mut session = runtime.start_session(dir.path().to_path_buf());
+
+        let output = runtime.run_in_runtime(async {
+            runtime
+                .submit_stream(&mut session, "Inspect the file.", |_| {})
+                .await
+        });
+
+        assert!(output.response.contains("Stopped after"));
+        assert_eq!(output.tools_executed, REPEATED_TOOL_LOOP_LIMIT);
     }
 
     #[test]
