@@ -231,7 +231,6 @@ impl ReplHandler {
             } else {
                 lines.push(format!("ClawedCode: {assistant}"));
             }
-            lines.push(String::new());
         }
 
         for entry in &self.live_tools {
@@ -2258,7 +2257,7 @@ mod command_policy_tests {
 
             assert_eq!(
                 handler.visible_lines().join("\n"),
-                "You: please inspect\n\nClawedCode:\n\n[tool] shell (id=tool-1) {\"command\":\"ls -la\"}\n[tool_pending] tool-1 awaiting approval"
+                "You: please inspect\n\nClawedCode:\n[tool] shell (id=tool-1) {\"command\":\"ls -la\"}\n[tool_pending] tool-1 awaiting approval"
             );
         }
 
@@ -2274,7 +2273,7 @@ mod command_policy_tests {
 
             assert_eq!(
                 handler.visible_lines().join("\n"),
-                "You: please inspect\n\nClawedCode:\n\n[tool] shell (id=tool-1) {\"command\":\"ls -la\"}"
+                "You: please inspect\n\nClawedCode:\n[tool] shell (id=tool-1) {\"command\":\"ls -la\"}"
             );
         }
 
@@ -2293,7 +2292,7 @@ mod command_policy_tests {
 
             assert_eq!(
                 handler.visible_lines().join("\n"),
-                "You: please inspect\n\nClawedCode:\n\n[tool] shell (id=tool-1) {\"command\":\"ls -la\"}\n[tool_pending] tool-1 awaiting approval\n[tool_approved] tool-1 approved\n[tool_result] tool-1: done"
+                "You: please inspect\n\nClawedCode:\n[tool] shell (id=tool-1) {\"command\":\"ls -la\"}\n[tool_pending] tool-1 awaiting approval\n[tool_approved] tool-1 approved\n[tool_result] tool-1: done"
             );
 
             let mut denied_handler = ReplHandler::new(false);
@@ -2308,7 +2307,7 @@ mod command_policy_tests {
 
             assert_eq!(
                 denied_handler.visible_lines().join("\n"),
-                "You: please inspect\n\nClawedCode:\n\n[tool] shell (id=tool-2) {\"command\":\"ls -la\"}\n[tool_pending] tool-2 awaiting approval\n[tool_denied] tool-2 denied"
+                "You: please inspect\n\nClawedCode:\n[tool] shell (id=tool-2) {\"command\":\"ls -la\"}\n[tool_pending] tool-2 awaiting approval\n[tool_denied] tool-2 denied"
             );
         }
 
