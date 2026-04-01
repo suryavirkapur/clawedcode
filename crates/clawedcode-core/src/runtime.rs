@@ -243,6 +243,55 @@ struct TurnResult {
 
 const REPEATED_TOOL_LOOP_LIMIT: usize = 4;
 
+pub(crate) fn casual_reply_for_prompt(prompt: &str) -> Option<&'static str> {
+    let normalized = prompt
+        .trim()
+        .trim_matches(|c: char| c.is_ascii_punctuation() || c.is_whitespace())
+        .to_ascii_lowercase();
+
+    match normalized.as_str() {
+        "hi" | "hello" | "hey" | "yo" => Some("Hello!"),
+        "how are you" | "how are you doing" | "how's it going" | "hows it going" => {
+            Some("Doing fine. What do you want to work on?")
+        }
+        _ => None,
+    }
+}
+
+fn push_casual_assistant_reply(session: &mut Session, reply: &str) {
+    session.push_blocks(Role::Assistant, vec![ContentBlock::text(reply)]);
+}
+
+fn runtime_output_from_reply(runtime: &Runtime, session: &Session, reply: &str) -> RuntimeOutput {
+    RuntimeOutput {
+        session_id: session.id.to_string(),
+        system_prompt: runtime.system_prompt.name.to_string(),
+        response: reply.to_string(),
+        tool_count: runtime.tools.len(),
+        skill_count: runtime.compatibility.skills.len(),
+        mcp_server_count: runtime.compatibility.mcp_servers.len(),
+        tools_executed: 0,
+    }
+}
+
+fn streaming_output_from_reply(
+    runtime: &Runtime,
+    session: &Session,
+    reply: &str,
+) -> StreamingRuntimeOutput {
+    StreamingRuntimeOutput {
+        session_id: session.id.to_string(),
+        system_prompt: runtime.system_prompt.name.to_string(),
+        response: reply.to_string(),
+        thinking: String::new(),
+        tool_count: runtime.tools.len(),
+        skill_count: runtime.compatibility.skills.len(),
+        mcp_server_count: runtime.compatibility.mcp_servers.len(),
+        tools_executed: 0,
+        tool_uses: Vec::new(),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct AgentToolInput {
     description: String,
@@ -571,6 +620,10 @@ impl Runtime {
     /// Loops across provider turns until no ToolUse or max_turns.
     pub fn submit(&self, session: &mut Session, prompt: &str) -> RuntimeOutput {
         session.push(Role::User, prompt);
+        if let Some(reply) = casual_reply_for_prompt(prompt) {
+            push_casual_assistant_reply(session, reply);
+            return runtime_output_from_reply(self, session, reply);
+        }
         let rt_output = self.run_in_runtime(async { self.submit_loop(session, &mut |_| {}).await });
 
         RuntimeOutput {
@@ -595,6 +648,10 @@ impl Runtime {
         A: Fn(&str, &str, &serde_json::Value) -> bool + Send + Sync,
     {
         session.push(Role::User, prompt);
+        if let Some(reply) = casual_reply_for_prompt(prompt) {
+            push_casual_assistant_reply(session, reply);
+            return runtime_output_from_reply(self, session, reply);
+        }
         let rt_output = self.run_in_runtime(async {
             self.submit_loop_with_approval(session, &mut |_| {}, approval_fn, None)
                 .await
@@ -638,6 +695,10 @@ impl Runtime {
         A: Fn(&str, &str, &serde_json::Value) -> bool + Send + Sync,
     {
         session.push(Role::User, visible_prompt);
+        if let Some(reply) = casual_reply_for_prompt(provider_prompt) {
+            push_casual_assistant_reply(session, reply);
+            return runtime_output_from_reply(self, session, reply);
+        }
         let rt_output = self.run_in_runtime(async {
             self.submit_loop_with_approval(session, &mut |_| {}, approval_fn, Some(provider_prompt))
                 .await
@@ -667,6 +728,14 @@ impl Runtime {
         F: FnMut(&ApiEvent),
     {
         session.push(Role::User, prompt);
+        if let Some(reply) = casual_reply_for_prompt(prompt) {
+            on_event(&ApiEvent::MessageDelta {
+                text: reply.to_string(),
+            });
+            on_event(&ApiEvent::Completed);
+            push_casual_assistant_reply(session, reply);
+            return streaming_output_from_reply(self, session, reply);
+        }
         self.submit_loop(session, &mut on_event).await
     }
 
@@ -683,6 +752,14 @@ impl Runtime {
         A: Fn(&str, &str, &serde_json::Value) -> bool + Send + Sync,
     {
         session.push(Role::User, prompt);
+        if let Some(reply) = casual_reply_for_prompt(prompt) {
+            on_event(&ApiEvent::MessageDelta {
+                text: reply.to_string(),
+            });
+            on_event(&ApiEvent::Completed);
+            push_casual_assistant_reply(session, reply);
+            return streaming_output_from_reply(self, session, reply);
+        }
         self.submit_loop_with_approval(session, &mut on_event, approval_fn, None)
             .await
     }
@@ -700,6 +777,14 @@ impl Runtime {
         A: Fn(&str, &str, &serde_json::Value) -> bool + Send + Sync,
     {
         session.push(Role::User, visible_prompt);
+        if let Some(reply) = execution_prompt.and_then(casual_reply_for_prompt) {
+            on_event(&ApiEvent::MessageDelta {
+                text: reply.to_string(),
+            });
+            on_event(&ApiEvent::Completed);
+            push_casual_assistant_reply(session, reply);
+            return streaming_output_from_reply(self, session, reply);
+        }
         self.submit_loop_with_approval(session, &mut on_event, approval_fn, execution_prompt)
             .await
     }
@@ -1867,7 +1952,7 @@ while True:
         let runtime = make_runtime();
         let mut session = runtime.start_session(PathBuf::from("/tmp"));
 
-        runtime.submit(&mut session, "hello");
+        runtime.submit(&mut session, "please help with a coding task");
 
         let assistant_msg = session
             .messages
@@ -1890,7 +1975,7 @@ while True:
         let runtime = make_runtime();
         let mut session = runtime.start_session(PathBuf::from("/tmp"));
 
-        let output = runtime.submit(&mut session, "hello");
+        let output = runtime.submit(&mut session, "please help with a coding task");
 
         let request = runtime.build_request(&session);
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -3629,7 +3714,7 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
         let output: Option<StreamingRuntimeOutput> = runtime.run_in_runtime(async {
             let mut events: Vec<ApiEvent> = Vec::new();
             let result = runtime
-                .submit_stream(&mut session, "hello", |e| {
+                .submit_stream(&mut session, "please help with a coding task", |e| {
                     events.push(e.clone());
                 })
                 .await;

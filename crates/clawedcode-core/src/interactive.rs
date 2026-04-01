@@ -4,7 +4,7 @@ use crate::{
     content::ContentBlock,
     permissions::PermissionMode,
     prompt::PromptSpec,
-    runtime::Runtime,
+    runtime::{Runtime, casual_reply_for_prompt},
     session::{Role, Session},
     subagent::{
         CompletedSubAgentTask, SubAgentConfig, SubAgentResult, SubAgentRuntime,
@@ -105,6 +105,19 @@ impl TuiContext {
         handler: &mut dyn TuiHandler,
     ) {
         self.session.push(Role::User, visible_prompt);
+
+        if let Some(reply) = execution_prompt
+            .or(Some(visible_prompt))
+            .and_then(casual_reply_for_prompt)
+        {
+            handler.on_event(&TuiEvent::MessageDelta {
+                text: reply.to_string(),
+            });
+            handler.on_event(&TuiEvent::AssistantDone);
+            self.session
+                .push_blocks(Role::Assistant, vec![ContentBlock::text(reply)]);
+            return;
+        }
 
         let request = self
             .runtime
@@ -465,12 +478,6 @@ mod tests {
             handler
                 .events
                 .iter()
-                .any(|e| matches!(e, TuiEvent::ThinkingDelta { .. }))
-        );
-        assert!(
-            handler
-                .events
-                .iter()
                 .any(|e| matches!(e, TuiEvent::MessageDelta { .. }))
         );
         assert!(
@@ -483,7 +490,7 @@ mod tests {
             handler
                 .events
                 .iter()
-                .any(|e| matches!(e, TuiEvent::TurnComplete))
+                .all(|e| !matches!(e, TuiEvent::ThinkingDelta { .. }))
         );
     }
 
@@ -516,7 +523,7 @@ mod tests {
             handler
                 .events
                 .iter()
-                .any(|e| matches!(e, TuiEvent::TurnComplete))
+                .any(|e| matches!(e, TuiEvent::AssistantDone))
         );
         assert!(
             ctx.session
