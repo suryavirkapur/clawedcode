@@ -23,6 +23,14 @@ pub struct UpdateOutcome {
     pub command: String,
 }
 
+pub fn render_update_command(program: &str, args: &[String]) -> String {
+    if args.is_empty() {
+        program.to_string()
+    } else {
+        format!("{program} {}", args.join(" "))
+    }
+}
+
 pub fn detect_install_method() -> InstallMethod {
     match std::env::var("CLAWEDCODE_INSTALL_METHOD").ok().as_deref() {
         Some("npm") => InstallMethod::Npm,
@@ -97,6 +105,7 @@ pub fn plan_self_update() -> Result<UpdatePlan> {
 
 pub fn run_self_update() -> Result<UpdateOutcome> {
     let plan = plan_self_update()?;
+    let command = render_update_command(&plan.program, &plan.args);
     let status = Command::new(&plan.program)
         .args(&plan.args)
         .status()
@@ -104,7 +113,8 @@ pub fn run_self_update() -> Result<UpdateOutcome> {
 
     if !status.success() {
         bail!(
-            "update command exited with status {}",
+            "update command `{}` exited with status {}",
+            command,
             status
                 .code()
                 .map(|code| code.to_string())
@@ -114,7 +124,7 @@ pub fn run_self_update() -> Result<UpdateOutcome> {
 
     Ok(UpdateOutcome {
         method: plan.method,
-        command: format!("{} {}", plan.program, plan.args.join(" ")),
+        command,
     })
 }
 
@@ -129,6 +139,7 @@ fn npm_program_name() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::env_lock;
     use std::path::PathBuf;
 
     #[test]
@@ -150,5 +161,101 @@ mod tests {
     fn detect_install_method_marks_npm_wrapper() {
         let path = PathBuf::from("/usr/lib/node_modules/clawedcode/bin/clawedcode");
         assert_eq!(detect_install_method_from_path(&path), InstallMethod::Npm);
+    }
+
+    #[test]
+    fn plan_self_update_uses_cargo_install_when_detected() {
+        let _guard = env_lock();
+        unsafe { std::env::set_var("CLAWEDCODE_INSTALL_METHOD", "cargo") };
+
+        let plan = plan_self_update().expect("cargo plan");
+        assert_eq!(plan.method, InstallMethod::Cargo);
+        assert_eq!(plan.program, "cargo");
+        assert_eq!(
+            plan.args,
+            vec![
+                "install".to_string(),
+                "clawedcode".to_string(),
+                "--force".to_string()
+            ]
+        );
+
+        unsafe { std::env::remove_var("CLAWEDCODE_INSTALL_METHOD") };
+    }
+
+    #[test]
+    fn plan_self_update_uses_npm_install_when_detected() {
+        let _guard = env_lock();
+        unsafe { std::env::set_var("CLAWEDCODE_INSTALL_METHOD", "npm") };
+
+        let plan = plan_self_update().expect("npm plan");
+        assert_eq!(plan.method, InstallMethod::Npm);
+        assert_eq!(plan.program, npm_program_name());
+        assert_eq!(
+            plan.args,
+            vec![
+                "install".to_string(),
+                "-g".to_string(),
+                "clawedcode@latest".to_string()
+            ]
+        );
+
+        unsafe { std::env::remove_var("CLAWEDCODE_INSTALL_METHOD") };
+    }
+
+    #[test]
+    fn render_update_command_joins_program_and_args() {
+        let command = render_update_command(
+            "cargo",
+            &["install".to_string(), "clawedcode".to_string(), "--force".to_string()],
+        );
+
+        assert_eq!(command, "cargo install clawedcode --force");
+    }
+
+    #[test]
+    fn run_self_update_reports_attempted_command_on_failure() {
+        let _guard = env_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "clawed_update_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let script = dir.join("cargo");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf 'update stderr\\n' >&2\nexit 7\n",
+        )
+        .expect("write script");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).expect("metadata").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).expect("set perms");
+        }
+
+        unsafe { std::env::set_var("CLAWEDCODE_INSTALL_METHOD", "cargo") };
+        let original_path = std::env::var_os("PATH");
+        let new_path = match &original_path {
+            Some(path) => format!("{}:{}", dir.display(), path.to_string_lossy()),
+            None => dir.display().to_string(),
+        };
+        unsafe { std::env::set_var("PATH", new_path) };
+
+        let err = run_self_update().expect_err("failing update should error");
+        let message = err.to_string();
+        assert!(message.contains("update command `cargo install clawedcode --force` exited with status"));
+
+        match original_path {
+            Some(path) => unsafe { std::env::set_var("PATH", path) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+        unsafe { std::env::remove_var("CLAWEDCODE_INSTALL_METHOD") };
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
