@@ -46,6 +46,7 @@ pub struct TuiContext {
     pub sessions_dir: PathBuf,
     pub show_thinking: bool,
     external_turn_executor: Option<Arc<dyn ExternalTurnExecutor>>,
+    startup_prompt: Option<String>,
     last_compatibility_refresh: Instant,
 }
 
@@ -148,8 +149,17 @@ impl TuiContext {
             sessions_dir,
             show_thinking,
             external_turn_executor,
+            startup_prompt: None,
             last_compatibility_refresh: Instant::now(),
         }
+    }
+
+    pub fn set_startup_prompt(&mut self, prompt: Option<String>) {
+        self.startup_prompt = prompt;
+    }
+
+    pub fn take_startup_prompt(&mut self) -> Option<String> {
+        self.startup_prompt.take()
     }
 
     pub fn submit_interactive(&mut self, prompt: &str, handler: &mut dyn TuiHandler) {
@@ -636,6 +646,16 @@ mod tests {
                 .iter()
                 .any(|m| m.role == Role::Assistant)
         );
+    }
+
+    #[test]
+    fn startup_prompt_is_stored_and_taken_once() {
+        let mut ctx = make_context();
+
+        ctx.set_startup_prompt(Some("hello".to_string()));
+
+        assert_eq!(ctx.take_startup_prompt().as_deref(), Some("hello"));
+        assert_eq!(ctx.take_startup_prompt(), None);
     }
 
     #[test]

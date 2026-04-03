@@ -948,13 +948,14 @@ fn execute_transport_tui(
     data_dir: Option<PathBuf>,
     config: AppConfig,
     compatibility: compat::CompatibilitySnapshot,
+    startup_prompt: Option<String>,
     system_prompt_override: Option<String>,
     session_mode: SessionMode,
     executor: Arc<dyn ExternalTurnExecutor>,
 ) -> Result<()> {
     let sessions_dir = session_store_dir(data_dir)
         .context("no sessions directory available")?;
-    let ctx = TuiContext::with_external_turn_executor(
+    let mut ctx = TuiContext::with_external_turn_executor(
         config,
         resolve_prompt(system_prompt_override.as_deref()),
         compatibility,
@@ -963,6 +964,7 @@ fn execute_transport_tui(
         session_mode,
         executor,
     );
+    ctx.set_startup_prompt(startup_prompt);
     tui::run_with_context(ctx)
 }
 
@@ -978,6 +980,7 @@ async fn execute_direct_connect(
             cli.data_dir.clone(),
             config,
             compatibility,
+            direct_connect_mode.prompt.clone(),
             direct_connect_mode.system_prompt.clone(),
             SessionMode::DirectConnect,
             Arc::new(InteractiveTransportExecutor::new_direct_connect(
@@ -1008,6 +1011,7 @@ async fn execute_ssh(
             cli.data_dir.clone(),
             config,
             compatibility,
+            ssh_mode.prompt.clone(),
             ssh_mode.system_prompt.clone(),
             SessionMode::Ssh,
             Arc::new(InteractiveTransportExecutor::new_ssh(
@@ -1038,6 +1042,7 @@ async fn execute_remote(
             cli.data_dir.clone(),
             config,
             compatibility,
+            remote_mode.prompt.clone(),
             remote_mode.system_prompt.clone(),
             SessionMode::Remote,
             Arc::new(InteractiveTransportExecutor::new_remote(

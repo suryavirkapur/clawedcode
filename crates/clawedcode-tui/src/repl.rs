@@ -421,6 +421,11 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     let mut last_area = Rect::default();
     let mut onboarding_seen_recorded = false;
 
+    if let Some(prompt) = ctx.take_startup_prompt() {
+        handler.begin_live_turn(prompt.clone());
+        active_turn = Some(spawn_turn_worker(ctx, prompt, None));
+    }
+
     loop {
         integrate_completed_subagents(ctx, &mut handler);
         drain_turn_events(ctx, &mut handler, &mut active_turn, &mut awaiting_approval);
