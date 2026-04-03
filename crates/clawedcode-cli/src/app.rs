@@ -434,9 +434,16 @@ struct TransportOutput {
     stderr: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportPromptSource {
+    Argument,
+    Stdin,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TransportCommandSpec {
     transport_name: &'static str,
+    destination: String,
     program: OsString,
     args: Vec<OsString>,
 }
@@ -455,20 +462,74 @@ fn remote_binary() -> OsString {
         .unwrap_or_else(|| OsString::from("clawedcode-remote"))
 }
 
-fn resolve_transport_prompt_from_reader<R: Read>(prompt: Option<String>, reader: &mut R) -> Result<String> {
+fn resolve_transport_prompt_from_reader<R: Read>(
+    transport_name: &'static str,
+    prompt: Option<String>,
+    reader: &mut R,
+    stdin_is_tty: bool,
+) -> Result<(String, TransportPromptSource)> {
     match prompt {
-        Some(prompt) if !prompt.trim().is_empty() => Ok(prompt),
+        Some(prompt) if !prompt.trim().is_empty() => Ok((prompt, TransportPromptSource::Argument)),
+        _ if stdin_is_tty => {
+            anyhow::bail!(
+                "{transport_name} transport requires a prompt. Pass --prompt or pipe one on stdin."
+            );
+        }
         _ => {
             let mut input = String::new();
             reader.read_to_string(&mut input)?;
-            Ok(input.trim().to_string())
+            let prompt = input.trim().to_string();
+            if prompt.is_empty() {
+                anyhow::bail!(
+                    "{transport_name} transport received an empty prompt from stdin."
+                );
+            }
+            Ok((prompt, TransportPromptSource::Stdin))
         }
     }
 }
 
-fn resolve_transport_prompt(prompt: Option<String>) -> Result<String> {
+fn resolve_transport_prompt(
+    transport_name: &'static str,
+    prompt: Option<String>,
+) -> Result<(String, TransportPromptSource)> {
     let mut stdin = std::io::stdin();
-    resolve_transport_prompt_from_reader(prompt, &mut stdin)
+    resolve_transport_prompt_from_reader(
+        transport_name,
+        prompt,
+        &mut stdin,
+        atty::is(atty::Stream::Stdin),
+    )
+}
+
+fn append_common_headless_args(
+    args: &mut Vec<OsString>,
+    cwd: &Path,
+    prompt: &str,
+    system_prompt: Option<&String>,
+    json: bool,
+    show_thinking: bool,
+    yes: bool,
+) {
+    args.push(OsString::from("--cwd"));
+    args.push(cwd.as_os_str().to_os_string());
+    args.push(OsString::from("headless"));
+    args.push(OsString::from("--prompt"));
+    args.push(OsString::from(prompt));
+
+    if let Some(system_prompt) = system_prompt {
+        args.push(OsString::from("--system-prompt"));
+        args.push(OsString::from(system_prompt));
+    }
+    if json {
+        args.push(OsString::from("--json"));
+    }
+    if show_thinking {
+        args.push(OsString::from("--show-thinking"));
+    }
+    if yes {
+        args.push(OsString::from("-y"));
+    }
 }
 
 fn build_ssh_command_spec(
@@ -479,29 +540,20 @@ fn build_ssh_command_spec(
     let mut args = vec![
         OsString::from(&ssh_mode.target),
         OsString::from("clawedcode"),
-        OsString::from("--cwd"),
-        cwd.as_os_str().to_os_string(),
-        OsString::from("headless"),
-        OsString::from("--prompt"),
-        OsString::from(prompt),
     ];
-
-    if let Some(system_prompt) = ssh_mode.system_prompt.as_ref() {
-        args.push(OsString::from("--system-prompt"));
-        args.push(OsString::from(system_prompt));
-    }
-    if ssh_mode.json {
-        args.push(OsString::from("--json"));
-    }
-    if ssh_mode.show_thinking {
-        args.push(OsString::from("--show-thinking"));
-    }
-    if ssh_mode.yes {
-        args.push(OsString::from("-y"));
-    }
+    append_common_headless_args(
+        &mut args,
+        cwd,
+        prompt,
+        ssh_mode.system_prompt.as_ref(),
+        ssh_mode.json,
+        ssh_mode.show_thinking,
+        ssh_mode.yes,
+    );
 
     TransportCommandSpec {
         transport_name: "ssh",
+        destination: ssh_mode.target.clone(),
         program: ssh_binary(),
         args,
     }
@@ -515,29 +567,20 @@ fn build_direct_connect_command_spec(
     let mut args = vec![
         OsString::from(&dc_mode.address),
         OsString::from("clawedcode"),
-        OsString::from("--cwd"),
-        cwd.as_os_str().to_os_string(),
-        OsString::from("headless"),
-        OsString::from("--prompt"),
-        OsString::from(prompt),
     ];
-
-    if let Some(system_prompt) = dc_mode.system_prompt.as_ref() {
-        args.push(OsString::from("--system-prompt"));
-        args.push(OsString::from(system_prompt));
-    }
-    if dc_mode.json {
-        args.push(OsString::from("--json"));
-    }
-    if dc_mode.show_thinking {
-        args.push(OsString::from("--show-thinking"));
-    }
-    if dc_mode.yes {
-        args.push(OsString::from("-y"));
-    }
+    append_common_headless_args(
+        &mut args,
+        cwd,
+        prompt,
+        dc_mode.system_prompt.as_ref(),
+        dc_mode.json,
+        dc_mode.show_thinking,
+        dc_mode.yes,
+    );
 
     TransportCommandSpec {
         transport_name: "direct-connect",
+        destination: dc_mode.address.clone(),
         program: direct_connect_binary(),
         args,
     }
@@ -551,29 +594,20 @@ fn build_remote_command_spec(
     let mut args = vec![
         OsString::from(&remote_mode.orchestrator),
         OsString::from("clawedcode"),
-        OsString::from("--cwd"),
-        cwd.as_os_str().to_os_string(),
-        OsString::from("headless"),
-        OsString::from("--prompt"),
-        OsString::from(prompt),
     ];
-
-    if let Some(system_prompt) = remote_mode.system_prompt.as_ref() {
-        args.push(OsString::from("--system-prompt"));
-        args.push(OsString::from(system_prompt));
-    }
-    if remote_mode.json {
-        args.push(OsString::from("--json"));
-    }
-    if remote_mode.show_thinking {
-        args.push(OsString::from("--show-thinking"));
-    }
-    if remote_mode.yes {
-        args.push(OsString::from("-y"));
-    }
+    append_common_headless_args(
+        &mut args,
+        cwd,
+        prompt,
+        remote_mode.system_prompt.as_ref(),
+        remote_mode.json,
+        remote_mode.show_thinking,
+        remote_mode.yes,
+    );
 
     TransportCommandSpec {
         transport_name: "remote",
+        destination: remote_mode.orchestrator.clone(),
         program: remote_binary(),
         args,
     }
@@ -583,22 +617,49 @@ fn transport_program_display(program: &OsString) -> String {
     PathBuf::from(program).display().to_string()
 }
 
+fn transport_launch_banner(
+    spec: &TransportCommandSpec,
+    cwd: &Path,
+    prompt_source: TransportPromptSource,
+) -> Vec<String> {
+    let mut lines = vec![
+        format!(
+            "[{}] Launching headless session on `{}` via `{}`",
+            spec.transport_name,
+            spec.destination,
+            transport_program_display(&spec.program)
+        ),
+        format!("[{}] Working directory: {}", spec.transport_name, cwd.display()),
+    ];
+
+    if matches!(prompt_source, TransportPromptSource::Stdin) {
+        lines.push(format!(
+            "[{}] Prompt source: stdin",
+            spec.transport_name
+        ));
+    }
+
+    lines
+}
+
 fn run_transport_command(spec: &TransportCommandSpec) -> Result<TransportOutput> {
     let output = match ProcessCommand::new(&spec.program).args(&spec.args).output() {
         Ok(output) => output,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             anyhow::bail!(
-                "{} transport binary not found: {}",
+                "{} transport binary not found via `{}` for `{}`",
                 spec.transport_name,
-                transport_program_display(&spec.program)
+                transport_program_display(&spec.program),
+                spec.destination
             );
         }
         Err(err) => {
             return Err(err).with_context(|| {
                 format!(
-                    "failed to launch {} transport via {}",
+                    "failed to launch {} transport via `{}` for `{}`",
                     spec.transport_name,
-                    transport_program_display(&spec.program)
+                    transport_program_display(&spec.program),
+                    spec.destination
                 )
             });
         }
@@ -613,35 +674,67 @@ fn run_transport_command(spec: &TransportCommandSpec) -> Result<TransportOutput>
         } else if !stdout.trim().is_empty() {
             stdout.trim().to_string()
         } else {
-            format!("{} exited with status {}", spec.transport_name, output.status)
+            format!("exited with status {}", output.status)
         };
-        anyhow::bail!("{} transport failed: {detail}", spec.transport_name);
+        anyhow::bail!(
+            "{} transport via `{}` for `{}` failed: {detail}",
+            spec.transport_name,
+            transport_program_display(&spec.program),
+            spec.destination
+        );
     }
 
     Ok(TransportOutput { stdout, stderr })
 }
 
-fn run_ssh_headless(cwd: &Path, ssh_mode: &crate::bootstrap::SshMode) -> Result<TransportOutput> {
-    let prompt = resolve_transport_prompt(ssh_mode.prompt.clone())?;
+fn prepare_ssh_headless(
+    cwd: &Path,
+    ssh_mode: &crate::bootstrap::SshMode,
+) -> Result<(TransportCommandSpec, TransportPromptSource)> {
+    let (prompt, prompt_source) = resolve_transport_prompt("ssh", ssh_mode.prompt.clone())?;
     let spec = build_ssh_command_spec(cwd, ssh_mode, &prompt);
+    Ok((spec, prompt_source))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn run_ssh_headless(cwd: &Path, ssh_mode: &crate::bootstrap::SshMode) -> Result<TransportOutput> {
+    let (spec, _) = prepare_ssh_headless(cwd, ssh_mode)?;
     run_transport_command(&spec)
 }
 
+fn prepare_direct_connect_headless(
+    cwd: &Path,
+    dc_mode: &crate::bootstrap::DirectConnectMode,
+) -> Result<(TransportCommandSpec, TransportPromptSource)> {
+    let (prompt, prompt_source) = resolve_transport_prompt("direct-connect", dc_mode.prompt.clone())?;
+    let spec = build_direct_connect_command_spec(cwd, dc_mode, &prompt);
+    Ok((spec, prompt_source))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn run_direct_connect_headless(
     cwd: &Path,
     dc_mode: &crate::bootstrap::DirectConnectMode,
 ) -> Result<TransportOutput> {
-    let prompt = resolve_transport_prompt(dc_mode.prompt.clone())?;
-    let spec = build_direct_connect_command_spec(cwd, dc_mode, &prompt);
+    let (spec, _) = prepare_direct_connect_headless(cwd, dc_mode)?;
     run_transport_command(&spec)
 }
 
+fn prepare_remote_headless(
+    cwd: &Path,
+    remote_mode: &crate::bootstrap::RemoteMode,
+) -> Result<(TransportCommandSpec, TransportPromptSource)> {
+    let (prompt, prompt_source) = resolve_transport_prompt("remote", remote_mode.prompt.clone())?;
+    let spec = build_remote_command_spec(cwd, remote_mode, &prompt);
+    Ok((spec, prompt_source))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn run_remote_headless(
     cwd: &Path,
     remote_mode: &crate::bootstrap::RemoteMode,
 ) -> Result<TransportOutput> {
-    let prompt = resolve_transport_prompt(remote_mode.prompt.clone())?;
-    let spec = build_remote_command_spec(cwd, remote_mode, &prompt);
+    let (spec, _) = prepare_remote_headless(cwd, remote_mode)?;
     run_transport_command(&spec)
 }
 
@@ -651,17 +744,14 @@ async fn execute_direct_connect(
     _compatibility: compat::CompatibilitySnapshot,
     direct_connect_mode: crate::bootstrap::DirectConnectMode,
 ) -> Result<()> {
+    let (spec, prompt_source) = prepare_direct_connect_headless(&cli.cwd, &direct_connect_mode)?;
     if !direct_connect_mode.json {
-        eprintln!(
-            "direct-connect mode currently runs a one-shot remote headless session; interactive direct-connect parity is still pending"
-        );
+        for line in transport_launch_banner(&spec, &cli.cwd, prompt_source) {
+            eprintln!("{line}");
+        }
     }
-
-    let output = run_direct_connect_headless(&cli.cwd, &direct_connect_mode)?;
-    if !output.stderr.is_empty() {
-        eprint!("{}", output.stderr);
-    }
-    print!("{}", output.stdout);
+    let output = run_transport_command(&spec)?;
+    emit_transport_output(&output);
     Ok(())
 }
 
@@ -671,17 +761,14 @@ async fn execute_ssh(
     _compatibility: compat::CompatibilitySnapshot,
     ssh_mode: crate::bootstrap::SshMode,
 ) -> Result<()> {
+    let (spec, prompt_source) = prepare_ssh_headless(&cli.cwd, &ssh_mode)?;
     if !ssh_mode.json {
-        eprintln!(
-            "ssh mode currently runs a one-shot remote headless session; interactive ssh parity is still pending"
-        );
+        for line in transport_launch_banner(&spec, &cli.cwd, prompt_source) {
+            eprintln!("{line}");
+        }
     }
-
-    let output = run_ssh_headless(&cli.cwd, &ssh_mode)?;
-    if !output.stderr.is_empty() {
-        eprint!("{}", output.stderr);
-    }
-    print!("{}", output.stdout);
+    let output = run_transport_command(&spec)?;
+    emit_transport_output(&output);
     Ok(())
 }
 
@@ -691,18 +778,22 @@ async fn execute_remote(
     _compatibility: compat::CompatibilitySnapshot,
     remote_mode: crate::bootstrap::RemoteMode,
 ) -> Result<()> {
+    let (spec, prompt_source) = prepare_remote_headless(&cli.cwd, &remote_mode)?;
     if !remote_mode.json {
-        eprintln!(
-            "remote mode currently runs a one-shot remote headless session; interactive remote parity is still pending"
-        );
+        for line in transport_launch_banner(&spec, &cli.cwd, prompt_source) {
+            eprintln!("{line}");
+        }
     }
+    let output = run_transport_command(&spec)?;
+    emit_transport_output(&output);
+    Ok(())
+}
 
-    let output = run_remote_headless(&cli.cwd, &remote_mode)?;
+fn emit_transport_output(output: &TransportOutput) {
     if !output.stderr.is_empty() {
         eprint!("{}", output.stderr);
     }
     print!("{}", output.stdout);
-    Ok(())
 }
 
 fn session_store_dir(explicit_data_dir: Option<PathBuf>) -> Option<PathBuf> {
@@ -811,17 +902,63 @@ mod tests {
     #[test]
     fn resolve_transport_prompt_prefers_explicit_prompt() {
         let mut reader = Cursor::new("ignored stdin");
-        let prompt =
-            resolve_transport_prompt_from_reader(Some("explicit prompt".to_string()), &mut reader)
-                .unwrap();
+        let (prompt, source) = resolve_transport_prompt_from_reader(
+            "ssh",
+            Some("explicit prompt".to_string()),
+            &mut reader,
+            false,
+        )
+        .unwrap();
         assert_eq!(prompt, "explicit prompt");
+        assert_eq!(source, TransportPromptSource::Argument);
     }
 
     #[test]
     fn resolve_transport_prompt_reads_from_reader_when_missing() {
         let mut reader = Cursor::new("  streamed prompt  ");
-        let prompt = resolve_transport_prompt_from_reader(None, &mut reader).unwrap();
+        let (prompt, source) =
+            resolve_transport_prompt_from_reader("remote", None, &mut reader, false).unwrap();
         assert_eq!(prompt, "streamed prompt");
+        assert_eq!(source, TransportPromptSource::Stdin);
+    }
+
+    #[test]
+    fn resolve_transport_prompt_errors_on_tty_without_prompt() {
+        let mut reader = Cursor::new("");
+        let err = resolve_transport_prompt_from_reader("ssh", None, &mut reader, true)
+            .expect_err("missing tty prompt should fail");
+        assert!(err.to_string().contains("ssh transport requires a prompt"));
+    }
+
+    #[test]
+    fn resolve_transport_prompt_errors_on_empty_stdin_prompt() {
+        let mut reader = Cursor::new("   ");
+        let err = resolve_transport_prompt_from_reader("remote", None, &mut reader, false)
+            .expect_err("empty stdin prompt should fail");
+        assert!(
+            err.to_string()
+                .contains("remote transport received an empty prompt from stdin")
+        );
+    }
+
+    #[test]
+    fn transport_launch_banner_mentions_transport_destination_and_source() {
+        let spec = TransportCommandSpec {
+            transport_name: "ssh",
+            destination: "devbox".to_string(),
+            program: OsString::from("/tmp/fake-ssh"),
+            args: vec![],
+        };
+
+        let lines = transport_launch_banner(&spec, Path::new("/repo"), TransportPromptSource::Stdin);
+        assert_eq!(
+            lines,
+            vec![
+                "[ssh] Launching headless session on `devbox` via `/tmp/fake-ssh`".to_string(),
+                "[ssh] Working directory: /repo".to_string(),
+                "[ssh] Prompt source: stdin".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -1168,8 +1305,8 @@ mod tests {
         let err = run_ssh_headless(Path::new("/workspace"), &ssh_mode)
             .expect_err("missing ssh binary should fail");
         let message = err.to_string();
-        assert!(message.contains("ssh transport binary not found"));
-        assert!(message.contains("/tmp/does-not-exist-ssh"));
+        assert!(message.contains("ssh transport binary not found via `/tmp/does-not-exist-ssh`"));
+        assert!(message.contains("for `devbox`"));
 
         unsafe { std::env::remove_var("CLAWEDCODE_SSH_BIN") };
     }
@@ -1196,8 +1333,10 @@ mod tests {
         let err = run_direct_connect_headless(Path::new("/workspace"), &dc_mode)
             .expect_err("missing direct-connect binary should fail");
         let message = err.to_string();
-        assert!(message.contains("direct-connect transport binary not found"));
-        assert!(message.contains("/tmp/does-not-exist-direct-connect"));
+        assert!(message.contains(
+            "direct-connect transport binary not found via `/tmp/does-not-exist-direct-connect`"
+        ));
+        assert!(message.contains("for `localhost:9000`"));
 
         unsafe { std::env::remove_var("CLAWEDCODE_DIRECT_CONNECT_BIN") };
     }
@@ -1219,8 +1358,8 @@ mod tests {
         let err = run_remote_headless(Path::new("/workspace"), &remote_mode)
             .expect_err("missing remote binary should fail");
         let message = err.to_string();
-        assert!(message.contains("remote transport binary not found"));
-        assert!(message.contains("/tmp/does-not-exist-remote"));
+        assert!(message.contains("remote transport binary not found via `/tmp/does-not-exist-remote`"));
+        assert!(message.contains("for `my-orchestrator.local`"));
 
         unsafe { std::env::remove_var("CLAWEDCODE_REMOTE_BIN") };
     }
