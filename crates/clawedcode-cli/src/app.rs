@@ -4,10 +4,10 @@ use clawedcode_core::{
     compat,
     config::AppConfig,
     config::default_data_dir,
-    interactive::TuiContext,
+    interactive::{ExternalTurnExecutor, ExternalTurnResult, TuiContext},
     permissions::PermissionMode,
     prompt::{builtin_prompts, resolve_prompt},
-    runtime::{ApprovalFn, Runtime},
+    runtime::{ApprovalFn, Runtime, RuntimeOutput},
     session::{Session, SessionMode},
 };
 use clawedcode_tools::builtin_tools;
@@ -18,6 +18,7 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
+    sync::Arc,
 };
 
 use crate::bootstrap::{BootstrappedApp, ExecutionMode};
@@ -448,6 +449,19 @@ struct TransportCommandSpec {
     args: Vec<OsString>,
 }
 
+#[derive(Debug, Clone)]
+enum InteractiveTransportMode {
+    Ssh(crate::bootstrap::SshMode),
+    DirectConnect(crate::bootstrap::DirectConnectMode),
+    Remote(crate::bootstrap::RemoteMode),
+}
+
+#[derive(Debug, Clone)]
+struct InteractiveTransportExecutor {
+    cwd: PathBuf,
+    mode: InteractiveTransportMode,
+}
+
 fn ssh_binary() -> OsString {
     std::env::var_os("CLAWEDCODE_SSH_BIN").unwrap_or_else(|| OsString::from("ssh"))
 }
@@ -613,6 +627,197 @@ fn build_remote_command_spec(
     }
 }
 
+fn append_common_interactive_run_args(
+    args: &mut Vec<OsString>,
+    cwd: &Path,
+    prompt: &str,
+    system_prompt: Option<&String>,
+) {
+    args.push(OsString::from("--cwd"));
+    args.push(cwd.as_os_str().to_os_string());
+    args.push(OsString::from("run"));
+    args.push(OsString::from("--prompt"));
+    args.push(OsString::from(prompt));
+    if let Some(system_prompt) = system_prompt {
+        args.push(OsString::from("--system-prompt"));
+        args.push(OsString::from(system_prompt));
+    }
+    args.push(OsString::from("--json"));
+    // Interactive transport turns cannot bridge remote approval requests yet.
+    // Force remote auto-approval so the local TUI does not deadlock on an
+    // approval prompt it cannot answer over this transport boundary.
+    args.push(OsString::from("-y"));
+}
+
+fn append_common_interactive_resume_args(
+    args: &mut Vec<OsString>,
+    cwd: &Path,
+    transport_session_id: &str,
+    prompt: &str,
+) {
+    args.push(OsString::from("--cwd"));
+    args.push(cwd.as_os_str().to_os_string());
+    args.push(OsString::from("resume"));
+    args.push(OsString::from(transport_session_id));
+    args.push(OsString::from("--prompt"));
+    args.push(OsString::from(prompt));
+    args.push(OsString::from("--json"));
+    args.push(OsString::from("-y"));
+}
+
+impl InteractiveTransportExecutor {
+    fn new_ssh(cwd: PathBuf, mode: crate::bootstrap::SshMode) -> Self {
+        Self {
+            cwd,
+            mode: InteractiveTransportMode::Ssh(mode),
+        }
+    }
+
+    fn new_direct_connect(cwd: PathBuf, mode: crate::bootstrap::DirectConnectMode) -> Self {
+        Self {
+            cwd,
+            mode: InteractiveTransportMode::DirectConnect(mode),
+        }
+    }
+
+    fn new_remote(cwd: PathBuf, mode: crate::bootstrap::RemoteMode) -> Self {
+        Self {
+            cwd,
+            mode: InteractiveTransportMode::Remote(mode),
+        }
+    }
+
+    fn build_run_spec(&self, prompt: &str) -> TransportCommandSpec {
+        match &self.mode {
+            InteractiveTransportMode::Ssh(mode) => {
+                let mut args = vec![OsString::from(&mode.target), OsString::from("clawedcode")];
+                append_common_interactive_run_args(
+                    &mut args,
+                    &self.cwd,
+                    prompt,
+                    mode.system_prompt.as_ref(),
+                );
+                TransportCommandSpec {
+                    transport_name: "ssh",
+                    destination: mode.target.clone(),
+                    program: ssh_binary(),
+                    args,
+                }
+            }
+            InteractiveTransportMode::DirectConnect(mode) => {
+                let mut args = vec![OsString::from(&mode.address), OsString::from("clawedcode")];
+                append_common_interactive_run_args(
+                    &mut args,
+                    &self.cwd,
+                    prompt,
+                    mode.system_prompt.as_ref(),
+                );
+                TransportCommandSpec {
+                    transport_name: "direct-connect",
+                    destination: mode.address.clone(),
+                    program: direct_connect_binary(),
+                    args,
+                }
+            }
+            InteractiveTransportMode::Remote(mode) => {
+                let mut args =
+                    vec![OsString::from(&mode.orchestrator), OsString::from("clawedcode")];
+                append_common_interactive_run_args(
+                    &mut args,
+                    &self.cwd,
+                    prompt,
+                    mode.system_prompt.as_ref(),
+                );
+                TransportCommandSpec {
+                    transport_name: "remote",
+                    destination: mode.orchestrator.clone(),
+                    program: remote_binary(),
+                    args,
+                }
+            }
+        }
+    }
+
+    fn build_resume_spec(&self, transport_session_id: &str, prompt: &str) -> TransportCommandSpec {
+        match &self.mode {
+            InteractiveTransportMode::Ssh(mode) => {
+                let mut args = vec![OsString::from(&mode.target), OsString::from("clawedcode")];
+                append_common_interactive_resume_args(
+                    &mut args,
+                    &self.cwd,
+                    transport_session_id,
+                    prompt,
+                );
+                TransportCommandSpec {
+                    transport_name: "ssh",
+                    destination: mode.target.clone(),
+                    program: ssh_binary(),
+                    args,
+                }
+            }
+            InteractiveTransportMode::DirectConnect(mode) => {
+                let mut args = vec![OsString::from(&mode.address), OsString::from("clawedcode")];
+                append_common_interactive_resume_args(
+                    &mut args,
+                    &self.cwd,
+                    transport_session_id,
+                    prompt,
+                );
+                TransportCommandSpec {
+                    transport_name: "direct-connect",
+                    destination: mode.address.clone(),
+                    program: direct_connect_binary(),
+                    args,
+                }
+            }
+            InteractiveTransportMode::Remote(mode) => {
+                let mut args =
+                    vec![OsString::from(&mode.orchestrator), OsString::from("clawedcode")];
+                append_common_interactive_resume_args(
+                    &mut args,
+                    &self.cwd,
+                    transport_session_id,
+                    prompt,
+                );
+                TransportCommandSpec {
+                    transport_name: "remote",
+                    destination: mode.orchestrator.clone(),
+                    program: remote_binary(),
+                    args,
+                }
+            }
+        }
+    }
+}
+
+impl ExternalTurnExecutor for InteractiveTransportExecutor {
+    fn submit_turn(
+        &self,
+        session: &mut Session,
+        visible_prompt: &str,
+        execution_prompt: Option<&str>,
+    ) -> Result<ExternalTurnResult> {
+        let prompt = execution_prompt.unwrap_or(visible_prompt);
+        let spec = if let Some(transport_session_id) = session.transport_session_id.as_deref() {
+            self.build_resume_spec(transport_session_id, prompt)
+        } else {
+            self.build_run_spec(prompt)
+        };
+        let output = run_transport_command(&spec)?;
+        let response: RuntimeOutput = serde_json::from_str(&output.stdout).with_context(|| {
+            format!(
+                "failed to parse {} interactive transport JSON output",
+                spec.transport_name
+            )
+        })?;
+        session.transport_session_id = Some(response.session_id.clone());
+        Ok(ExternalTurnResult {
+            response: response.response,
+            transport_session_id: Some(response.session_id),
+        })
+    }
+}
+
 fn transport_program_display(program: &OsString) -> String {
     PathBuf::from(program).display().to_string()
 }
@@ -738,17 +943,53 @@ fn run_remote_headless(
     run_transport_command(&spec)
 }
 
+fn execute_transport_tui(
+    cwd: PathBuf,
+    data_dir: Option<PathBuf>,
+    config: AppConfig,
+    compatibility: compat::CompatibilitySnapshot,
+    system_prompt_override: Option<String>,
+    session_mode: SessionMode,
+    executor: Arc<dyn ExternalTurnExecutor>,
+) -> Result<()> {
+    let sessions_dir = session_store_dir(data_dir)
+        .context("no sessions directory available")?;
+    let ctx = TuiContext::with_external_turn_executor(
+        config,
+        resolve_prompt(system_prompt_override.as_deref()),
+        compatibility,
+        cwd,
+        sessions_dir,
+        session_mode,
+        executor,
+    );
+    tui::run_with_context(ctx)
+}
+
 async fn execute_direct_connect(
     cli: Cli,
-    _config: AppConfig,
-    _compatibility: compat::CompatibilitySnapshot,
+    config: AppConfig,
+    compatibility: compat::CompatibilitySnapshot,
     direct_connect_mode: crate::bootstrap::DirectConnectMode,
 ) -> Result<()> {
-    let (spec, prompt_source) = prepare_direct_connect_headless(&cli.cwd, &direct_connect_mode)?;
     if !direct_connect_mode.json {
-        for line in transport_launch_banner(&spec, &cli.cwd, prompt_source) {
-            eprintln!("{line}");
-        }
+        return execute_transport_tui(
+            cli.cwd.clone(),
+            cli.data_dir.clone(),
+            config,
+            compatibility,
+            direct_connect_mode.system_prompt.clone(),
+            SessionMode::DirectConnect,
+            Arc::new(InteractiveTransportExecutor::new_direct_connect(
+                cli.cwd.clone(),
+                direct_connect_mode,
+            )),
+        );
+    }
+
+    let (spec, prompt_source) = prepare_direct_connect_headless(&cli.cwd, &direct_connect_mode)?;
+    for line in transport_launch_banner(&spec, &cli.cwd, prompt_source) {
+        eprintln!("{line}");
     }
     let output = run_transport_command(&spec)?;
     emit_transport_output(&output);
@@ -757,15 +998,28 @@ async fn execute_direct_connect(
 
 async fn execute_ssh(
     cli: Cli,
-    _config: AppConfig,
-    _compatibility: compat::CompatibilitySnapshot,
+    config: AppConfig,
+    compatibility: compat::CompatibilitySnapshot,
     ssh_mode: crate::bootstrap::SshMode,
 ) -> Result<()> {
-    let (spec, prompt_source) = prepare_ssh_headless(&cli.cwd, &ssh_mode)?;
     if !ssh_mode.json {
-        for line in transport_launch_banner(&spec, &cli.cwd, prompt_source) {
-            eprintln!("{line}");
-        }
+        return execute_transport_tui(
+            cli.cwd.clone(),
+            cli.data_dir.clone(),
+            config,
+            compatibility,
+            ssh_mode.system_prompt.clone(),
+            SessionMode::Ssh,
+            Arc::new(InteractiveTransportExecutor::new_ssh(
+                cli.cwd.clone(),
+                ssh_mode,
+            )),
+        );
+    }
+
+    let (spec, prompt_source) = prepare_ssh_headless(&cli.cwd, &ssh_mode)?;
+    for line in transport_launch_banner(&spec, &cli.cwd, prompt_source) {
+        eprintln!("{line}");
     }
     let output = run_transport_command(&spec)?;
     emit_transport_output(&output);
@@ -774,15 +1028,28 @@ async fn execute_ssh(
 
 async fn execute_remote(
     cli: Cli,
-    _config: AppConfig,
-    _compatibility: compat::CompatibilitySnapshot,
+    config: AppConfig,
+    compatibility: compat::CompatibilitySnapshot,
     remote_mode: crate::bootstrap::RemoteMode,
 ) -> Result<()> {
-    let (spec, prompt_source) = prepare_remote_headless(&cli.cwd, &remote_mode)?;
     if !remote_mode.json {
-        for line in transport_launch_banner(&spec, &cli.cwd, prompt_source) {
-            eprintln!("{line}");
-        }
+        return execute_transport_tui(
+            cli.cwd.clone(),
+            cli.data_dir.clone(),
+            config,
+            compatibility,
+            remote_mode.system_prompt.clone(),
+            SessionMode::Remote,
+            Arc::new(InteractiveTransportExecutor::new_remote(
+                cli.cwd.clone(),
+                remote_mode,
+            )),
+        );
+    }
+
+    let (spec, prompt_source) = prepare_remote_headless(&cli.cwd, &remote_mode)?;
+    for line in transport_launch_banner(&spec, &cli.cwd, prompt_source) {
+        eprintln!("{line}");
     }
     let output = run_transport_command(&spec)?;
     emit_transport_output(&output);
@@ -1361,6 +1628,149 @@ mod tests {
         assert!(message.contains("remote transport binary not found via `/tmp/does-not-exist-remote`"));
         assert!(message.contains("for `my-orchestrator.local`"));
 
+        unsafe { std::env::remove_var("CLAWEDCODE_REMOTE_BIN") };
+    }
+
+    #[test]
+    fn interactive_ssh_executor_uses_run_then_resume() {
+        let _guard = env_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "clawed_interactive_ssh_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script_path = dir.join("fake-ssh.sh");
+        let capture_path = dir.join("argv.txt");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{capture}\"\nprintf '{{\"session_id\":\"remote-abc\",\"system_prompt\":\"system\",\"response\":\"remote ok\",\"tool_count\":0,\"skill_count\":0,\"mcp_server_count\":0,\"tools_executed\":0}}'\n",
+                capture = capture_path.display()
+            ),
+        )
+        .unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).unwrap();
+        }
+
+        unsafe { std::env::set_var("CLAWEDCODE_SSH_BIN", &script_path) };
+        let executor = InteractiveTransportExecutor::new_ssh(
+            PathBuf::from("/workspace"),
+            crate::bootstrap::SshMode {
+                target: "devbox".to_string(),
+                prompt: None,
+                system_prompt: Some("system".to_string()),
+                json: false,
+                show_thinking: false,
+                yes: false,
+            },
+        );
+        let mut session = Session::with_mode(PathBuf::from("/workspace"), SessionMode::Ssh);
+
+        let first = executor.submit_turn(&mut session, "hello", None).unwrap();
+        assert_eq!(first.transport_session_id.as_deref(), Some("remote-abc"));
+        session.transport_session_id = first.transport_session_id.clone();
+
+        let second = executor
+            .submit_turn(&mut session, "next", Some("resume prompt"))
+            .unwrap();
+        assert_eq!(second.transport_session_id.as_deref(), Some("remote-abc"));
+
+        let argv = std::fs::read_to_string(&capture_path).unwrap();
+        let args: Vec<&str> = argv.lines().collect();
+        assert_eq!(
+            args,
+            vec![
+                "devbox",
+                "clawedcode",
+                "--cwd",
+                "/workspace",
+                "run",
+                "--prompt",
+                "hello",
+                "--system-prompt",
+                "system",
+                "--json",
+                "-y",
+                "devbox",
+                "clawedcode",
+                "--cwd",
+                "/workspace",
+                "resume",
+                "remote-abc",
+                "--prompt",
+                "resume prompt",
+                "--json",
+                "-y",
+            ]
+        );
+
+        unsafe { std::env::remove_var("CLAWEDCODE_SSH_BIN") };
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn interactive_transport_builders_use_transport_specific_binaries() {
+        let _guard = env_lock();
+        unsafe { std::env::set_var("CLAWEDCODE_SSH_BIN", "/tmp/fake-ssh") };
+        unsafe { std::env::set_var("CLAWEDCODE_DIRECT_CONNECT_BIN", "/tmp/fake-dc") };
+        unsafe { std::env::set_var("CLAWEDCODE_REMOTE_BIN", "/tmp/fake-remote") };
+
+        let ssh_spec = InteractiveTransportExecutor::new_ssh(
+            PathBuf::from("/workspace"),
+            crate::bootstrap::SshMode {
+                target: "devbox".to_string(),
+                prompt: None,
+                system_prompt: None,
+                json: false,
+                show_thinking: false,
+                yes: false,
+            },
+        )
+        .build_run_spec("hello");
+        assert_eq!(ssh_spec.program, OsString::from("/tmp/fake-ssh"));
+        assert_eq!(ssh_spec.transport_name, "ssh");
+
+        let direct_spec = InteractiveTransportExecutor::new_direct_connect(
+            PathBuf::from("/workspace"),
+            crate::bootstrap::DirectConnectMode {
+                address: "localhost:9999".to_string(),
+                prompt: None,
+                system_prompt: None,
+                json: false,
+                show_thinking: false,
+                yes: false,
+            },
+        )
+        .build_run_spec("hello");
+        assert_eq!(direct_spec.program, OsString::from("/tmp/fake-dc"));
+        assert_eq!(direct_spec.transport_name, "direct-connect");
+
+        let remote_spec = InteractiveTransportExecutor::new_remote(
+            PathBuf::from("/workspace"),
+            crate::bootstrap::RemoteMode {
+                orchestrator: "orchestrator.local".to_string(),
+                prompt: None,
+                system_prompt: None,
+                json: false,
+                show_thinking: false,
+                yes: false,
+            },
+        )
+        .build_run_spec("hello");
+        assert_eq!(remote_spec.program, OsString::from("/tmp/fake-remote"));
+        assert_eq!(remote_spec.transport_name, "remote");
+
+        unsafe { std::env::remove_var("CLAWEDCODE_SSH_BIN") };
+        unsafe { std::env::remove_var("CLAWEDCODE_DIRECT_CONNECT_BIN") };
         unsafe { std::env::remove_var("CLAWEDCODE_REMOTE_BIN") };
     }
 

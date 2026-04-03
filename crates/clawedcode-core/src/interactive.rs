@@ -5,7 +5,7 @@ use crate::{
     permissions::PermissionMode,
     prompt::PromptSpec,
     runtime::{Runtime, casual_reply_for_prompt},
-    session::{Role, Session},
+    session::{Role, Session, SessionMode, transport_session_id_marker},
     subagent::{
         CompletedSubAgentTask, SubAgentConfig, SubAgentResult, SubAgentRuntime,
         SubAgentTaskState, drain_completed_subagent_tasks_for_parent,
@@ -18,8 +18,24 @@ use futures_util::StreamExt;
 use serde::Serialize;
 use std::{
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
+
+#[derive(Debug, Clone)]
+pub struct ExternalTurnResult {
+    pub response: String,
+    pub transport_session_id: Option<String>,
+}
+
+pub trait ExternalTurnExecutor: Send + Sync {
+    fn submit_turn(
+        &self,
+        session: &mut Session,
+        visible_prompt: &str,
+        execution_prompt: Option<&str>,
+    ) -> anyhow::Result<ExternalTurnResult>;
+}
 
 pub struct TuiContext {
     config: AppConfig,
@@ -29,6 +45,7 @@ pub struct TuiContext {
     cwd: PathBuf,
     pub sessions_dir: PathBuf,
     pub show_thinking: bool,
+    external_turn_executor: Option<Arc<dyn ExternalTurnExecutor>>,
     last_compatibility_refresh: Instant,
 }
 
@@ -74,6 +91,46 @@ impl TuiContext {
         cwd: PathBuf,
         sessions_dir: PathBuf,
     ) -> Self {
+        Self::with_mode_and_executor(
+            config,
+            system_prompt,
+            compatibility,
+            cwd,
+            sessions_dir,
+            SessionMode::Interactive,
+            None,
+        )
+    }
+
+    pub fn with_external_turn_executor(
+        config: AppConfig,
+        system_prompt: PromptSpec,
+        compatibility: crate::compat::CompatibilitySnapshot,
+        cwd: PathBuf,
+        sessions_dir: PathBuf,
+        session_mode: SessionMode,
+        external_turn_executor: Arc<dyn ExternalTurnExecutor>,
+    ) -> Self {
+        Self::with_mode_and_executor(
+            config,
+            system_prompt,
+            compatibility,
+            cwd,
+            sessions_dir,
+            session_mode,
+            Some(external_turn_executor),
+        )
+    }
+
+    fn with_mode_and_executor(
+        config: AppConfig,
+        system_prompt: PromptSpec,
+        compatibility: crate::compat::CompatibilitySnapshot,
+        cwd: PathBuf,
+        sessions_dir: PathBuf,
+        session_mode: SessionMode,
+        external_turn_executor: Option<Arc<dyn ExternalTurnExecutor>>,
+    ) -> Self {
         let show_thinking = config.ui.show_thinking;
         let runtime = Runtime::with_mode(
             config.clone(),
@@ -81,7 +138,7 @@ impl TuiContext {
             compatibility,
             PermissionMode::Default,
         );
-        let session = runtime.start_session(cwd.clone());
+        let session = runtime.start_session_with_mode(cwd.clone(), session_mode);
         Self {
             config,
             system_prompt,
@@ -90,6 +147,7 @@ impl TuiContext {
             cwd,
             sessions_dir,
             show_thinking,
+            external_turn_executor,
             last_compatibility_refresh: Instant::now(),
         }
     }
@@ -104,6 +162,38 @@ impl TuiContext {
         execution_prompt: Option<&str>,
         handler: &mut dyn TuiHandler,
     ) {
+        if let Some(executor) = &self.external_turn_executor {
+            self.session.push(Role::User, visible_prompt);
+            match executor.submit_turn(&mut self.session, visible_prompt, execution_prompt) {
+                Ok(result) => {
+                    let mut assistant_blocks = Vec::new();
+                    assistant_blocks.push(ContentBlock::text(result.response.clone()));
+                    if let Some(transport_session_id) = result.transport_session_id {
+                        self.session.transport_session_id = Some(transport_session_id.clone());
+                        assistant_blocks
+                            .push(ContentBlock::thinking(transport_session_id_marker(&transport_session_id)));
+                    }
+                    handler.on_event(&TuiEvent::MessageDelta {
+                        text: result.response.clone(),
+                    });
+                    handler.on_event(&TuiEvent::AssistantDone);
+                    self.session.push_blocks(Role::Assistant, assistant_blocks);
+                    handler.on_event(&TuiEvent::TurnComplete);
+                }
+                Err(err) => {
+                    let message = format!("Transport error: {err}");
+                    handler.on_event(&TuiEvent::MessageDelta {
+                        text: message.clone(),
+                    });
+                    handler.on_event(&TuiEvent::AssistantDone);
+                    self.session
+                        .push_blocks(Role::Assistant, vec![ContentBlock::text(message)]);
+                    handler.on_event(&TuiEvent::TurnComplete);
+                }
+            }
+            return;
+        }
+
         self.session.push(Role::User, visible_prompt);
 
         if let Some(reply) = execution_prompt
@@ -285,6 +375,10 @@ impl TuiContext {
         )
     }
 
+    pub fn external_turn_executor(&self) -> Option<Arc<dyn ExternalTurnExecutor>> {
+        self.external_turn_executor.clone()
+    }
+
     pub fn replace_session(&mut self, session: Session) {
         self.session = session;
     }
@@ -417,7 +511,9 @@ fn is_write_like(tool_name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::compat::CompatibilitySnapshot;
+    use crate::session::TRANSPORT_SESSION_ID_MARKER_PREFIX;
     use crate::test_support::env_lock;
+    use std::sync::{Arc, Mutex};
 
     struct TestHandler {
         events: Vec<TuiEvent>,
@@ -468,6 +564,36 @@ mod tests {
         )
     }
 
+    #[derive(Default)]
+    struct RecordingExecutor {
+        calls: Mutex<Vec<(String, Option<String>, Option<String>)>>,
+    }
+
+    impl RecordingExecutor {
+        fn calls(&self) -> Vec<(String, Option<String>, Option<String>)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl ExternalTurnExecutor for RecordingExecutor {
+        fn submit_turn(
+            &self,
+            session: &mut Session,
+            visible_prompt: &str,
+            execution_prompt: Option<&str>,
+        ) -> anyhow::Result<ExternalTurnResult> {
+            self.calls.lock().unwrap().push((
+                visible_prompt.to_string(),
+                execution_prompt.map(str::to_string),
+                session.transport_session_id.clone(),
+            ));
+            Ok(ExternalTurnResult {
+                response: "remote reply".to_string(),
+                transport_session_id: Some("remote-session-123".to_string()),
+            })
+        }
+    }
+
     #[test]
     fn submit_interactive_produces_events() {
         let mut ctx = make_context();
@@ -509,6 +635,110 @@ mod tests {
                 .messages
                 .iter()
                 .any(|m| m.role == Role::Assistant)
+        );
+    }
+
+    #[test]
+    fn external_turn_executor_persists_transport_session_marker() {
+        let config = AppConfig::default();
+        let prompt_spec = PromptSpec {
+            name: "test",
+            summary: "test",
+            body: "You are a test assistant.",
+        };
+        let compat = CompatibilitySnapshot {
+            settings_files: vec![],
+            settings: serde_json::Value::Null,
+            skills: vec![],
+            memory_files: vec![],
+            memory: String::new(),
+            mcp_servers: std::collections::BTreeMap::new(),
+        };
+        let executor = Arc::new(RecordingExecutor::default());
+        let mut ctx = TuiContext::with_external_turn_executor(
+            config,
+            prompt_spec,
+            compat,
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp/sessions"),
+            SessionMode::Ssh,
+            executor.clone(),
+        );
+        let mut handler = TestHandler::new();
+
+        ctx.submit_interactive("hello", &mut handler);
+
+        assert_eq!(
+            ctx.session.transport_session_id.as_deref(),
+            Some("remote-session-123")
+        );
+        let assistant = ctx
+            .session
+            .messages
+            .iter()
+            .find(|message| message.role == Role::Assistant)
+            .expect("assistant message should exist");
+        assert!(assistant.content_blocks.iter().any(|block| matches!(
+            block,
+            ContentBlock::Thinking { thinking }
+                if thinking
+                    == &format!("{TRANSPORT_SESSION_ID_MARKER_PREFIX}remote-session-123")
+        )));
+        assert!(
+            handler
+                .events
+                .iter()
+                .any(|event| matches!(event, TuiEvent::AssistantDone))
+        );
+        assert_eq!(
+            executor.calls(),
+            vec![("hello".to_string(), None, None)]
+        );
+    }
+
+    #[test]
+    fn external_turn_executor_receives_existing_transport_session_id() {
+        let config = AppConfig::default();
+        let prompt_spec = PromptSpec {
+            name: "test",
+            summary: "test",
+            body: "You are a test assistant.",
+        };
+        let compat = CompatibilitySnapshot {
+            settings_files: vec![],
+            settings: serde_json::Value::Null,
+            skills: vec![],
+            memory_files: vec![],
+            memory: String::new(),
+            mcp_servers: std::collections::BTreeMap::new(),
+        };
+        let executor = Arc::new(RecordingExecutor::default());
+        let mut ctx = TuiContext::with_external_turn_executor(
+            config,
+            prompt_spec,
+            compat,
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp/sessions"),
+            SessionMode::Ssh,
+            executor.clone(),
+        );
+        let mut handler = TestHandler::new();
+        ctx.session.push_blocks(
+            Role::Assistant,
+            vec![ContentBlock::thinking(transport_session_id_marker(
+                "existing-remote-session",
+            ))],
+        );
+
+        ctx.submit_interactive_with_prompt_override("visible", Some("execution"), &mut handler);
+
+        assert_eq!(
+            executor.calls(),
+            vec![(
+                "visible".to_string(),
+                Some("execution".to_string()),
+                Some("existing-remote-session".to_string()),
+            )]
         );
     }
 

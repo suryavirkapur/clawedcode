@@ -25,7 +25,7 @@ use clawedcode_tools::{
     builtin_tools,
 };
 use futures_util::StreamExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
     path::PathBuf,
@@ -199,7 +199,7 @@ pub struct Runtime {
     permission_engine: PermissionEngine,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeOutput {
     pub session_id: String,
     pub system_prompt: String,

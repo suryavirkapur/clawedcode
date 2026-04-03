@@ -8,6 +8,8 @@ use std::{
 };
 use uuid::Uuid;
 
+pub const TRANSPORT_SESSION_ID_MARKER_PREFIX: &str = "clawedcode-transport-session-id:";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionMode {
@@ -34,6 +36,8 @@ pub struct Session {
     pub parent_session_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub child_sessions: Vec<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_session_id: Option<String>,
     #[serde(default)]
     pub execution_mode: SessionMode,
 }
@@ -125,6 +129,7 @@ impl Session {
             task_list_id: String::new(),
             parent_session_id: None,
             child_sessions: Vec::new(),
+            transport_session_id: None,
             execution_mode: mode,
         }
         .with_default_task_list_id()
@@ -154,6 +159,7 @@ impl Session {
             task_list_id: task_list_id.into(),
             parent_session_id: Some(parent_id),
             child_sessions: Vec::new(),
+            transport_session_id: None,
             execution_mode: mode,
         }
     }
@@ -169,6 +175,7 @@ impl Session {
             task_list_id: String::new(),
             parent_session_id: None,
             child_sessions: Vec::new(),
+            transport_session_id: None,
             execution_mode: SessionMode::Interactive,
         }
         .with_default_task_list_id()
@@ -182,18 +189,22 @@ impl Session {
     pub fn push(&mut self, role: Role, content: impl Into<String>) {
         self.updated_at = Utc::now();
         self.messages.push(Message::from_text(role, content));
+        self.refresh_transport_session_id_from_messages();
     }
 
     pub fn push_blocks(&mut self, role: Role, blocks: Vec<ContentBlock>) {
         self.updated_at = Utc::now();
         self.messages.push(Message::from_blocks(role, blocks));
+        self.refresh_transport_session_id_from_messages();
     }
 
     pub fn save(&self, base_dir: &Path) -> Result<PathBuf> {
         fs::create_dir_all(base_dir)
             .with_context(|| format!("failed to create {}", base_dir.display()))?;
         let path = base_dir.join(format!("{}.json", self.id));
-        let raw = serde_json::to_string_pretty(self)?;
+        let mut session = self.clone();
+        session.refresh_transport_session_id_from_messages();
+        let raw = serde_json::to_string_pretty(&session)?;
         fs::write(&path, raw).with_context(|| format!("failed to write {}", path.display()))?;
         Ok(path)
     }
@@ -202,8 +213,9 @@ impl Session {
         let path = base_dir.join(format!("{}.json", session_id));
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let session: Self = serde_json::from_str(&raw)
+        let mut session: Self = serde_json::from_str(&raw)
             .with_context(|| format!("failed to parse session from {}", path.display()))?;
+        session.refresh_transport_session_id_from_messages();
         Ok(session.with_default_task_list_id())
     }
 
@@ -228,6 +240,10 @@ impl Session {
         self
     }
 
+    pub fn refresh_transport_session_id_from_messages(&mut self) {
+        self.transport_session_id = extract_transport_session_id(&self.messages);
+    }
+
     pub fn fork(&self) -> Self {
         let now = Utc::now();
         Self {
@@ -239,9 +255,30 @@ impl Session {
             task_list_id: self.task_list_id.clone(),
             parent_session_id: Some(self.id),
             child_sessions: Vec::new(),
+            transport_session_id: None,
             execution_mode: SessionMode::Interactive,
         }
     }
+}
+
+pub fn transport_session_id_marker(session_id: &str) -> String {
+    format!("{TRANSPORT_SESSION_ID_MARKER_PREFIX}{session_id}")
+}
+
+fn extract_transport_session_id(messages: &[Message]) -> Option<String> {
+    for message in messages.iter().rev() {
+        for block in message.content_blocks.iter().rev() {
+            if let ContentBlock::Thinking { thinking } = block {
+                if let Some(rest) = thinking.strip_prefix(TRANSPORT_SESSION_ID_MARKER_PREFIX) {
+                    let candidate = rest.trim();
+                    if !candidate.is_empty() {
+                        return Some(candidate.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone)]
@@ -503,6 +540,54 @@ mod tests {
         assert_eq!(loaded.execution_mode, SessionMode::DirectConnect);
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn transport_session_id_is_persisted_from_thinking_marker() {
+        let dir = std::env::temp_dir().join(format!("clawed_test_{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut session = Session::new(PathBuf::from("/tmp/test"));
+        session.transport_session_id = None;
+        session.push_blocks(
+            Role::Assistant,
+            vec![ContentBlock::thinking(transport_session_id_marker("remote-123"))],
+        );
+
+        session.save(&dir).unwrap();
+        let loaded = Session::load(&dir, session.id).unwrap();
+
+        assert_eq!(loaded.transport_session_id.as_deref(), Some("remote-123"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn push_blocks_refreshes_transport_session_id_in_memory() {
+        let mut session = Session::new(PathBuf::from("/tmp/test"));
+
+        session.push_blocks(
+            Role::Assistant,
+            vec![ContentBlock::thinking(transport_session_id_marker("remote-456"))],
+        );
+
+        assert_eq!(session.transport_session_id.as_deref(), Some("remote-456"));
+    }
+
+    #[test]
+    fn fork_does_not_inherit_transport_session_id() {
+        let mut session = Session::with_mode(PathBuf::from("/tmp/test"), SessionMode::Ssh);
+        session.push_blocks(
+            Role::Assistant,
+            vec![ContentBlock::thinking(transport_session_id_marker("remote-789"))],
+        );
+
+        let forked = session.fork();
+        let forked_from = Session::fork_from(&session);
+
+        assert_eq!(session.transport_session_id.as_deref(), Some("remote-789"));
+        assert_eq!(forked.transport_session_id, None);
+        assert_eq!(forked_from.transport_session_id, None);
     }
 
     #[test]

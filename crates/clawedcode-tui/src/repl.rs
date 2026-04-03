@@ -8,7 +8,7 @@ use clawedcode_core::onboarding::{
     increment_project_onboarding_seen_count, maybe_mark_project_onboarding_complete,
     onboarding_steps, should_show_project_onboarding,
 };
-use clawedcode_core::session::{Message, Role, Session, SessionMode};
+use clawedcode_core::session::{Message, Role, Session, SessionMode, transport_session_id_marker};
 use clawedcode_core::subagent::{
     list_subagent_tasks_for_parent, SubAgentTaskState, SubAgentTaskStatus,
 };
@@ -565,6 +565,9 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                     KeyCode::Char('q') => {
                         break;
                     }
+                    KeyCode::Char('?') if input_buffer.is_empty() => {
+                        handler.overlay_lines = help_overlay_lines(ctx);
+                    }
                     _ if active_turn.is_some() => {}
                     KeyCode::Enter => {
                         if !input_buffer.trim().is_empty() {
@@ -818,7 +821,7 @@ fn footer_hint_line(
         return format!("Enter to run the slash command. Matches: {preview}");
     }
 
-    "Enter to send. /help shows commands, /sessions shows recent sessions, /tools shows available tools.".to_string()
+    "Enter to send · ? for shortcuts · / for commands · /sessions for recent sessions · /tools for tools".to_string()
 }
 
 fn prompt_prefix_for_state(
@@ -1068,6 +1071,7 @@ fn spawn_turn_worker(
     execution_prompt: Option<String>,
 ) -> ActiveTurn {
     let runtime = ctx.replacement_runtime();
+    let external_turn_executor = ctx.external_turn_executor();
     let mut session = ctx.cloned_session();
     let (event_tx, event_rx) = mpsc::channel();
     let (approval_tx, approval_rx) = mpsc::channel();
@@ -1076,6 +1080,45 @@ fn spawn_turn_worker(
     let join = thread::spawn(move || {
         let approval_rx = approval_rx.clone();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Some(executor) = external_turn_executor {
+                session.push(Role::User, visible_prompt.clone());
+                match executor.submit_turn(&mut session, &visible_prompt, execution_prompt.as_deref()) {
+                    Ok(result) => {
+                        let mut assistant_blocks = Vec::new();
+                        if let Some(transport_session_id) = result.transport_session_id {
+                            session.transport_session_id = Some(transport_session_id);
+                            assistant_blocks.push(ContentBlock::thinking(
+                                transport_session_id_marker(
+                                    session.transport_session_id.as_deref().unwrap(),
+                                ),
+                            ));
+                        }
+                        let response = result.response;
+                        if !response.is_empty() {
+                            let _ = event_tx.send(TurnWorkerEvent::Ui(TuiEvent::MessageDelta {
+                                text: response.clone(),
+                            }));
+                            assistant_blocks.insert(0, ContentBlock::text(response));
+                        }
+                        if assistant_blocks.is_empty() {
+                            assistant_blocks.push(ContentBlock::text(""));
+                        }
+                        session.push_blocks(Role::Assistant, assistant_blocks);
+                    }
+                    Err(err) => {
+                        let _ = event_tx.send(TurnWorkerEvent::Failed(format!(
+                            "interactive transport turn failed: {err}"
+                        )));
+                        return;
+                    }
+                }
+
+                let _ = event_tx.send(TurnWorkerEvent::Ui(TuiEvent::AssistantDone));
+                let _ = event_tx.send(TurnWorkerEvent::Ui(TuiEvent::TurnComplete));
+                let _ = event_tx.send(TurnWorkerEvent::Finished(session));
+                return;
+            }
+
             let tx = event_tx.clone();
             let approval_fn =
                 move |tool_use_id: &str, tool_name: &str, input: &serde_json::Value| {
@@ -1126,8 +1169,8 @@ fn spawn_turn_worker(
 
             let _ = event_tx.send(TurnWorkerEvent::Ui(TuiEvent::AssistantDone));
             let _ = event_tx.send(TurnWorkerEvent::Ui(TuiEvent::TurnComplete));
+            let _ = runtime_result;
             let _ = event_tx.send(TurnWorkerEvent::Finished(session));
-            runtime_result
         }));
 
         if result.is_err() {
@@ -1770,6 +1813,16 @@ fn help_overlay_lines(ctx: &TuiContext) -> Vec<String> {
             ctx.tool_specs().len(),
             ctx.skills().len()
         ),
+        "Shortcuts:".to_string(),
+        "  Enter        send prompt".to_string(),
+        "  ?            show this shortcut overlay".to_string(),
+        "  /            start slash command input".to_string(),
+        "  y / n        approve or deny the focused tool request".to_string(),
+        "  q / Ctrl+C   exit the REPL".to_string(),
+        "Prompt features:".to_string(),
+        "  !            bash-style intent prefix".to_string(),
+        "  @            file/reference prefix".to_string(),
+        "  &            background-task intent prefix".to_string(),
         "Built-in commands:".to_string(),
     ];
 
@@ -2240,6 +2293,9 @@ mod command_policy_tests {
 
         let rendered = handler.overlay_lines.join("\n");
         assert!(rendered.contains("Session context:"));
+        assert!(rendered.contains("Shortcuts:"));
+        assert!(rendered.contains("?            show this shortcut overlay"));
+        assert!(rendered.contains("Prompt features:"));
         assert!(rendered.contains("Built-in commands:"));
         assert!(rendered.contains("Discovered skills:"));
         assert!(rendered.contains("model "));
@@ -2274,7 +2330,8 @@ mod command_policy_tests {
         assert!(footer.contains("session"));
         assert!(footer.contains("mode interactive"));
         assert!(hint.contains("Enter to send"));
-        assert!(hint.contains("/help"));
+        assert!(hint.contains("? for shortcuts"));
+        assert!(hint.contains("/sessions"));
         assert!(slash_hint.contains("slash command"));
         assert!(slash_hint.contains("Matches:"));
         assert_eq!(slash_prefix, "cmd> ");
