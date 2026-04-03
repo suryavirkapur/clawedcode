@@ -445,10 +445,13 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 Constraint::Min(1),
                 Constraint::Length(1),
                 Constraint::Length(1),
+                Constraint::Length(1),
             ])
             .split(area);
 
             let command_entries = filtered_command_entries(ctx, &input_buffer);
+            let footer_status = footer_status_line(ctx, active_turn.is_some(), awaiting_approval.as_ref());
+            let footer_hint = footer_hint_line(ctx, &input_buffer, active_turn.is_some(), awaiting_approval.as_ref());
 
             frame.render_widget(
                 Paragraph::new(launch_banner(ctx)).style(Style::default().fg(MUTED)),
@@ -465,24 +468,31 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
             );
 
             frame.render_widget(
-                Paragraph::new(shortcuts_hint(ctx, &input_buffer))
+                Paragraph::new(footer_status.clone())
                     .style(Style::default().fg(MUTED)),
                 chunks[2],
             );
 
             frame.render_widget(
+                Paragraph::new(footer_hint)
+                    .style(Style::default().fg(MUTED)),
+                chunks[3],
+            );
+
+            let prompt_prefix = prompt_prefix_for_state(
+                &input_buffer,
+                active_turn.is_some(),
+                awaiting_approval.as_ref(),
+            );
+            frame.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled(
-                        if awaiting_approval.is_some() {
-                            "Approve tool? (y/n): "
-                        } else {
-                            "> "
-                        },
+                        prompt_prefix,
                         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(input_buffer.clone()),
                 ])),
-                chunks[3],
+                chunks[4],
             );
 
             if let Some(req) = &awaiting_approval {
@@ -509,6 +519,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
         let chunks = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(1),
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
@@ -740,25 +751,120 @@ fn command_palette_height(entries: &[CommandEntry]) -> u16 {
 }
 
 fn launch_banner(ctx: &TuiContext) -> String {
+    let session_id = ctx.session().id.to_string();
+    let session_short = short_session_id(&session_id);
+    let cwd = display_path(&ctx.session().cwd);
     if ctx.session().messages.is_empty() {
-        format!("Launching ClawedCode with {}...", ctx.model_name())
+        format!(
+            "Launching ClawedCode with {} · session {} in {}",
+            ctx.model_name(),
+            session_short,
+            cwd
+        )
     } else {
         format!(
-            "ClawedCode session {} in {}",
-            &ctx.session().id.to_string()[..8],
-            display_path(&ctx.session().cwd)
+            "ClawedCode session {} in {} · {}",
+            session_short,
+            cwd,
+            ctx.model_name()
         )
     }
 }
 
-fn shortcuts_hint(ctx: &TuiContext, input_buffer: &str) -> String {
-    let hint = if input_buffer.trim_start().starts_with('/') {
-        "Enter to run a slash command. Ctrl+C or q exits."
+fn footer_status_line(
+    ctx: &TuiContext,
+    active_turn: bool,
+    awaiting_approval: Option<&ApprovalRequest>,
+) -> String {
+    let state = if let Some(req) = awaiting_approval {
+        format!("waiting for approval: {}", req.tool_name)
+    } else if active_turn {
+        "busy: assistant responding".to_string()
+    } else if let Some(background) = background_activity_summary(ctx) {
+        background
     } else {
-        "? for shortcuts"
+        "idle".to_string()
     };
 
-    format!("{hint} · {}", session_compact_status(ctx))
+    format!("{state} · {}", session_compact_status(ctx))
+}
+
+fn footer_hint_line(
+    ctx: &TuiContext,
+    input_buffer: &str,
+    active_turn: bool,
+    awaiting_approval: Option<&ApprovalRequest>,
+) -> String {
+    if awaiting_approval.is_some() {
+        return "Press y to approve, n to deny. Ctrl+C or q exits.".to_string();
+    }
+
+    if active_turn {
+        return "Assistant is working. Your next prompt will queue after this turn.".to_string();
+    }
+
+    if input_buffer.trim_start().starts_with('/') {
+        let visible = filtered_command_entries(ctx, input_buffer);
+        if visible.is_empty() {
+            return "Enter to run the slash command. /help lists available commands.".to_string();
+        }
+
+        let preview = visible
+            .into_iter()
+            .take(4)
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!("Enter to run the slash command. Matches: {preview}");
+    }
+
+    "Enter to send. /help shows commands, /sessions shows recent sessions, /tools shows available tools.".to_string()
+}
+
+fn prompt_prefix_for_state(
+    input_buffer: &str,
+    active_turn: bool,
+    awaiting_approval: Option<&ApprovalRequest>,
+) -> String {
+    if let Some(req) = awaiting_approval {
+        return format!("Approve {}? (y/n): ", req.tool_name);
+    }
+
+    if active_turn {
+        return "Working: ".to_string();
+    }
+
+    if input_buffer.trim_start().starts_with('/') {
+        return "cmd> ".to_string();
+    }
+
+    "> ".to_string()
+}
+
+fn background_activity_summary(ctx: &TuiContext) -> Option<String> {
+    let session_id = ctx.session().id.to_string();
+
+    let shell_running = list_background_tasks()
+        .into_iter()
+        .filter(|task| task.session_id == session_id)
+        .filter(|task| matches!(task.status, ShellTaskStatus::Pending | ShellTaskStatus::Running))
+        .count();
+
+    let agent_running = list_subagent_tasks_for_parent(ctx.session().id)
+        .into_iter()
+        .filter(|task| matches!(task.status, SubAgentTaskStatus::Running))
+        .count();
+
+    let total = shell_running + agent_running;
+    if total == 0 {
+        None
+    } else if shell_running > 0 && agent_running > 0 {
+        Some(format!("background: {shell_running} shell, {agent_running} agent tasks"))
+    } else if shell_running > 0 {
+        Some(format!("background: {shell_running} shell task{}", if shell_running == 1 { "" } else { "s" }))
+    } else {
+        Some(format!("background: {agent_running} agent task{}", if agent_running == 1 { "" } else { "s" }))
+    }
 }
 
 fn welcome_left_lines(ctx: &TuiContext) -> Vec<Line<'static>> {
@@ -2150,7 +2256,7 @@ mod command_policy_tests {
     }
 
     #[test]
-    fn footer_status_line_includes_compact_context() {
+    fn footer_status_line_and_hint_reflect_idle_and_slash_states() {
         let root = temp_dir("footer_status");
         let project = root.join("project");
         let sessions_dir = root.join("sessions");
@@ -2158,12 +2264,48 @@ mod command_policy_tests {
         fs::create_dir_all(&sessions_dir).expect("create sessions dir");
 
         let ctx = make_context_at(project, sessions_dir);
-        let footer = shortcuts_hint(&ctx, "hello");
+        let footer = footer_status_line(&ctx, false, None);
+        let hint = footer_hint_line(&ctx, "hello", false, None);
+        let slash_hint = footer_hint_line(&ctx, "/hel", false, None);
+        let slash_prefix = prompt_prefix_for_state("/hel", false, None);
 
-        assert!(footer.contains("? for shortcuts"));
+        assert!(footer.contains("idle"));
         assert!(footer.contains("model "));
         assert!(footer.contains("session"));
         assert!(footer.contains("mode interactive"));
+        assert!(hint.contains("Enter to send"));
+        assert!(hint.contains("/help"));
+        assert!(slash_hint.contains("slash command"));
+        assert!(slash_hint.contains("Matches:"));
+        assert_eq!(slash_prefix, "cmd> ");
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn footer_status_line_reflects_busy_and_approval_states() {
+        let root = temp_dir("footer_status_busy");
+        let project = root.join("project");
+        let sessions_dir = root.join("sessions");
+        fs::create_dir_all(&project).expect("create project dir");
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+
+        let ctx = make_context_at(project, sessions_dir);
+        let request = ApprovalRequest {
+            tool_use_id: "tool-1".to_string(),
+            tool_name: "shell".to_string(),
+            input: serde_json::json!({"command": "ls -la"}),
+        };
+
+        let busy_footer = footer_status_line(&ctx, true, None);
+        let approval_footer = footer_status_line(&ctx, true, Some(&request));
+        let approval_hint = footer_hint_line(&ctx, "hello", true, Some(&request));
+        let approval_prefix = prompt_prefix_for_state("hello", true, Some(&request));
+
+        assert!(busy_footer.contains("busy: assistant responding"));
+        assert!(approval_footer.contains("waiting for approval: shell"));
+        assert!(approval_hint.contains("Press y to approve, n to deny"));
+        assert!(approval_prefix.contains("Approve shell? (y/n): "));
 
         fs::remove_dir_all(root).ok();
     }
