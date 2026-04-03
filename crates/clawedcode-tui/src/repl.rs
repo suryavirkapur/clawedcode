@@ -40,6 +40,7 @@ const ACCENT: Color = Color::Rgb(224, 122, 95);
 const MUTED: Color = Color::Rgb(150, 150, 150);
 const DASHBOARD_HEIGHT: u16 = 13;
 const TOOL_LINE_INDENT: &str = "  ";
+const MAX_VISIBLE_QUEUED_PROMPTS: usize = 3;
 
 const BUILTIN_COMMANDS: &[&str] = &[
     "/help",
@@ -416,6 +417,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     let mut input_buffer = String::new();
     let mut cursor_pos: usize = 0;
     let mut scroll_offset: usize = 0;
+    let mut queued_prompts: Vec<String> = Vec::new();
     let mut awaiting_approval: Option<ApprovalRequest> = None;
     let mut active_turn: Option<ActiveTurn> = None;
     let mut last_area = Rect::default();
@@ -429,6 +431,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     loop {
         integrate_completed_subagents(ctx, &mut handler);
         drain_turn_events(ctx, &mut handler, &mut active_turn, &mut awaiting_approval);
+        maybe_submit_queued_prompt(ctx, &mut handler, &mut active_turn, &mut queued_prompts)?;
 
         if ctx.session().messages.is_empty() && !onboarding_seen_recorded {
             if should_show_project_onboarding(&ctx.session().cwd) {
@@ -444,10 +447,17 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
         terminal.draw(|frame| {
             let area = frame.area();
             last_area = area;
+            let queued_preview_lines = queued_prompt_preview_lines(&queued_prompts);
+            let queued_height = if queued_preview_lines.is_empty() {
+                0
+            } else {
+                queued_preview_lines.len() as u16 + 2
+            };
 
             let chunks = Layout::vertical([
                 Constraint::Length(1),
                 Constraint::Min(1),
+                Constraint::Length(queued_height),
                 Constraint::Length(1),
                 Constraint::Length(1),
                 Constraint::Length(1),
@@ -455,8 +465,19 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
             .split(area);
 
             let command_entries = filtered_command_entries(ctx, &input_buffer);
-            let footer_status = footer_status_line(ctx, active_turn.is_some(), awaiting_approval.as_ref());
-            let footer_hint = footer_hint_line(ctx, &input_buffer, active_turn.is_some(), awaiting_approval.as_ref());
+            let footer_status = footer_status_line(
+                ctx,
+                active_turn.is_some(),
+                awaiting_approval.as_ref(),
+                queued_prompts.len(),
+            );
+            let footer_hint = footer_hint_line(
+                ctx,
+                &input_buffer,
+                active_turn.is_some(),
+                awaiting_approval.as_ref(),
+                queued_prompts.len(),
+            );
 
             frame.render_widget(
                 Paragraph::new(launch_banner(ctx)).style(Style::default().fg(MUTED)),
@@ -472,16 +493,29 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 scroll_offset,
             );
 
+            if !queued_preview_lines.is_empty() {
+                frame.render_widget(
+                    Paragraph::new(queued_preview_lines)
+                        .block(
+                            Block::default()
+                                .borders(Borders::TOP)
+                                .border_style(Style::default().fg(MUTED)),
+                        )
+                        .wrap(Wrap { trim: false }),
+                    chunks[2],
+                );
+            }
+
             frame.render_widget(
                 Paragraph::new(footer_status.clone())
                     .style(Style::default().fg(MUTED)),
-                chunks[2],
+                chunks[3],
             );
 
             frame.render_widget(
                 Paragraph::new(footer_hint)
                     .style(Style::default().fg(MUTED)),
-                chunks[3],
+                chunks[4],
             );
 
             let prompt_prefix = prompt_prefix_for_state(
@@ -497,7 +531,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                     ),
                     Span::raw(input_buffer.clone()),
                 ])),
-                chunks[4],
+                chunks[5],
             );
 
             if let Some(req) = &awaiting_approval {
@@ -524,6 +558,11 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
         let chunks = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(1),
+            Constraint::Length(if queued_prompts.is_empty() {
+                0
+            } else {
+                queued_prompt_preview_lines(&queued_prompts).len() as u16 + 2
+            }),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
@@ -573,14 +612,15 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                     KeyCode::Char('?') if input_buffer.is_empty() => {
                         handler.overlay_lines = help_overlay_lines(ctx);
                     }
-                    _ if active_turn.is_some() => {}
                     KeyCode::Enter => {
                         if !input_buffer.trim().is_empty() {
                             let prompt = input_buffer.trim().to_string();
                             input_buffer.clear();
                             cursor_pos = 0;
 
-                            if handle_slash_command(ctx, &mut handler, &prompt, &mut active_turn)? {
+                            if active_turn.is_some() {
+                                queued_prompts.push(prompt);
+                            } else if handle_slash_command(ctx, &mut handler, &prompt, &mut active_turn)? {
                                 handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
                             } else {
                                 handler.begin_live_turn(prompt.clone());
@@ -783,11 +823,16 @@ fn footer_status_line(
     ctx: &TuiContext,
     active_turn: bool,
     awaiting_approval: Option<&ApprovalRequest>,
+    queued_count: usize,
 ) -> String {
     let state = if let Some(req) = awaiting_approval {
         format!("waiting for approval: {}", req.tool_name)
     } else if active_turn {
-        "busy: assistant responding".to_string()
+        if queued_count == 0 {
+            "busy: assistant responding".to_string()
+        } else {
+            format!("busy: assistant responding · {queued_count} queued")
+        }
     } else if let Some(background) = background_activity_summary(ctx) {
         background
     } else {
@@ -802,13 +847,21 @@ fn footer_hint_line(
     input_buffer: &str,
     active_turn: bool,
     awaiting_approval: Option<&ApprovalRequest>,
+    queued_count: usize,
 ) -> String {
     if awaiting_approval.is_some() {
         return "Press y to approve, n to deny. Ctrl+C or q exits.".to_string();
     }
 
     if active_turn {
-        return "Assistant is working. Your next prompt will queue after this turn.".to_string();
+        return if queued_count == 0 {
+            "Assistant is working. Keep typing and press Enter to queue the next prompt.".to_string()
+        } else {
+            format!(
+                "Assistant is working. {queued_count} queued prompt{} will run next.",
+                if queued_count == 1 { "" } else { "s" }
+            )
+        };
     }
 
     if input_buffer.trim_start().starts_with('/') {
@@ -839,6 +892,9 @@ fn prompt_prefix_for_state(
     }
 
     if active_turn {
+        if !input_buffer.trim().is_empty() {
+            return "Queue> ".to_string();
+        }
         return "Working: ".to_string();
     }
 
@@ -847,6 +903,55 @@ fn prompt_prefix_for_state(
     }
 
     "> ".to_string()
+}
+
+fn queued_prompt_preview_lines(queued_prompts: &[String]) -> Vec<Line<'static>> {
+    if queued_prompts.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = vec![Line::from(Span::styled(
+        "Queued prompts",
+        Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+    ))];
+
+    let visible_count = queued_prompts.len().min(MAX_VISIBLE_QUEUED_PROMPTS);
+    for prompt in queued_prompts.iter().take(visible_count) {
+        lines.push(Line::from(vec![
+            Span::styled("queued> ", Style::default().fg(ACCENT)),
+            Span::styled(truncate_for_display(prompt, 96), Style::default().fg(MUTED)),
+        ]));
+    }
+
+    if queued_prompts.len() > visible_count {
+        lines.push(Line::from(Span::styled(
+            format!("+{} more queued prompt(s)", queued_prompts.len() - visible_count),
+            Style::default().fg(MUTED),
+        )));
+    }
+
+    lines
+}
+
+fn maybe_submit_queued_prompt(
+    ctx: &mut TuiContext,
+    handler: &mut ReplHandler,
+    active_turn: &mut Option<ActiveTurn>,
+    queued_prompts: &mut Vec<String>,
+) -> Result<()> {
+    if active_turn.is_some() || queued_prompts.is_empty() {
+        return Ok(());
+    }
+
+    let prompt = queued_prompts.remove(0);
+    if handle_slash_command(ctx, handler, &prompt, active_turn)? {
+        handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
+    } else {
+        handler.begin_live_turn(prompt.clone());
+        *active_turn = Some(spawn_turn_worker(ctx, prompt, None));
+    }
+
+    Ok(())
 }
 
 fn background_activity_summary(ctx: &TuiContext) -> Option<String> {
@@ -2325,9 +2430,9 @@ mod command_policy_tests {
         fs::create_dir_all(&sessions_dir).expect("create sessions dir");
 
         let ctx = make_context_at(project, sessions_dir);
-        let footer = footer_status_line(&ctx, false, None);
-        let hint = footer_hint_line(&ctx, "hello", false, None);
-        let slash_hint = footer_hint_line(&ctx, "/hel", false, None);
+        let footer = footer_status_line(&ctx, false, None, 0);
+        let hint = footer_hint_line(&ctx, "hello", false, None, 0);
+        let slash_hint = footer_hint_line(&ctx, "/hel", false, None, 0);
         let slash_prefix = prompt_prefix_for_state("/hel", false, None);
 
         assert!(footer.contains("idle"));
@@ -2359,15 +2464,46 @@ mod command_policy_tests {
             input: serde_json::json!({"command": "ls -la"}),
         };
 
-        let busy_footer = footer_status_line(&ctx, true, None);
-        let approval_footer = footer_status_line(&ctx, true, Some(&request));
-        let approval_hint = footer_hint_line(&ctx, "hello", true, Some(&request));
+        let busy_footer = footer_status_line(&ctx, true, None, 0);
+        let approval_footer = footer_status_line(&ctx, true, Some(&request), 0);
+        let approval_hint = footer_hint_line(&ctx, "hello", true, Some(&request), 0);
         let approval_prefix = prompt_prefix_for_state("hello", true, Some(&request));
 
         assert!(busy_footer.contains("busy: assistant responding"));
         assert!(approval_footer.contains("waiting for approval: shell"));
         assert!(approval_hint.contains("Press y to approve, n to deny"));
         assert!(approval_prefix.contains("Approve shell? (y/n): "));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn busy_footer_and_prompt_reflect_queued_prompts() {
+        let root = temp_dir("footer_status_queued");
+        let project = root.join("project");
+        let sessions_dir = root.join("sessions");
+        fs::create_dir_all(&project).expect("create project dir");
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+
+        let ctx = make_context_at(project, sessions_dir);
+        let busy_footer = footer_status_line(&ctx, true, None, 2);
+        let busy_hint = footer_hint_line(&ctx, "next prompt", true, None, 2);
+        let busy_prefix = prompt_prefix_for_state("next prompt", true, None);
+        let queued_lines = queued_prompt_preview_lines(&[
+            "first queued prompt".to_string(),
+            "second queued prompt".to_string(),
+        ]);
+        let rendered_queue = queued_lines
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(busy_footer.contains("2 queued"));
+        assert!(busy_hint.contains("2 queued prompts will run next"));
+        assert_eq!(busy_prefix, "Queue> ");
+        assert!(rendered_queue.contains("Queued prompts"));
+        assert!(rendered_queue.contains("queued> first queued prompt"));
 
         fs::remove_dir_all(root).ok();
     }
