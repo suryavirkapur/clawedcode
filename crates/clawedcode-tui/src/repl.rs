@@ -39,6 +39,7 @@ use std::{
 const ACCENT: Color = Color::Rgb(224, 122, 95);
 const MUTED: Color = Color::Rgb(150, 150, 150);
 const DASHBOARD_HEIGHT: u16 = 13;
+const TOOL_LINE_INDENT: &str = "  ";
 
 const BUILTIN_COMMANDS: &[&str] = &[
     "/help",
@@ -123,6 +124,7 @@ struct SavedSessionSummary {
     updated_at: i64,
     mode: SessionMode,
     preview: String,
+    is_current: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -173,9 +175,14 @@ impl ReplHandler {
 
     fn rebuild_from_session(&mut self, session: &Session, show_thinking: bool) {
         self.transcript_lines.clear();
+        let mut turn = TranscriptTurn::default();
         for msg in &session.messages {
-            append_message_to_transcript(&mut self.transcript_lines, msg, show_thinking);
+            if msg.role == Role::User && !turn.lines.is_empty() {
+                flush_turn_lines(&mut self.transcript_lines, &mut turn);
+            }
+            append_message_to_turn(&mut turn, msg, show_thinking);
         }
+        flush_turn_lines(&mut self.transcript_lines, &mut turn);
     }
 
     fn visible_lines(&self) -> Vec<String> {
@@ -223,8 +230,7 @@ impl ReplHandler {
         if self.show_thinking {
             let thinking = self.live_thinking.trim();
             if !thinking.is_empty() {
-                lines.push(format!("[thinking] {thinking}"));
-                lines.push(String::new());
+                lines.push(format!("{TOOL_LINE_INDENT}[thinking] {thinking}"));
             }
         }
 
@@ -313,22 +319,28 @@ fn render_live_tool_entry(entry: &LiveToolEntry) -> Vec<String> {
         match event {
             LiveToolEventState::Use { name, input } => {
                 lines.push(format!(
-                    "[tool] {name} (id={}) {}",
+                    "{TOOL_LINE_INDENT}[tool] {name} (id={}) {}",
                     entry.tool_use_id,
                     serde_json::to_string(input).unwrap_or_default()
                 ));
             }
             LiveToolEventState::PendingApproval => {
                 lines.push(format!(
-                    "[tool_pending] {} awaiting approval",
+                    "{TOOL_LINE_INDENT}[tool_pending] {} awaiting approval",
                     entry.tool_use_id
                 ));
             }
             LiveToolEventState::Approved => {
-                lines.push(format!("[tool_approved] {} approved", entry.tool_use_id));
+                lines.push(format!(
+                    "{TOOL_LINE_INDENT}[tool_approved] {} approved",
+                    entry.tool_use_id
+                ));
             }
             LiveToolEventState::Denied => {
-                lines.push(format!("[tool_denied] {} denied", entry.tool_use_id));
+                lines.push(format!(
+                    "{TOOL_LINE_INDENT}[tool_denied] {} denied",
+                    entry.tool_use_id
+                ));
             }
             LiveToolEventState::Result { content, is_error } => {
                 let prefix = if *is_error {
@@ -336,7 +348,10 @@ fn render_live_tool_entry(entry: &LiveToolEntry) -> Vec<String> {
                 } else {
                     "[tool_result]"
                 };
-                lines.push(format!("{prefix} {}: {content}", entry.tool_use_id));
+                lines.push(format!(
+                    "{TOOL_LINE_INDENT}{prefix} {}: {content}",
+                    entry.tool_use_id
+                ));
             }
         }
     }
@@ -450,7 +465,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
             );
 
             frame.render_widget(
-                Paragraph::new(shortcuts_hint(&input_buffer)).style(Style::default().fg(MUTED)),
+                Paragraph::new(shortcuts_hint(ctx, &input_buffer))
+                    .style(Style::default().fg(MUTED)),
                 chunks[2],
             );
 
@@ -735,12 +751,14 @@ fn launch_banner(ctx: &TuiContext) -> String {
     }
 }
 
-fn shortcuts_hint(input_buffer: &str) -> &'static str {
-    if input_buffer.trim_start().starts_with('/') {
+fn shortcuts_hint(ctx: &TuiContext, input_buffer: &str) -> String {
+    let hint = if input_buffer.trim_start().starts_with('/') {
         "Enter to run a slash command. Ctrl+C or q exits."
     } else {
         "? for shortcuts"
-    }
+    };
+
+    format!("{hint} · {}", session_compact_status(ctx))
 }
 
 fn welcome_left_lines(ctx: &TuiContext) -> Vec<Line<'static>> {
@@ -825,39 +843,85 @@ fn section_title(title: &'static str) -> Line<'static> {
     ))
 }
 
-fn append_message_to_transcript(lines: &mut Vec<String>, msg: &Message, show_thinking: bool) {
-    let role_prefix = match msg.role {
-        Role::System => return,
-        Role::User => "You",
-        Role::Assistant => "ClawedCode",
-        Role::Tool => "Tool",
-    };
+#[derive(Default)]
+struct TranscriptTurn {
+    lines: Vec<String>,
+}
 
-    for block in &msg.content_blocks {
+fn flush_turn_lines(lines: &mut Vec<String>, turn: &mut TranscriptTurn) {
+    if turn.lines.is_empty() {
+        return;
+    }
+    if !lines.is_empty() && !lines.last().is_some_and(|line| line.is_empty()) {
+        lines.push(String::new());
+    }
+    lines.append(&mut turn.lines);
+}
+
+fn append_message_to_turn(turn: &mut TranscriptTurn, msg: &Message, show_thinking: bool) {
+    match msg.role {
+        Role::System => {}
+        Role::User => {
+            append_message_blocks(turn, "You", &msg.content_blocks, show_thinking, true);
+        }
+        Role::Assistant => {
+            let has_text = msg.content_blocks.iter().any(|block| {
+                matches!(block, ContentBlock::Text { text } if !text.trim().is_empty())
+            });
+            if !has_text && !msg.content_blocks.is_empty() {
+                turn.lines.push("ClawedCode:".to_string());
+            }
+            append_message_blocks(turn, "ClawedCode", &msg.content_blocks, show_thinking, false);
+        }
+        Role::Tool => {
+            append_message_blocks(turn, "Tool", &msg.content_blocks, show_thinking, false);
+        }
+    }
+}
+
+fn append_message_blocks(
+    turn: &mut TranscriptTurn,
+    role_prefix: &str,
+    blocks: &[ContentBlock],
+    show_thinking: bool,
+    add_spacing_after: bool,
+) {
+    let mut wrote_block = false;
+    let has_toolish_block = blocks.iter().any(|block| {
+        matches!(
+            block,
+            ContentBlock::ToolUse { .. }
+                | ContentBlock::ToolResult { .. }
+                | ContentBlock::SubAgentSummary { .. }
+        )
+    });
+
+    for block in blocks {
         match block {
             ContentBlock::Text { text } => {
                 let text = text.trim();
                 if !text.is_empty() {
-                    lines.push(format!("{role_prefix}: {text}"));
-                    lines.push(String::new());
+                    turn.lines.push(format!("{role_prefix}: {text}"));
+                    wrote_block = true;
                 }
             }
             ContentBlock::Thinking { thinking } => {
                 if show_thinking {
                     let thinking = thinking.trim();
                     if !thinking.is_empty() {
-                        lines.push(format!("[thinking] {thinking}"));
-                        lines.push(String::new());
+                        turn.lines.push(format!("{TOOL_LINE_INDENT}[thinking] {thinking}"));
+                        wrote_block = true;
                     }
                 }
             }
             ContentBlock::ToolUse {
                 id, name, input, ..
             } => {
-                lines.push(format!(
-                    "[tool] {name} (id={id}) {}",
+                turn.lines.push(format!(
+                    "{TOOL_LINE_INDENT}[tool] {name} (id={id}) {}",
                     serde_json::to_string(input).unwrap_or_default()
                 ));
+                wrote_block = true;
             }
             ContentBlock::ToolResult {
                 tool_use_id,
@@ -869,25 +933,26 @@ fn append_message_to_transcript(lines: &mut Vec<String>, msg: &Message, show_thi
                 } else {
                     "[tool_result]"
                 };
-                lines.push(format!("{prefix} {tool_use_id}: {content}"));
-                lines.push(String::new());
+                turn.lines
+                    .push(format!("{TOOL_LINE_INDENT}{prefix} {tool_use_id}: {content}"));
+                wrote_block = true;
             }
             ContentBlock::SubAgentSummary {
                 child_session_id,
                 summary,
             } => {
-                lines.push(format!(
-                    "[sub-agent: {}] {}",
+                turn.lines.push(format!(
+                    "{TOOL_LINE_INDENT}[sub-agent: {}] {}",
                     &child_session_id[..8.min(child_session_id.len())],
                     summary
                 ));
-                lines.push(String::new());
+                wrote_block = true;
             }
         }
     }
 
-    while lines.last().is_some_and(|line| line.is_empty()) {
-        lines.pop();
+    if wrote_block && add_spacing_after && !has_toolish_block {
+        turn.lines.push(String::new());
     }
 }
 
@@ -1056,12 +1121,8 @@ fn handle_slash_command(
         Some(entry) => match entry.source {
             CommandSource::BuiltIn => match entry.name.as_str() {
                 "/help" => {
-                    handler.push_overlay("[info] Commands:");
-                    for entry in visible_command_entries(ctx) {
-                        handler.push_overlay(format!(
-                            "[info] {:<18} {}",
-                            entry.name, entry.description
-                        ));
+                    for line in help_overlay_lines(ctx) {
+                        handler.push_overlay(format!("[info] {line}"));
                     }
                     let _ = ctx.save_session();
                     return Ok(true);
@@ -1136,11 +1197,13 @@ fn handle_slash_command(
                     if sessions.is_empty() {
                         handler.push_overlay("[info] No saved sessions found.");
                     } else {
-                        handler.push_overlay("[info] Recent sessions:");
+                        handler.push_overlay(
+                            "[info] Recent sessions (current marked with *, forkable via /fork):",
+                        );
                         for session in sessions {
                             handler.push_overlay(format!(
                                 "[info] {}",
-                                format_saved_session_line(&session)
+                                format_saved_session_line(&session, &ctx.session().id)
                             ));
                         }
                     }
@@ -1183,12 +1246,13 @@ fn handle_slash_command(
                             ctx.replace_session(forked);
                             let _ = ctx.save_session();
                             handler.overlay_lines.clear();
-                            handler.push_overlay(format!(
-                                "[info] Forked session {source_short} into new session {forked_short}"
-                            ));
+                            handler.push_overlay(format!("[info] Forked {source_short} -> {forked_short}"));
                         }
                         Err(err) => {
-                            handler.push_overlay(format!("[error] {err}"));
+                            handler.push_overlay(format!(
+                                "[error] Fork failed: {}",
+                                compact_fork_error(prefix, &err)
+                            ));
                         }
                     }
                     return Ok(true);
@@ -1517,7 +1581,14 @@ fn load_saved_sessions(sessions_dir: &Path) -> Vec<Session> {
 }
 
 fn list_saved_sessions(ctx: &TuiContext, limit: usize) -> Vec<SavedSessionSummary> {
-    load_saved_sessions(&ctx.sessions_dir)
+    let current_id = ctx.session().id;
+    let mut sessions = load_saved_sessions(&ctx.sessions_dir);
+    if !sessions.iter().any(|session| session.id == current_id) {
+        sessions.push(ctx.cloned_session());
+        sessions.sort_by_key(|session| Reverse(session.updated_at.timestamp()));
+    }
+
+    sessions
         .into_iter()
         .take(limit)
         .map(|session| {
@@ -1531,6 +1602,7 @@ fn list_saved_sessions(ctx: &TuiContext, limit: usize) -> Vec<SavedSessionSummar
                 updated_at: session.updated_at.timestamp(),
                 mode: session.execution_mode.clone(),
                 preview,
+                is_current: session.id == current_id,
             }
         })
         .collect()
@@ -1568,11 +1640,72 @@ fn session_mode_label(mode: SessionMode) -> &'static str {
     }
 }
 
-fn format_saved_session_line(session: &SavedSessionSummary) -> String {
+fn session_compact_status(ctx: &TuiContext) -> String {
     format!(
-        "{} {:<14} {:<18} {}",
+        "model {} · session {} · mode {}",
+        ctx.model_name(),
+        short_session_id(&ctx.session().id.to_string()),
+        session_mode_label(ctx.session().execution_mode.clone()),
+    )
+}
+
+fn help_overlay_lines(ctx: &TuiContext) -> Vec<String> {
+    let entries = visible_command_entries(ctx);
+    let (builtins, skills): (Vec<_>, Vec<_>) = entries
+        .into_iter()
+        .partition(|entry| matches!(entry.source, CommandSource::BuiltIn));
+
+    let mut lines = vec![
+        format!(
+            "Session context: {} · cwd {} · commands {} · tools {} · skills {}",
+            session_compact_status(ctx),
+            display_path(&ctx.session().cwd),
+            builtins.len() + skills.len(),
+            ctx.tool_specs().len(),
+            ctx.skills().len()
+        ),
+        "Built-in commands:".to_string(),
+    ];
+
+    for entry in builtins {
+        lines.push(format!("{:<12} {}", entry.name, entry.description));
+    }
+
+    lines.push("Discovered skills:".to_string());
+    if skills.is_empty() {
+        lines.push("(none)".to_string());
+    } else {
+        for entry in skills {
+            lines.push(format!("{:<12} {}", entry.name, entry.description));
+        }
+    }
+
+    lines
+}
+
+fn compact_fork_error(prefix: &str, err: &anyhow::Error) -> String {
+    let message = err.to_string();
+    if message.contains("No saved session matches") {
+        format!("no saved session matches `{prefix}`")
+    } else if message.contains("Multiple sessions match") {
+        format!("multiple sessions match `{prefix}`")
+    } else {
+        truncate_for_display(&message, 96)
+    }
+}
+
+fn format_saved_session_line(
+    session: &SavedSessionSummary,
+    _current_session_id: &uuid::Uuid,
+) -> String {
+    let current_marker = if session.is_current { "*" } else { " " };
+    let action = if session.is_current { "current" } else { "forkable" };
+    format!(
+        "{} {} {:<14} {:<8} {:<18} {}",
+        current_marker,
         short_session_id(&session.id),
         session_mode_label(session.mode.clone()),
+        action,
         relative_time_label(session.updated_at),
         truncate_for_display(
             &format!("{} · {}", display_path(&session.cwd), session.preview),
@@ -1981,7 +2114,7 @@ mod command_policy_tests {
     }
 
     #[test]
-    fn help_only_lists_visible_commands() {
+    fn help_overlay_is_sectioned_and_contextual() {
         let _guard = env_lock();
         unsafe { std::env::set_var("CLAWEDCODE_INSTALL_METHOD", "local") };
 
@@ -2000,15 +2133,65 @@ mod command_policy_tests {
         handle_slash_command(&mut ctx, &mut handler, "/help", &mut active_turn).unwrap();
 
         let rendered = handler.overlay_lines.join("\n");
-        assert!(rendered.contains("[info] Commands:"));
+        assert!(rendered.contains("Session context:"));
+        assert!(rendered.contains("Built-in commands:"));
+        assert!(rendered.contains("Discovered skills:"));
+        assert!(rendered.contains("model "));
+        assert!(rendered.contains("cwd"));
         assert!(rendered.contains("/help"));
         assert!(rendered.contains("/clear"));
-        assert!(rendered.contains("[info] /task"));
+        assert!(rendered.contains("/task"));
         assert!(rendered.contains("/visible-skill"));
         assert!(!rendered.contains("/update"));
         assert!(!rendered.contains("/hidden-skill"));
 
         unsafe { std::env::remove_var("CLAWEDCODE_INSTALL_METHOD") };
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn footer_status_line_includes_compact_context() {
+        let root = temp_dir("footer_status");
+        let project = root.join("project");
+        let sessions_dir = root.join("sessions");
+        fs::create_dir_all(&project).expect("create project dir");
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+
+        let ctx = make_context_at(project, sessions_dir);
+        let footer = shortcuts_hint(&ctx, "hello");
+
+        assert!(footer.contains("? for shortcuts"));
+        assert!(footer.contains("model "));
+        assert!(footer.contains("session"));
+        assert!(footer.contains("mode interactive"));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn sessions_overlay_marks_current_session() {
+        let root = temp_dir("sessions_overlay");
+        let project = root.join("project");
+        let sessions_dir = root.join("sessions");
+        fs::create_dir_all(&project).expect("create project dir");
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+
+        let mut ctx = make_context_at(project.clone(), sessions_dir.clone());
+        ctx.session_mut().push(Role::User, "current prompt");
+        ctx.save_session().expect("save current session");
+
+        let mut older = Session::new(project);
+        older.push(Role::User, "older prompt");
+        older.save(&sessions_dir).expect("save older session");
+
+        let mut handler = ReplHandler::new(false);
+        let mut active_turn = None;
+        handle_slash_command(&mut ctx, &mut handler, "/sessions", &mut active_turn).unwrap();
+
+        let rendered = handler.overlay_lines.join("\n");
+        assert!(rendered.contains("Recent sessions (current marked with *, forkable via /fork):"));
+        assert!(rendered.contains("* "));
+
         fs::remove_dir_all(root).ok();
     }
 
@@ -2118,11 +2301,13 @@ mod command_policy_tests {
                 .as_secs() as i64,
             mode: SessionMode::Resume,
             preview: "Continue the task".to_string(),
+            is_current: true,
         };
 
-        let line = format_saved_session_line(&summary);
-        assert!(line.contains("12345678"));
+        let line = format_saved_session_line(&summary, &uuid::Uuid::new_v4());
+        assert!(line.starts_with("* 12345678"));
         assert!(line.contains("resume"));
+        assert!(line.contains("current"));
         assert!(line.contains("/tmp/project"));
         assert!(line.contains("Continue the task"));
     }
@@ -2210,7 +2395,7 @@ mod command_policy_tests {
 
             assert_eq!(
                 render_session(&session, false),
-                "You: What is 2+2?\nClawedCode: The answer is 4."
+                "You: What is 2+2?\n\nClawedCode: The answer is 4."
             );
         }
 
@@ -2229,7 +2414,7 @@ mod command_policy_tests {
 
             assert_eq!(
                 render_session(&session, false),
-                "You: Hello\nClawedCode: Hi there."
+                "You: Hello\n\nClawedCode: Hi there."
             );
         }
 
@@ -2247,7 +2432,7 @@ mod command_policy_tests {
 
             assert_eq!(
                 render_session(&session, true),
-                "You: Hello\n[thinking] Let me think about this.\n\nClawedCode: Hi there."
+                "You: Hello\n\n  [thinking] Let me think about this.\nClawedCode: Hi there."
             );
         }
 
@@ -2271,7 +2456,7 @@ mod command_policy_tests {
 
             assert_eq!(
                 render_session(&session, false),
-                "You: Read the file.\n[tool] read_file (id=tool-1) {\"path\":\"test.txt\"}\n[tool_result] tool-1: file contents here"
+                "You: Read the file.\n\nClawedCode:\n  [tool] read_file (id=tool-1) {\"path\":\"test.txt\"}\n  [tool_result] tool-1: file contents here"
             );
         }
 
@@ -2288,7 +2473,7 @@ mod command_policy_tests {
 
             assert_eq!(
                 render_session(&session, false),
-                "[sub-agent: child-se] Completed the task successfully."
+                "ClawedCode:\n  [sub-agent: child-se] Completed the task successfully."
             );
         }
 
@@ -2321,7 +2506,7 @@ mod command_policy_tests {
 
             assert_eq!(
                 handler.visible_lines().join("\n"),
-                "You: hello\n\n[thinking] let me think\n\nClawedCode: Hi"
+                "You: hello\n\n  [thinking] let me think\nClawedCode: Hi"
             );
         }
 
@@ -2338,7 +2523,7 @@ mod command_policy_tests {
 
             assert_eq!(
                 handler.visible_lines().join("\n"),
-                "You: please inspect\n\nClawedCode:\n[tool] shell (id=tool-1) {\"command\":\"ls -la\"}\n[tool_pending] tool-1 awaiting approval"
+                "You: please inspect\n\nClawedCode:\n  [tool] shell (id=tool-1) {\"command\":\"ls -la\"}\n  [tool_pending] tool-1 awaiting approval"
             );
         }
 
@@ -2354,7 +2539,7 @@ mod command_policy_tests {
 
             assert_eq!(
                 handler.visible_lines().join("\n"),
-                "You: please inspect\n\nClawedCode:\n[tool] shell (id=tool-1) {\"command\":\"ls -la\"}"
+                "You: please inspect\n\nClawedCode:\n  [tool] shell (id=tool-1) {\"command\":\"ls -la\"}"
             );
         }
 
@@ -2373,7 +2558,7 @@ mod command_policy_tests {
 
             assert_eq!(
                 handler.visible_lines().join("\n"),
-                "You: please inspect\n\nClawedCode:\n[tool] shell (id=tool-1) {\"command\":\"ls -la\"}\n[tool_pending] tool-1 awaiting approval\n[tool_approved] tool-1 approved\n[tool_result] tool-1: done"
+                "You: please inspect\n\nClawedCode:\n  [tool] shell (id=tool-1) {\"command\":\"ls -la\"}\n  [tool_pending] tool-1 awaiting approval\n  [tool_approved] tool-1 approved\n  [tool_result] tool-1: done"
             );
 
             let mut denied_handler = ReplHandler::new(false);
@@ -2388,7 +2573,7 @@ mod command_policy_tests {
 
             assert_eq!(
                 denied_handler.visible_lines().join("\n"),
-                "You: please inspect\n\nClawedCode:\n[tool] shell (id=tool-2) {\"command\":\"ls -la\"}\n[tool_pending] tool-2 awaiting approval\n[tool_denied] tool-2 denied"
+                "You: please inspect\n\nClawedCode:\n  [tool] shell (id=tool-2) {\"command\":\"ls -la\"}\n  [tool_pending] tool-2 awaiting approval\n  [tool_denied] tool-2 denied"
             );
         }
 
@@ -2466,7 +2651,7 @@ mod command_policy_tests {
             assert!(handler
                 .overlay_lines
                 .iter()
-                .any(|line| line.contains("Forked session")));
+                .any(|line| line.contains("Forked ") && line.contains(" -> ")));
 
             fs::remove_dir_all(root).ok();
         }
