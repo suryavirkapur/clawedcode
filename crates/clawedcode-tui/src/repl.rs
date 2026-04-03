@@ -8,7 +8,10 @@ use clawedcode_core::onboarding::{
     increment_project_onboarding_seen_count, maybe_mark_project_onboarding_complete,
     onboarding_steps, should_show_project_onboarding,
 };
-use clawedcode_core::session::{Message, Role, Session, SessionMode, transport_session_id_marker};
+use clawedcode_core::session::{
+    Message, Role, Session, SessionMode, TRANSPORT_SESSION_ID_MARKER_PREFIX,
+    transport_session_id_marker,
+};
 use clawedcode_core::subagent::{
     list_subagent_tasks_for_parent, SubAgentTaskState, SubAgentTaskStatus,
 };
@@ -802,19 +805,25 @@ fn launch_banner(ctx: &TuiContext) -> String {
     let session_id = ctx.session().id.to_string();
     let session_short = short_session_id(&session_id);
     let cwd = display_path(&ctx.session().cwd);
+    let transport = ctx
+        .transport_label()
+        .map(|label| format!(" via {label}"))
+        .unwrap_or_default();
     if ctx.session().messages.is_empty() {
         format!(
-            "Launching ClawedCode with {} · session {} in {}",
+            "Launching ClawedCode with {}{} · session {} in {}",
             ctx.model_name(),
+            transport,
             session_short,
             cwd
         )
     } else {
         format!(
-            "ClawedCode session {} in {} · {}",
+            "ClawedCode session {} in {} · {}{}",
             session_short,
             cwd,
-            ctx.model_name()
+            ctx.model_name(),
+            transport
         )
     }
 }
@@ -1010,7 +1019,18 @@ fn welcome_left_lines(ctx: &TuiContext) -> Vec<Line<'static>> {
 }
 
 fn welcome_right_lines(ctx: &TuiContext) -> Vec<Line<'static>> {
-    let mut lines = if should_show_project_onboarding(&ctx.session().cwd) {
+    let mut lines = Vec::new();
+
+    if let Some(label) = ctx.transport_label() {
+        lines.push(section_title("Connection"));
+        lines.push(Line::from(format!("Interactive transport: {label}")));
+        lines.push(Line::from(
+            "This shell is attached through a transport bridge. Prompts, sessions, and approvals still persist locally.",
+        ));
+        lines.push(Line::from(""));
+    }
+
+    lines.extend(if should_show_project_onboarding(&ctx.session().cwd) {
         let mut lines = vec![section_title("Getting started")];
         for step in onboarding_steps(&ctx.session().cwd)
             .into_iter()
@@ -1025,7 +1045,7 @@ fn welcome_right_lines(ctx: &TuiContext) -> Vec<Line<'static>> {
             section_title("Tips for getting started"),
             Line::from("Run /init to create a CLAUDE.md file with instructions for ClawedCode."),
         ]
-    };
+    });
 
     if launched_in_home(&ctx.session().cwd) {
         lines.push(Line::from(
@@ -1125,7 +1145,9 @@ fn append_message_blocks(
                 }
             }
             ContentBlock::Thinking { thinking } => {
-                if show_thinking {
+                if show_thinking
+                    && !thinking.starts_with(TRANSPORT_SESSION_ID_MARKER_PREFIX)
+                {
                     let thinking = thinking.trim();
                     if !thinking.is_empty() {
                         turn.lines.push(format!("{TOOL_LINE_INDENT}[thinking] {thinking}"));
@@ -1900,12 +1922,17 @@ fn session_mode_label(mode: SessionMode) -> &'static str {
 }
 
 fn session_compact_status(ctx: &TuiContext) -> String {
-    format!(
+    let mut status = format!(
         "model {} · session {} · mode {}",
         ctx.model_name(),
         short_session_id(&ctx.session().id.to_string()),
         session_mode_label(ctx.session().execution_mode.clone()),
-    )
+    );
+    if let Some(label) = ctx.transport_label() {
+        status.push_str(" · ");
+        status.push_str(label);
+    }
+    status
 }
 
 fn help_overlay_lines(ctx: &TuiContext) -> Vec<String> {
@@ -1923,8 +1950,13 @@ fn help_overlay_lines(ctx: &TuiContext) -> Vec<String> {
             ctx.tool_specs().len(),
             ctx.skills().len()
         ),
+        format!(
+            "Transport: {}",
+            ctx.transport_label().unwrap_or("local session")
+        ),
         "Shortcuts:".to_string(),
         "  Enter        send prompt".to_string(),
+        "  Enter busy   queue the next prompt while the assistant works".to_string(),
         "  ?            show this shortcut overlay".to_string(),
         "  /            start slash command input".to_string(),
         "  y / n        approve or deny the focused tool request".to_string(),
@@ -2506,6 +2538,55 @@ mod command_policy_tests {
         assert!(rendered_queue.contains("queued> first queued prompt"));
 
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn transport_label_appears_in_banner_help_and_dashboard() {
+        let root = temp_dir("transport_label_surfaces");
+        let project = root.join("project");
+        let sessions_dir = root.join("sessions");
+        fs::create_dir_all(&project).expect("create project dir");
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+
+        let mut ctx = make_context_at(project, sessions_dir);
+        ctx.set_transport_label(Some("ssh devbox".to_string()));
+
+        let banner = launch_banner(&ctx);
+        let help = help_overlay_lines(&ctx).join("\n");
+        let dashboard = welcome_right_lines(&ctx)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let compact = session_compact_status(&ctx);
+
+        assert!(banner.contains("via ssh devbox"));
+        assert!(help.contains("Transport: ssh devbox"));
+        assert!(dashboard.contains("Connection"));
+        assert!(dashboard.contains("Interactive transport: ssh devbox"));
+        assert!(compact.contains("ssh devbox"));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn transport_session_marker_thinking_is_hidden_even_when_thinking_is_enabled() {
+        let mut turn = TranscriptTurn::default();
+        let message = Message::from_blocks(
+            Role::Assistant,
+            vec![
+                ContentBlock::text("Remote hello"),
+                ContentBlock::thinking(transport_session_id_marker(
+                    "11111111-1111-1111-1111-111111111111",
+                )),
+            ],
+        );
+
+        append_message_to_turn(&mut turn, &message, true);
+        let rendered = turn.lines.join("\n");
+
+        assert!(rendered.contains("ClawedCode: Remote hello"));
+        assert!(!rendered.contains("clawedcode-transport-session-id"));
     }
 
     #[test]

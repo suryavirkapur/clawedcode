@@ -949,6 +949,7 @@ fn execute_transport_tui(
     config: AppConfig,
     compatibility: compat::CompatibilitySnapshot,
     startup_prompt: Option<String>,
+    transport_label: Option<String>,
     system_prompt_override: Option<String>,
     session_mode: SessionMode,
     executor: Arc<dyn ExternalTurnExecutor>,
@@ -965,6 +966,7 @@ fn execute_transport_tui(
         executor,
     );
     ctx.set_startup_prompt(startup_prompt);
+    ctx.set_transport_label(transport_label);
     tui::run_with_context(ctx)
 }
 
@@ -981,6 +983,7 @@ async fn execute_direct_connect(
             config,
             compatibility,
             direct_connect_mode.prompt.clone(),
+            Some(format!("direct-connect {}", direct_connect_mode.address)),
             direct_connect_mode.system_prompt.clone(),
             SessionMode::DirectConnect,
             Arc::new(InteractiveTransportExecutor::new_direct_connect(
@@ -1012,6 +1015,7 @@ async fn execute_ssh(
             config,
             compatibility,
             ssh_mode.prompt.clone(),
+            Some(format!("ssh {}", ssh_mode.target)),
             ssh_mode.system_prompt.clone(),
             SessionMode::Ssh,
             Arc::new(InteractiveTransportExecutor::new_ssh(
@@ -1043,6 +1047,7 @@ async fn execute_remote(
             config,
             compatibility,
             remote_mode.prompt.clone(),
+            Some(format!("remote {}", remote_mode.orchestrator)),
             remote_mode.system_prompt.clone(),
             SessionMode::Remote,
             Arc::new(InteractiveTransportExecutor::new_remote(

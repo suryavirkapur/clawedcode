@@ -47,6 +47,7 @@ pub struct TuiContext {
     pub show_thinking: bool,
     external_turn_executor: Option<Arc<dyn ExternalTurnExecutor>>,
     startup_prompt: Option<String>,
+    transport_label: Option<String>,
     last_compatibility_refresh: Instant,
 }
 
@@ -150,6 +151,7 @@ impl TuiContext {
             show_thinking,
             external_turn_executor,
             startup_prompt: None,
+            transport_label: None,
             last_compatibility_refresh: Instant::now(),
         }
     }
@@ -160,6 +162,14 @@ impl TuiContext {
 
     pub fn take_startup_prompt(&mut self) -> Option<String> {
         self.startup_prompt.take()
+    }
+
+    pub fn set_transport_label(&mut self, label: Option<String>) {
+        self.transport_label = label;
+    }
+
+    pub fn transport_label(&self) -> Option<&str> {
+        self.transport_label.as_deref()
     }
 
     pub fn submit_interactive(&mut self, prompt: &str, handler: &mut dyn TuiHandler) {
