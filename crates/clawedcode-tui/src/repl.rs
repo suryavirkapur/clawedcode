@@ -492,6 +492,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 chunks[1],
                 ctx,
                 &handler,
+                &input_buffer,
                 &command_entries,
                 scroll_offset,
             );
@@ -677,13 +678,14 @@ fn render_body(
     area: Rect,
     ctx: &TuiContext,
     handler: &ReplHandler,
+    input_buffer: &str,
     command_entries: &[CommandEntry],
     scroll_offset: usize,
 ) {
     if handler.has_content() {
         render_conversation(frame, area, handler, command_entries, scroll_offset);
     } else {
-        render_dashboard(frame, area, ctx, command_entries);
+        render_dashboard(frame, area, ctx, input_buffer, command_entries);
     }
 }
 
@@ -713,13 +715,14 @@ fn render_conversation(
         .scroll((scroll_offset as u16, 0));
 
     frame.render_widget(transcript, chunks[0]);
-    render_command_palette(frame, chunks[1], command_entries);
+    render_command_palette(frame, chunks[1], "", command_entries);
 }
 
 fn render_dashboard(
     frame: &mut Frame,
     area: Rect,
     ctx: &TuiContext,
+    input_buffer: &str,
     command_entries: &[CommandEntry],
 ) {
     let chunks = if command_entries.is_empty() {
@@ -766,28 +769,45 @@ fn render_dashboard(
     frame.render_widget(right, body_chunks[1]);
 
     if !command_entries.is_empty() && chunks.len() > 1 {
-        render_command_palette(frame, chunks[1], command_entries);
+        render_command_palette(frame, chunks[1], input_buffer, command_entries);
     }
 }
 
-fn render_command_palette(frame: &mut Frame, area: Rect, entries: &[CommandEntry]) {
-    let lines: Vec<Line> = entries
-        .iter()
-        .take(8)
-        .map(|entry| {
-            let name_color = match entry.source {
-                CommandSource::BuiltIn => Color::White,
-                CommandSource::Skill => Color::Cyan,
-            };
-            Line::from(vec![
-                Span::styled(
-                    format!("{:<18}", entry.name),
-                    Style::default().fg(name_color).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(entry.description.clone(), Style::default().fg(MUTED)),
-            ])
-        })
-        .collect();
+fn render_command_palette(
+    frame: &mut Frame,
+    area: Rect,
+    input_buffer: &str,
+    entries: &[CommandEntry],
+) {
+    let title = if input_buffer.trim() == "/" {
+        " Commands "
+    } else {
+        " Command matches "
+    };
+
+    let mut lines = vec![Line::from(vec![
+        Span::styled(title, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!(" · {}", entries.len().min(6)),
+            Style::default().fg(MUTED),
+        ),
+    ])];
+
+    lines.extend(entries.iter().take(6).map(|entry| {
+        let (badge, badge_color) = command_source_badge(entry.source);
+        Line::from(vec![
+            Span::styled(
+                format!("{:<11}", badge),
+                Style::default().fg(badge_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!("{:<16}", entry.name),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(entry.description.clone(), Style::default().fg(MUTED)),
+        ])
+    }));
 
     let palette = Paragraph::new(lines).block(
         Block::default()
@@ -798,7 +818,7 @@ fn render_command_palette(frame: &mut Frame, area: Rect, entries: &[CommandEntry
 }
 
 fn command_palette_height(entries: &[CommandEntry]) -> u16 {
-    entries.len().min(8) as u16 + 2
+    entries.len().min(6) as u16 + 3
 }
 
 fn launch_banner(ctx: &TuiContext) -> String {
@@ -1647,7 +1667,6 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
         });
     }
 
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
     entries
 }
 
@@ -1667,10 +1686,75 @@ fn filtered_command_entries(ctx: &TuiContext, input_buffer: &str) -> Vec<Command
     }
 
     let query = input_buffer.trim();
-    all_command_entries(ctx)
+    let entries = all_command_entries(ctx);
+    if query == "/" {
+        return curated_command_entries(entries);
+    }
+
+    let mut entries: Vec<_> = entries
         .into_iter()
         .filter(|entry| entry.name.starts_with(query))
-        .collect()
+        .collect();
+    entries.sort_by(|a, b| compare_command_entries(query, a, b));
+    entries
+}
+
+fn curated_command_entries(entries: Vec<CommandEntry>) -> Vec<CommandEntry> {
+    let builtin_priority = [
+        "/help",
+        "/task",
+        "/tasks",
+        "/sessions",
+        "/tools",
+        "/fork",
+        "/clear",
+        "/update",
+    ];
+
+    let mut ranked = Vec::new();
+    for name in builtin_priority {
+        if let Some(index) = entries.iter().position(|entry| entry.name == name) {
+            ranked.push(entries[index].clone());
+        }
+    }
+
+    let mut remaining_skills: Vec<_> = entries
+        .into_iter()
+        .filter(|entry| matches!(entry.source, CommandSource::Skill))
+        .collect();
+    remaining_skills.sort_by(|a, b| a.name.cmp(&b.name));
+    ranked.extend(remaining_skills);
+    ranked
+}
+
+fn compare_command_entries(query: &str, left: &CommandEntry, right: &CommandEntry) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let exact_left = left.name == query;
+    let exact_right = right.name == query;
+    match exact_right.cmp(&exact_left) {
+        Ordering::Equal => {}
+        other => return other,
+    }
+
+    let left_builtin = matches!(left.source, CommandSource::BuiltIn);
+    let right_builtin = matches!(right.source, CommandSource::BuiltIn);
+    match right_builtin.cmp(&left_builtin) {
+        Ordering::Equal => {}
+        other => return other,
+    }
+
+    match left.name.len().cmp(&right.name.len()) {
+        Ordering::Equal => left.name.cmp(&right.name),
+        other => other,
+    }
+}
+
+fn command_source_badge(source: CommandSource) -> (&'static str, Color) {
+    match source {
+        CommandSource::BuiltIn => ("[built-in]", ACCENT),
+        CommandSource::Skill => ("[skill]", Color::Cyan),
+    }
 }
 
 fn integrate_completed_subagents(ctx: &mut TuiContext, handler: &mut ReplHandler) {
@@ -2345,6 +2429,63 @@ mod command_policy_tests {
         assert!(command_is_visible(&entry, InstallMethod::Cargo));
         assert!(command_is_visible(&entry, InstallMethod::LocalBuild));
         assert!(command_is_visible(&entry, InstallMethod::Unknown));
+    }
+
+    #[test]
+    fn bare_slash_uses_curated_builtin_first_entries() {
+        let _guard = env_lock();
+        unsafe { std::env::set_var("CLAWEDCODE_INSTALL_METHOD", "cargo") };
+
+        let root = temp_dir("bare_slash_curated");
+        let project = root.join("project");
+        let sessions_dir = root.join("sessions");
+        fs::create_dir_all(&project).expect("create project dir");
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        write_skill(&project, "AlphaSkill.md", "Alpha Skill", "Use alpha.");
+
+        let ctx = make_context_at(project, sessions_dir);
+        let entries = filtered_command_entries(&ctx, "/");
+        let names: Vec<_> = entries.iter().take(6).map(|entry| entry.name.as_str()).collect();
+
+        assert_eq!(
+            names,
+            vec!["/help", "/task", "/tasks", "/sessions", "/tools", "/fork"]
+        );
+    }
+
+    #[test]
+    fn slash_matches_rank_exact_then_builtin_then_shorter_names() {
+        let entries = vec![
+            CommandEntry {
+                name: "/help".to_string(),
+                description: "Show help".to_string(),
+                source: CommandSource::BuiltIn,
+            },
+            CommandEntry {
+                name: "/helper".to_string(),
+                description: "Helper".to_string(),
+                source: CommandSource::Skill,
+            },
+            CommandEntry {
+                name: "/hello".to_string(),
+                description: "Hello".to_string(),
+                source: CommandSource::BuiltIn,
+            },
+            CommandEntry {
+                name: "/helm".to_string(),
+                description: "Helm".to_string(),
+                source: CommandSource::Skill,
+            },
+        ];
+
+        let mut filtered = entries
+            .into_iter()
+            .filter(|entry| entry.name.starts_with("/hel"))
+            .collect::<Vec<_>>();
+        filtered.sort_by(|a, b| compare_command_entries("/help", a, b));
+
+        let names: Vec<_> = filtered.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec!["/help", "/hello", "/helm", "/helper"]);
     }
 
     #[test]
