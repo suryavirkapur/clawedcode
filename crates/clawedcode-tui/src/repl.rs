@@ -152,6 +152,16 @@ struct LiveToolEntry {
     events: Vec<LiveToolEventState>,
 }
 
+#[derive(Debug, Clone)]
+struct InfoPanel {
+    title: String,
+    lines: Vec<String>,
+}
+
+fn info_panel_hint_line() -> &'static str {
+    "Esc/q/? close · ↑/↓ or j/k scroll"
+}
+
 struct ReplHandler {
     transcript_lines: Vec<String>,
     overlay_lines: Vec<String>,
@@ -159,6 +169,7 @@ struct ReplHandler {
     live_assistant_text: String,
     live_thinking: String,
     live_tools: Vec<LiveToolEntry>,
+    info_panel: Option<InfoPanel>,
     show_thinking: bool,
     state: AppState,
 }
@@ -172,6 +183,7 @@ impl ReplHandler {
             live_assistant_text: String::new(),
             live_thinking: String::new(),
             live_tools: Vec::new(),
+            info_panel: None,
             show_thinking,
             state: AppState::Idle,
         }
@@ -207,6 +219,17 @@ impl ReplHandler {
 
     fn push_overlay(&mut self, line: impl Into<String>) {
         self.overlay_lines.push(line.into());
+    }
+
+    fn show_panel(&mut self, title: impl Into<String>, lines: Vec<String>) {
+        self.info_panel = Some(InfoPanel {
+            title: title.into(),
+            lines,
+        });
+    }
+
+    fn clear_panel(&mut self) {
+        self.info_panel = None;
     }
 
     fn begin_live_turn(&mut self, prompt: impl Into<String>) {
@@ -423,6 +446,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     let mut queued_prompts: Vec<String> = Vec::new();
     let mut awaiting_approval: Option<ApprovalRequest> = None;
     let mut active_turn: Option<ActiveTurn> = None;
+    let mut info_panel_scroll: usize = 0;
     let mut last_area = Rect::default();
     let mut onboarding_seen_recorded = false;
 
@@ -473,6 +497,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 active_turn.is_some(),
                 awaiting_approval.as_ref(),
                 queued_prompts.len(),
+                handler.info_panel.as_ref(),
             );
             let footer_hint = footer_hint_line(
                 ctx,
@@ -480,6 +505,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 active_turn.is_some(),
                 awaiting_approval.as_ref(),
                 queued_prompts.len(),
+                handler.info_panel.as_ref(),
             );
 
             frame.render_widget(
@@ -556,6 +582,22 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                     .alignment(Alignment::Center);
                 frame.render_widget(Clear, modal_area);
                 frame.render_widget(modal, modal_area);
+            } else if let Some(panel) = &handler.info_panel {
+                let modal_area = centered_rect(72, 72, area);
+                let mut panel_lines = panel.lines.clone();
+                panel_lines.push(String::new());
+                panel_lines.push(info_panel_hint_line().to_string());
+                let modal = Paragraph::new(panel_lines.join("\n"))
+                    .block(
+                        Block::default()
+                            .title(panel.title.as_str())
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(ACCENT)),
+                    )
+                    .wrap(Wrap { trim: false })
+                    .scroll((info_panel_scroll as u16, 0));
+                frame.render_widget(Clear, modal_area);
+                frame.render_widget(modal, modal_area);
             }
         })?;
 
@@ -606,6 +648,38 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                     continue;
                 }
 
+                if handler.info_panel.is_some() {
+                    let max_scroll = handler
+                        .info_panel
+                        .as_ref()
+                        .map(|panel| panel.lines.len().saturating_sub(1))
+                        .unwrap_or(0);
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?') => {
+                            handler.clear_panel();
+                            info_panel_scroll = 0;
+                            continue;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            info_panel_scroll = info_panel_scroll.saturating_sub(1);
+                            continue;
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            info_panel_scroll = info_panel_scroll.saturating_add(1).min(max_scroll);
+                            continue;
+                        }
+                        KeyCode::PageUp => {
+                            info_panel_scroll = info_panel_scroll.saturating_sub(8);
+                            continue;
+                        }
+                        KeyCode::PageDown => {
+                            info_panel_scroll = info_panel_scroll.saturating_add(8).min(max_scroll);
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+
                 match key.code {
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         break;
@@ -614,7 +688,9 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         break;
                     }
                     KeyCode::Char('?') if input_buffer.is_empty() => {
-                        handler.overlay_lines = help_overlay_lines(ctx);
+                        let panel = help_panel(ctx);
+                        handler.show_panel(panel.title, panel.lines);
+                        info_panel_scroll = 0;
                     }
                     KeyCode::Enter => {
                         if !input_buffer.trim().is_empty() {
@@ -853,8 +929,11 @@ fn footer_status_line(
     active_turn: bool,
     awaiting_approval: Option<&ApprovalRequest>,
     queued_count: usize,
+    info_panel: Option<&InfoPanel>,
 ) -> String {
-    let state = if let Some(req) = awaiting_approval {
+    let state = if let Some(panel) = info_panel {
+        format!("viewing {}", panel.title.to_ascii_lowercase())
+    } else if let Some(req) = awaiting_approval {
         format!("waiting for approval: {}", req.tool_name)
     } else if active_turn {
         if queued_count == 0 {
@@ -877,9 +956,14 @@ fn footer_hint_line(
     active_turn: bool,
     awaiting_approval: Option<&ApprovalRequest>,
     queued_count: usize,
+    info_panel: Option<&InfoPanel>,
 ) -> String {
     if awaiting_approval.is_some() {
         return "Press y to approve, n to deny. Ctrl+C or q exits.".to_string();
+    }
+
+    if info_panel.is_some() {
+        return "Press Esc or Enter to close this panel. q or Ctrl+C exits the REPL.".to_string();
     }
 
     if active_turn {
@@ -1443,14 +1527,14 @@ fn handle_slash_command(
         Some(entry) => match entry.source {
             CommandSource::BuiltIn => match entry.name.as_str() {
                 "/help" => {
-                    for line in help_overlay_lines(ctx) {
-                        handler.push_overlay(format!("[info] {line}"));
-                    }
+                    let panel = help_panel(ctx);
+                    handler.show_panel(panel.title, panel.lines);
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
                 "/clear" => {
                     handler.overlay_lines.clear();
+                    handler.clear_panel();
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
@@ -1507,42 +1591,20 @@ fn handle_slash_command(
                     return Ok(true);
                 }
                 "/tasks" => {
-                    handler.push_overlay("[info] Background tasks:");
-                    for line in background_task_lines(ctx) {
-                        handler.push_overlay(format!("[info] {line}"));
-                    }
+                    let panel = tasks_panel(ctx);
+                    handler.show_panel(panel.title, panel.lines);
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
                 "/sessions" => {
-                    let sessions = list_saved_sessions(ctx, 8);
-                    if sessions.is_empty() {
-                        handler.push_overlay("[info] No saved sessions found.");
-                    } else {
-                        handler.push_overlay(
-                            "[info] Recent sessions (current marked with *, forkable via /fork):",
-                        );
-                        for session in sessions {
-                            handler.push_overlay(format!(
-                                "[info] {}",
-                                format_saved_session_line(&session, &ctx.session().id)
-                            ));
-                        }
-                    }
+                    let panel = sessions_panel(ctx);
+                    handler.show_panel(panel.title, panel.lines);
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
                 "/tools" => {
-                    let lines = tool_surface_lines(ctx);
-                    handler.push_overlay(format!(
-                        "[info] Tools: built-in={}, skills={}, mcp={}",
-                        built_in_tool_count(ctx),
-                        ctx.skills().len(),
-                        mcp_tool_count(ctx)
-                    ));
-                    for line in lines {
-                        handler.push_overlay(format!("[info] {line}"));
-                    }
+                    let panel = tools_panel(ctx);
+                    handler.show_panel(panel.title, panel.lines);
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
@@ -1568,6 +1630,7 @@ fn handle_slash_command(
                             ctx.replace_session(forked);
                             let _ = ctx.save_session();
                             handler.overlay_lines.clear();
+                            handler.clear_panel();
                             handler.push_overlay(format!("[info] Forked {source_short} -> {forked_short}"));
                         }
                         Err(err) => {
@@ -2038,6 +2101,59 @@ fn session_compact_status(ctx: &TuiContext) -> String {
         status.push_str(label);
     }
     status
+}
+
+fn help_panel(ctx: &TuiContext) -> InfoPanel {
+    InfoPanel {
+        title: "Shortcuts and Commands".to_string(),
+        lines: help_overlay_lines(ctx),
+    }
+}
+
+fn sessions_panel(ctx: &TuiContext) -> InfoPanel {
+    let sessions = list_saved_sessions(ctx, 8);
+    let mut lines = vec![
+        format!(
+            "Current session: {} · cwd {}",
+            short_session_id(&ctx.session().id.to_string()),
+            display_path(&ctx.session().cwd)
+        ),
+        "Use /fork <session-id-or-prefix> to branch from a saved session.".to_string(),
+        "".to_string(),
+    ];
+    if sessions.is_empty() {
+        lines.push("No saved sessions found.".to_string());
+    } else {
+        for session in sessions {
+            lines.push(format_saved_session_line(&session, &ctx.session().id));
+        }
+    }
+    InfoPanel {
+        title: "Recent Sessions".to_string(),
+        lines,
+    }
+}
+
+fn tasks_panel(ctx: &TuiContext) -> InfoPanel {
+    InfoPanel {
+        title: "Background Tasks".to_string(),
+        lines: background_task_lines(ctx),
+    }
+}
+
+fn tools_panel(ctx: &TuiContext) -> InfoPanel {
+    let mut lines = vec![format!(
+        "built-in={} · skills={} · mcp={}",
+        built_in_tool_count(ctx),
+        ctx.skills().len(),
+        mcp_tool_count(ctx)
+    )];
+    lines.push(String::new());
+    lines.extend(tool_surface_lines(ctx));
+    InfoPanel {
+        title: "Active Tools".to_string(),
+        lines,
+    }
 }
 
 fn help_overlay_lines(ctx: &TuiContext) -> Vec<String> {
@@ -2595,7 +2711,12 @@ mod command_policy_tests {
 
         handle_slash_command(&mut ctx, &mut handler, "/help", &mut active_turn).unwrap();
 
-        let rendered = handler.overlay_lines.join("\n");
+        let rendered = handler
+            .info_panel
+            .as_ref()
+            .expect("help panel should be visible")
+            .lines
+            .join("\n");
         assert!(rendered.contains("Session context:"));
         assert!(rendered.contains("Shortcuts:"));
         assert!(rendered.contains("?            show this shortcut overlay"));
@@ -2616,6 +2737,13 @@ mod command_policy_tests {
     }
 
     #[test]
+    fn info_panel_hint_mentions_close_and_scroll_controls() {
+        let hint = info_panel_hint_line();
+        assert!(hint.contains("Esc/q/?"));
+        assert!(hint.contains("scroll"));
+    }
+
+    #[test]
     fn footer_status_line_and_hint_reflect_idle_and_slash_states() {
         let root = temp_dir("footer_status");
         let project = root.join("project");
@@ -2624,9 +2752,9 @@ mod command_policy_tests {
         fs::create_dir_all(&sessions_dir).expect("create sessions dir");
 
         let ctx = make_context_at(project, sessions_dir);
-        let footer = footer_status_line(&ctx, false, None, 0);
-        let hint = footer_hint_line(&ctx, "hello", false, None, 0);
-        let slash_hint = footer_hint_line(&ctx, "/hel", false, None, 0);
+        let footer = footer_status_line(&ctx, false, None, 0, None);
+        let hint = footer_hint_line(&ctx, "hello", false, None, 0, None);
+        let slash_hint = footer_hint_line(&ctx, "/hel", false, None, 0, None);
         let slash_prefix = prompt_prefix_for_state("/hel", false, None);
 
         assert!(footer.contains("idle"));
@@ -2658,9 +2786,9 @@ mod command_policy_tests {
             input: serde_json::json!({"command": "ls -la"}),
         };
 
-        let busy_footer = footer_status_line(&ctx, true, None, 0);
-        let approval_footer = footer_status_line(&ctx, true, Some(&request), 0);
-        let approval_hint = footer_hint_line(&ctx, "hello", true, Some(&request), 0);
+        let busy_footer = footer_status_line(&ctx, true, None, 0, None);
+        let approval_footer = footer_status_line(&ctx, true, Some(&request), 0, None);
+        let approval_hint = footer_hint_line(&ctx, "hello", true, Some(&request), 0, None);
         let approval_prefix = prompt_prefix_for_state("hello", true, Some(&request));
 
         assert!(busy_footer.contains("busy: assistant responding"));
@@ -2680,8 +2808,8 @@ mod command_policy_tests {
         fs::create_dir_all(&sessions_dir).expect("create sessions dir");
 
         let ctx = make_context_at(project, sessions_dir);
-        let busy_footer = footer_status_line(&ctx, true, None, 2);
-        let busy_hint = footer_hint_line(&ctx, "next prompt", true, None, 2);
+        let busy_footer = footer_status_line(&ctx, true, None, 2, None);
+        let busy_hint = footer_hint_line(&ctx, "next prompt", true, None, 2, None);
         let busy_prefix = prompt_prefix_for_state("next prompt", true, None);
         let queued_lines = queued_prompt_preview_lines(&[
             "first queued prompt".to_string(),
@@ -2698,6 +2826,37 @@ mod command_policy_tests {
         assert_eq!(busy_prefix, "Queue> ");
         assert!(rendered_queue.contains("Queued prompts"));
         assert!(rendered_queue.contains("queued> first queued prompt"));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn info_panels_are_sectioned_and_contextual() {
+        let root = temp_dir("info_panels");
+        let project = root.join("project");
+        let sessions_dir = root.join("sessions");
+        fs::create_dir_all(&project).expect("create project dir");
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+
+        let ctx = make_context_at(project.clone(), sessions_dir.clone());
+        let current = ctx.session().clone();
+        current.save(&sessions_dir).expect("save current session");
+        let older = Session::with_mode(project, SessionMode::Headless);
+        older.save(&sessions_dir).expect("save older session");
+
+        let help = help_panel(&ctx);
+        let sessions = sessions_panel(&ctx);
+        let tools = tools_panel(&ctx);
+        let tasks = tasks_panel(&ctx);
+
+        assert_eq!(help.title, "Shortcuts and Commands");
+        assert!(help.lines.iter().any(|line| line.contains("Built-in commands:")));
+        assert_eq!(sessions.title, "Recent Sessions");
+        assert!(sessions.lines.iter().any(|line| line.contains("Use /fork")));
+        assert_eq!(tools.title, "Active Tools");
+        assert!(tools.lines[0].contains("built-in="));
+        assert_eq!(tasks.title, "Background Tasks");
+        assert!(tasks.lines.iter().any(|line| line.contains("No background tasks")));
 
         fs::remove_dir_all(root).ok();
     }
@@ -2771,8 +2930,13 @@ mod command_policy_tests {
         let mut active_turn = None;
         handle_slash_command(&mut ctx, &mut handler, "/sessions", &mut active_turn).unwrap();
 
-        let rendered = handler.overlay_lines.join("\n");
-        assert!(rendered.contains("Recent sessions (current marked with *, forkable via /fork):"));
+        let panel = handler
+            .info_panel
+            .as_ref()
+            .expect("sessions panel should be visible");
+        let rendered = panel.lines.join("\n");
+        assert_eq!(panel.title, "Recent Sessions");
+        assert!(rendered.contains("Use /fork"));
         assert!(rendered.contains("* "));
 
         fs::remove_dir_all(root).ok();
