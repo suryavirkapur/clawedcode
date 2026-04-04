@@ -963,7 +963,7 @@ fn footer_hint_line(
     }
 
     if info_panel.is_some() {
-        return "Press Esc or Enter to close this panel. q or Ctrl+C exits the REPL.".to_string();
+        return "Esc/q/? closes this panel. Use ↑/↓ or j/k to scroll. Ctrl+C exits.".to_string();
     }
 
     if active_turn {
@@ -2857,6 +2857,26 @@ mod command_policy_tests {
         assert!(tools.lines[0].contains("built-in="));
         assert_eq!(tasks.title, "Background Tasks");
         assert!(tasks.lines.iter().any(|line| line.contains("No background tasks")));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn info_panel_footer_surfaces_close_and_scroll_controls() {
+        let root = temp_dir("info_panel_footer");
+        let project = root.join("project");
+        let sessions_dir = root.join("sessions");
+        fs::create_dir_all(&project).expect("create project dir");
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+
+        let ctx = make_context_at(project, sessions_dir);
+        let panel = help_panel(&ctx);
+        let status = footer_status_line(&ctx, false, None, 0, Some(&panel));
+        let hint = footer_hint_line(&ctx, "", false, None, 0, Some(&panel));
+
+        assert!(status.contains("viewing shortcuts and commands"));
+        assert!(hint.contains("Esc/q/?"));
+        assert!(hint.contains("scroll"));
 
         fs::remove_dir_all(root).ok();
     }
