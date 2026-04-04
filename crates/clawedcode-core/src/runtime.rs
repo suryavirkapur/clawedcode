@@ -7,7 +7,7 @@ use crate::{
     config::{AppConfig, default_data_dir},
     content::ContentBlock,
     permissions::{PermissionDecision, PermissionEngine, PermissionMode},
-    prompt::PromptSpec,
+    prompt::{PromptRenderContext, PromptSpec, render_system_prompt},
     session::{Message, Role, Session, SessionMode},
     subagent::{SubAgentConfig, SubAgentResult, SubAgentRuntime},
     tasks::execute_task_tool,
@@ -470,7 +470,7 @@ impl Runtime {
 
     pub fn start_session_with_mode(&self, cwd: PathBuf, mode: SessionMode) -> Session {
         let mut session = Session::with_mode(cwd, mode);
-        session.push(Role::System, self.system_prompt.body);
+        session.push(Role::System, self.effective_system_prompt_body(&session));
         session
     }
 
@@ -495,15 +495,17 @@ impl Runtime {
             .collect()
     }
 
-    fn effective_system_prompt_body(&self) -> String {
-        if self.compatibility.memory.trim().is_empty() {
-            self.system_prompt.body.to_string()
-        } else {
-            format!(
-                "{}\n\n## Loaded Memory\n{}",
-                self.system_prompt.body, self.compatibility.memory
-            )
-        }
+    fn effective_system_prompt_body(&self, session: &Session) -> String {
+        let tool_names: Vec<String> = self.tools.iter().map(|tool| tool.name.clone()).collect();
+        render_system_prompt(
+            &self.system_prompt,
+            &PromptRenderContext {
+                session,
+                model: &self.config.model,
+                tool_names: &tool_names,
+                compatibility: &self.compatibility,
+            },
+        )
     }
 
     pub fn build_request(&self, session: &Session) -> CompletionRequest {
@@ -521,7 +523,7 @@ impl Runtime {
             model: self.config.model.clone(),
             prompt_pack: self.config.prompts.default_prompt_pack.clone(),
             system_prompt_name: self.system_prompt.name.to_string(),
-            system_prompt_body: self.effective_system_prompt_body(),
+            system_prompt_body: self.effective_system_prompt_body(session),
             prompt: prompt_override
                 .unwrap_or_else(|| session.last_user_text().unwrap_or_default())
                 .to_string(),
@@ -2628,10 +2630,12 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
             })
             .collect();
 
-        assert_eq!(
-            texts,
-            vec!["You are a test assistant.", "second", "second reply"]
+        assert!(
+            texts[0].starts_with("## System"),
+            "expected rendered system prompt to start with a System section"
         );
+        assert!(texts[0].contains("You are a test assistant."));
+        assert_eq!(&texts[1..], ["second", "second reply"]);
     }
 
     #[test]
@@ -2670,7 +2674,9 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
             clawedcode_api::ProviderContentBlock::Text { text } => Some(text.as_str()),
             _ => None,
         });
-        assert_eq!(system_text, Some("You are a test assistant."));
+        let system_text = system_text.expect("expected system prompt text");
+        assert!(system_text.starts_with("## System"));
+        assert!(system_text.contains("You are a test assistant."));
     }
 
     #[test]
@@ -2732,6 +2738,74 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
     }
 
     #[test]
+    fn build_request_renders_dynamic_environment_tools_and_mcp_sections() {
+        let _guard = crate::test_support::env_lock();
+        unsafe { std::env::set_var("SHELL", "/bin/bash") };
+
+        let mut config = AppConfig::default();
+        config.model = "test-model".to_string();
+
+        let prompt_spec = PromptSpec {
+            name: "test",
+            summary: "test",
+            body: "You are a test assistant.",
+        };
+        let script_path = temp_python_mcp_server();
+        let mut mcp_servers = std::collections::BTreeMap::new();
+        mcp_servers.insert(
+            "demo-server".to_string(),
+            McpServerConfig::Stdio {
+                r#type: Some("stdio".to_string()),
+                command: "python3".to_string(),
+                args: vec![script_path.to_string_lossy().into_owned()],
+                env: std::collections::BTreeMap::new(),
+            },
+        );
+        let compat = CompatibilitySnapshot {
+            settings_files: vec![],
+            settings: serde_json::Value::Null,
+            skills: vec![],
+            memory_files: vec![],
+            memory: "Follow the project rule.".to_string(),
+            mcp_servers,
+        };
+        let runtime = Runtime::with_provider(
+            config,
+            prompt_spec,
+            compat,
+            PermissionMode::Default,
+            Box::new(MockProvider),
+        );
+
+        let session = runtime.start_session(PathBuf::from("/tmp/dynamic-prompt"));
+        let system_text = session
+            .messages
+            .first()
+            .and_then(|message| message.primary_text())
+            .expect("expected initial system prompt");
+
+        assert!(system_text.starts_with("## System"));
+        assert!(system_text.contains("## Doing Tasks"));
+        assert!(system_text.contains("## Actions With Care"));
+        assert!(system_text.contains("## Using Your Tools"));
+        assert!(system_text.contains("shell"));
+        assert!(system_text.contains("## Tone And Style"));
+        assert!(system_text.contains("## Environment"));
+        assert!(system_text.contains("Primary working directory: /tmp/dynamic-prompt"));
+        assert!(system_text.contains("Date: "));
+        assert!(system_text.contains("Model: test-model"));
+        assert!(system_text.contains("Shell: /bin/bash"));
+        assert!(system_text.contains("## Loaded Memory"));
+        assert!(system_text.contains("Follow the project rule."));
+        assert!(system_text.contains("## MCP Server Instructions"));
+        assert!(system_text.contains("demo-server"));
+        assert!(system_text.contains("stdio via `python3`"));
+
+        unsafe { std::env::remove_var("SHELL") };
+        fs::remove_file(script_path).ok();
+    }
+
+    #[test]
     fn build_request_includes_merged_memory_in_system_prompt_body() {
         let config = AppConfig::default();
         let prompt_spec = PromptSpec {
@@ -2769,6 +2843,88 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
                 .system_prompt_body
                 .contains("Follow the project rule.")
         );
+    }
+
+    #[test]
+    fn build_request_includes_dynamic_environment_and_tool_sections() {
+        let config = AppConfig::default();
+        let prompt_spec = PromptSpec {
+            name: "test",
+            summary: "test",
+            body: "You are a test assistant.",
+        };
+        let compat = CompatibilitySnapshot {
+            settings_files: vec![],
+            settings: serde_json::Value::Null,
+            skills: vec![],
+            memory_files: vec![],
+            memory: String::new(),
+            mcp_servers: std::collections::BTreeMap::new(),
+        };
+        let runtime = Runtime::with_provider(
+            config,
+            prompt_spec,
+            compat,
+            PermissionMode::Default,
+            Box::new(MockProvider),
+        );
+
+        let session = runtime.start_session(PathBuf::from("/tmp"));
+        let request = runtime.build_request(&session);
+
+        assert!(request.system_prompt_body.contains("## Doing Tasks"));
+        assert!(request.system_prompt_body.contains("## Actions With Care"));
+        assert!(request.system_prompt_body.contains("## Using Your Tools"));
+        assert!(request.system_prompt_body.contains("## Session Guidance"));
+        assert!(request.system_prompt_body.contains("## Language"));
+        assert!(request.system_prompt_body.contains("## Environment"));
+        assert!(request.system_prompt_body.contains("Primary working directory: /tmp"));
+        assert!(request.system_prompt_body.contains("Model: gpt-5"));
+        assert!(request.system_prompt_body.contains("Current setting: default"));
+        assert!(request.system_prompt_body.contains("shell"));
+        assert!(request.system_prompt_body.contains("read_file"));
+        assert!(request.system_prompt_body.contains("apply_patch"));
+    }
+
+    #[test]
+    fn build_request_includes_mcp_server_section_when_present() {
+        let config = AppConfig::default();
+        let prompt_spec = PromptSpec {
+            name: "test",
+            summary: "test",
+            body: "You are a test assistant.",
+        };
+        let mut mcp_servers = std::collections::BTreeMap::new();
+        mcp_servers.insert(
+            "example-http".to_string(),
+            McpServerConfig::Http {
+                r#type: "http".to_string(),
+                url: "https://example.com/mcp".to_string(),
+                headers: std::collections::BTreeMap::new(),
+            },
+        );
+        let compat = CompatibilitySnapshot {
+            settings_files: vec![],
+            settings: serde_json::Value::Null,
+            skills: vec![],
+            memory_files: vec![],
+            memory: String::new(),
+            mcp_servers,
+        };
+        let runtime = Runtime::with_provider(
+            config,
+            prompt_spec,
+            compat,
+            PermissionMode::Default,
+            Box::new(MockProvider),
+        );
+
+        let session = runtime.start_session(PathBuf::from("/tmp"));
+        let request = runtime.build_request(&session);
+
+        assert!(request.system_prompt_body.contains("## MCP Server Instructions"));
+        assert!(request.system_prompt_body.contains("example-http"));
+        assert!(request.system_prompt_body.contains("https://example.com/mcp"));
     }
 
     #[test]
