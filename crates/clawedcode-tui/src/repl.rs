@@ -435,6 +435,13 @@ struct ActiveTurn {
     _join: thread::JoinHandle<()>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct TranscriptViewport {
+    scroll_offset: usize,
+    pinned_to_bottom: bool,
+    unseen_count: usize,
+}
+
 fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     let mut handler = ReplHandler::new(ctx.show_thinking);
     handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
@@ -442,13 +449,17 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
 
     let mut input_buffer = String::new();
     let mut cursor_pos: usize = 0;
-    let mut scroll_offset: usize = 0;
+    let mut viewport = TranscriptViewport {
+        pinned_to_bottom: true,
+        ..TranscriptViewport::default()
+    };
     let mut queued_prompts: Vec<String> = Vec::new();
     let mut awaiting_approval: Option<ApprovalRequest> = None;
     let mut active_turn: Option<ActiveTurn> = None;
     let mut info_panel_scroll: usize = 0;
     let mut last_area = Rect::default();
     let mut onboarding_seen_recorded = false;
+    let mut last_visible_line_count = handler.visible_lines().len();
 
     if let Some(prompt) = ctx.take_startup_prompt() {
         handler.begin_live_turn(prompt.clone());
@@ -470,6 +481,12 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
         if input_buffer.trim_start().starts_with('/') {
             let _ = ctx.refresh_compatibility_if_stale(Duration::from_millis(500));
         }
+
+        let visible_line_count = handler.visible_lines().len();
+        if visible_line_count > last_visible_line_count && !viewport.pinned_to_bottom {
+            viewport.unseen_count += visible_line_count - last_visible_line_count;
+        }
+        last_visible_line_count = visible_line_count;
 
         terminal.draw(|frame| {
             let area = frame.area();
@@ -498,6 +515,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 awaiting_approval.as_ref(),
                 queued_prompts.len(),
                 handler.info_panel.as_ref(),
+                &viewport,
             );
             let footer_hint = footer_hint_line(
                 ctx,
@@ -506,7 +524,14 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 awaiting_approval.as_ref(),
                 queued_prompts.len(),
                 handler.info_panel.as_ref(),
+                &viewport,
             );
+
+            if viewport.pinned_to_bottom {
+                viewport.scroll_offset =
+                    max_transcript_scroll(&handler, chunks[1].height as usize);
+                viewport.unseen_count = 0;
+            }
 
             frame.render_widget(
                 Paragraph::new(launch_banner(ctx)).style(Style::default().fg(MUTED)),
@@ -520,7 +545,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 &handler,
                 &input_buffer,
                 &command_entries,
-                scroll_offset,
+                viewport.scroll_offset,
             );
 
             if !queued_preview_lines.is_empty() {
@@ -641,10 +666,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         }
                         _ => {}
                     }
-                    scroll_offset = handler
-                        .visible_lines()
-                        .len()
-                        .saturating_sub(chunks[1].height as usize);
+                    viewport.pinned_to_bottom = true;
+                    viewport.unseen_count = 0;
                     continue;
                 }
 
@@ -681,6 +704,47 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 }
 
                 match key.code {
+                    KeyCode::Up if handler.has_content() && input_buffer.is_empty() => {
+                        viewport.scroll_offset = viewport.scroll_offset.saturating_sub(1);
+                        viewport.pinned_to_bottom = viewport.scroll_offset
+                            >= max_transcript_scroll(&handler, chunks[1].height as usize);
+                    }
+                    KeyCode::Down if handler.has_content() && input_buffer.is_empty() => {
+                        let max_scroll = max_transcript_scroll(&handler, chunks[1].height as usize);
+                        viewport.scroll_offset =
+                            viewport.scroll_offset.saturating_add(1).min(max_scroll);
+                        viewport.pinned_to_bottom = viewport.scroll_offset >= max_scroll;
+                        if viewport.pinned_to_bottom {
+                            viewport.unseen_count = 0;
+                        }
+                    }
+                    KeyCode::PageUp if handler.has_content() && input_buffer.is_empty() => {
+                        let step = chunks[1].height.saturating_sub(2) as usize;
+                        viewport.scroll_offset = viewport.scroll_offset.saturating_sub(step.max(1));
+                        viewport.pinned_to_bottom = false;
+                    }
+                    KeyCode::PageDown if handler.has_content() && input_buffer.is_empty() => {
+                        let max_scroll = max_transcript_scroll(&handler, chunks[1].height as usize);
+                        let step = chunks[1].height.saturating_sub(2) as usize;
+                        viewport.scroll_offset = viewport
+                            .scroll_offset
+                            .saturating_add(step.max(1))
+                            .min(max_scroll);
+                        viewport.pinned_to_bottom = viewport.scroll_offset >= max_scroll;
+                        if viewport.pinned_to_bottom {
+                            viewport.unseen_count = 0;
+                        }
+                    }
+                    KeyCode::Home if handler.has_content() && input_buffer.is_empty() => {
+                        viewport.scroll_offset = 0;
+                        viewport.pinned_to_bottom = false;
+                    }
+                    KeyCode::End if handler.has_content() && input_buffer.is_empty() => {
+                        viewport.scroll_offset =
+                            max_transcript_scroll(&handler, chunks[1].height as usize);
+                        viewport.pinned_to_bottom = true;
+                        viewport.unseen_count = 0;
+                    }
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         break;
                     }
@@ -739,11 +803,6 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 }
             }
         }
-
-        scroll_offset = handler
-            .visible_lines()
-            .len()
-            .saturating_sub(chunks[1].height as usize);
     }
 
     Ok(())
@@ -930,9 +989,16 @@ fn footer_status_line(
     awaiting_approval: Option<&ApprovalRequest>,
     queued_count: usize,
     info_panel: Option<&InfoPanel>,
+    viewport: &TranscriptViewport,
 ) -> String {
     let state = if let Some(panel) = info_panel {
         format!("viewing {}", panel.title.to_ascii_lowercase())
+    } else if !viewport.pinned_to_bottom {
+        if viewport.unseen_count == 0 {
+            "scrolled transcript".to_string()
+        } else {
+            format!("scrolled transcript · {} unseen", viewport.unseen_count)
+        }
     } else if let Some(req) = awaiting_approval {
         format!("waiting for approval: {}", req.tool_name)
     } else if active_turn {
@@ -957,6 +1023,7 @@ fn footer_hint_line(
     awaiting_approval: Option<&ApprovalRequest>,
     queued_count: usize,
     info_panel: Option<&InfoPanel>,
+    viewport: &TranscriptViewport,
 ) -> String {
     if awaiting_approval.is_some() {
         return "Press y to approve, n to deny. Ctrl+C or q exits.".to_string();
@@ -964,6 +1031,11 @@ fn footer_hint_line(
 
     if info_panel.is_some() {
         return "Esc/q/? closes this panel. Use ↑/↓ or j/k to scroll. Ctrl+C exits.".to_string();
+    }
+
+    if !viewport.pinned_to_bottom {
+        return "Use ↑/↓/PgUp/PgDn/Home/End to browse transcript. End jumps back to live output."
+            .to_string();
     }
 
     if active_turn {
@@ -993,6 +1065,13 @@ fn footer_hint_line(
     }
 
     "Enter to send · ? for shortcuts · / for commands · /sessions for recent sessions · /tools for tools".to_string()
+}
+
+fn max_transcript_scroll(handler: &ReplHandler, viewport_height: usize) -> usize {
+    handler
+        .visible_lines()
+        .len()
+        .saturating_sub(viewport_height)
 }
 
 fn prompt_prefix_for_state(
@@ -2752,9 +2831,13 @@ mod command_policy_tests {
         fs::create_dir_all(&sessions_dir).expect("create sessions dir");
 
         let ctx = make_context_at(project, sessions_dir);
-        let footer = footer_status_line(&ctx, false, None, 0, None);
-        let hint = footer_hint_line(&ctx, "hello", false, None, 0, None);
-        let slash_hint = footer_hint_line(&ctx, "/hel", false, None, 0, None);
+        let viewport = TranscriptViewport {
+            pinned_to_bottom: true,
+            ..TranscriptViewport::default()
+        };
+        let footer = footer_status_line(&ctx, false, None, 0, None, &viewport);
+        let hint = footer_hint_line(&ctx, "hello", false, None, 0, None, &viewport);
+        let slash_hint = footer_hint_line(&ctx, "/hel", false, None, 0, None, &viewport);
         let slash_prefix = prompt_prefix_for_state("/hel", false, None);
 
         assert!(footer.contains("idle"));
@@ -2785,10 +2868,15 @@ mod command_policy_tests {
             tool_name: "shell".to_string(),
             input: serde_json::json!({"command": "ls -la"}),
         };
+        let viewport = TranscriptViewport {
+            pinned_to_bottom: true,
+            ..TranscriptViewport::default()
+        };
 
-        let busy_footer = footer_status_line(&ctx, true, None, 0, None);
-        let approval_footer = footer_status_line(&ctx, true, Some(&request), 0, None);
-        let approval_hint = footer_hint_line(&ctx, "hello", true, Some(&request), 0, None);
+        let busy_footer = footer_status_line(&ctx, true, None, 0, None, &viewport);
+        let approval_footer = footer_status_line(&ctx, true, Some(&request), 0, None, &viewport);
+        let approval_hint =
+            footer_hint_line(&ctx, "hello", true, Some(&request), 0, None, &viewport);
         let approval_prefix = prompt_prefix_for_state("hello", true, Some(&request));
 
         assert!(busy_footer.contains("busy: assistant responding"));
@@ -2808,8 +2896,12 @@ mod command_policy_tests {
         fs::create_dir_all(&sessions_dir).expect("create sessions dir");
 
         let ctx = make_context_at(project, sessions_dir);
-        let busy_footer = footer_status_line(&ctx, true, None, 2, None);
-        let busy_hint = footer_hint_line(&ctx, "next prompt", true, None, 2, None);
+        let viewport = TranscriptViewport {
+            pinned_to_bottom: true,
+            ..TranscriptViewport::default()
+        };
+        let busy_footer = footer_status_line(&ctx, true, None, 2, None, &viewport);
+        let busy_hint = footer_hint_line(&ctx, "next prompt", true, None, 2, None, &viewport);
         let busy_prefix = prompt_prefix_for_state("next prompt", true, None);
         let queued_lines = queued_prompt_preview_lines(&[
             "first queued prompt".to_string(),
@@ -2871,12 +2963,41 @@ mod command_policy_tests {
 
         let ctx = make_context_at(project, sessions_dir);
         let panel = help_panel(&ctx);
-        let status = footer_status_line(&ctx, false, None, 0, Some(&panel));
-        let hint = footer_hint_line(&ctx, "", false, None, 0, Some(&panel));
+        let viewport = TranscriptViewport {
+            pinned_to_bottom: true,
+            ..TranscriptViewport::default()
+        };
+        let status = footer_status_line(&ctx, false, None, 0, Some(&panel), &viewport);
+        let hint = footer_hint_line(&ctx, "", false, None, 0, Some(&panel), &viewport);
 
         assert!(status.contains("viewing shortcuts and commands"));
         assert!(hint.contains("Esc/q/?"));
         assert!(hint.contains("scroll"));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn scrolled_transcript_footer_surfaces_navigation_and_unseen_state() {
+        let root = temp_dir("scrolled_transcript_footer");
+        let project = root.join("project");
+        let sessions_dir = root.join("sessions");
+        fs::create_dir_all(&project).expect("create project dir");
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+
+        let ctx = make_context_at(project, sessions_dir);
+        let viewport = TranscriptViewport {
+            scroll_offset: 4,
+            pinned_to_bottom: false,
+            unseen_count: 3,
+        };
+        let status = footer_status_line(&ctx, false, None, 0, None, &viewport);
+        let hint = footer_hint_line(&ctx, "", false, None, 0, None, &viewport);
+
+        assert!(status.contains("scrolled transcript"));
+        assert!(status.contains("3 unseen"));
+        assert!(hint.contains("PgUp"));
+        assert!(hint.contains("End jumps back"));
 
         fs::remove_dir_all(root).ok();
     }
