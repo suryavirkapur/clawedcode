@@ -1234,7 +1234,33 @@ fn spawn_turn_worker(
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if let Some(executor) = external_turn_executor {
                 session.push(Role::User, visible_prompt.clone());
-                match executor.submit_turn(&mut session, &visible_prompt, execution_prompt.as_deref()) {
+                let tx = event_tx.clone();
+                let mut on_event = move |event: TuiEvent| {
+                    let _ = tx.send(TurnWorkerEvent::Ui(event));
+                };
+                let tx = event_tx.clone();
+                let approval_rx = approval_rx.clone();
+                let mut request_approval = move |request: ApprovalRequest| {
+                    if tx
+                        .send(TurnWorkerEvent::ApprovalRequested(request))
+                        .is_err()
+                    {
+                        return false;
+                    }
+
+                    approval_rx
+                        .lock()
+                        .ok()
+                        .and_then(|rx| rx.recv().ok())
+                        .unwrap_or(false)
+                };
+                match executor.submit_turn(
+                    &mut session,
+                    &visible_prompt,
+                    execution_prompt.as_deref(),
+                    &mut on_event,
+                    &mut request_approval,
+                ) {
                     Ok(result) => {
                         let mut assistant_blocks = Vec::new();
                         if let Some(transport_session_id) = result.transport_session_id {
@@ -1245,12 +1271,8 @@ fn spawn_turn_worker(
                                 ),
                             ));
                         }
-                        let response = result.response;
-                        if !response.is_empty() {
-                            let _ = event_tx.send(TurnWorkerEvent::Ui(TuiEvent::MessageDelta {
-                                text: response.clone(),
-                            }));
-                            assistant_blocks.insert(0, ContentBlock::text(response));
+                        if !result.response.is_empty() {
+                            assistant_blocks.insert(0, ContentBlock::text(result.response));
                         }
                         if assistant_blocks.is_empty() {
                             assistant_blocks.push(ContentBlock::text(""));
@@ -1265,7 +1287,6 @@ fn spawn_turn_worker(
                     }
                 }
 
-                let _ = event_tx.send(TurnWorkerEvent::Ui(TuiEvent::AssistantDone));
                 let _ = event_tx.send(TurnWorkerEvent::Ui(TuiEvent::TurnComplete));
                 let _ = event_tx.send(TurnWorkerEvent::Finished(session));
                 return;

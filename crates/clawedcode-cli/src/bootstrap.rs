@@ -2,10 +2,10 @@ use crate::cli::{Cli, Command};
 use anyhow::{Context, Result};
 use clawedcode_core::{
     compat,
-    config::{default_config_path, AppConfig},
+    config::{AppConfig, default_config_path},
 };
 use std::{fs, path::PathBuf};
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Debug)]
 pub struct BootstrappedApp {
@@ -35,6 +35,7 @@ pub struct RunMode {
     pub prompt: String,
     pub system_prompt: Option<String>,
     pub json: bool,
+    pub stream_json: bool,
     pub show_thinking: bool,
     pub yes: bool,
 }
@@ -44,6 +45,7 @@ pub struct ResumeMode {
     pub session_id: String,
     pub prompt: Option<String>,
     pub json: bool,
+    pub stream_json: bool,
     pub show_thinking: bool,
     pub yes: bool,
 }
@@ -171,12 +173,14 @@ pub fn resolve_mode(cli: &Cli) -> Result<ExecutionMode> {
             prompt,
             system_prompt,
             json,
+            stream_json,
             show_thinking,
             yes,
         } => Ok(ExecutionMode::Run(RunMode {
             prompt,
             system_prompt,
             json,
+            stream_json,
             show_thinking,
             yes,
         })),
@@ -184,12 +188,14 @@ pub fn resolve_mode(cli: &Cli) -> Result<ExecutionMode> {
             session_id,
             prompt,
             json,
+            stream_json,
             show_thinking,
             yes,
         } => Ok(ExecutionMode::Resume(ResumeMode {
             session_id,
             prompt,
             json,
+            stream_json,
             show_thinking,
             yes,
         })),
@@ -276,11 +282,27 @@ fn prompt_payload_from_command(command: Option<&Command>) -> PromptExecutionPayl
             prompt,
             system_prompt,
             json,
+            stream_json: _,
             show_thinking,
             yes,
         }) => PromptExecutionPayload {
             prompt: Some(prompt.clone()),
             system_prompt: system_prompt.clone(),
+            json: *json,
+            show_thinking: *show_thinking,
+            yes: *yes,
+            output_path: None,
+        },
+        Some(Command::Resume {
+            prompt,
+            json,
+            stream_json: _,
+            show_thinking,
+            yes,
+            ..
+        }) => PromptExecutionPayload {
+            prompt: prompt.clone(),
+            system_prompt: None,
             json: *json,
             show_thinking: *show_thinking,
             yes: *yes,
@@ -413,6 +435,7 @@ mod tests {
             prompt: "hello".to_string(),
             system_prompt: None,
             json: false,
+            stream_json: false,
             show_thinking: false,
             yes: false,
         });
@@ -427,11 +450,33 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_mode_run_stream_json() {
+        let cli = make_cli(Command::Run {
+            prompt: "hello".to_string(),
+            system_prompt: None,
+            json: true,
+            stream_json: true,
+            show_thinking: true,
+            yes: true,
+        });
+        let mode = resolve_mode(&cli).unwrap();
+        if let ExecutionMode::Run(run) = mode {
+            assert!(run.json);
+            assert!(run.stream_json);
+            assert!(run.show_thinking);
+            assert!(run.yes);
+        } else {
+            panic!("expected run mode");
+        }
+    }
+
+    #[test]
     fn test_resolve_mode_resume() {
         let cli = make_cli(Command::Resume {
             session_id: "abc-123".to_string(),
             prompt: Some("continue".to_string()),
             json: false,
+            stream_json: false,
             show_thinking: false,
             yes: false,
         });
@@ -442,6 +487,29 @@ mod tests {
             assert_eq!(resume.prompt.as_deref(), Some("continue"));
             assert!(!resume.show_thinking);
             assert!(!resume.yes);
+        }
+    }
+
+    #[test]
+    fn test_resolve_mode_resume_stream_json() {
+        let cli = make_cli(Command::Resume {
+            session_id: "abc-123".to_string(),
+            prompt: Some("continue".to_string()),
+            json: true,
+            stream_json: true,
+            show_thinking: true,
+            yes: true,
+        });
+        let mode = resolve_mode(&cli).unwrap();
+        if let ExecutionMode::Resume(resume) = mode {
+            assert_eq!(resume.session_id, "abc-123");
+            assert_eq!(resume.prompt.as_deref(), Some("continue"));
+            assert!(resume.json);
+            assert!(resume.stream_json);
+            assert!(resume.show_thinking);
+            assert!(resume.yes);
+        } else {
+            panic!("expected resume mode");
         }
     }
 
@@ -666,6 +734,7 @@ mod tests {
                 prompt: "hello".to_string(),
                 system_prompt: Some("be helpful".to_string()),
                 json: true,
+                stream_json: false,
                 show_thinking: true,
                 yes: true,
             }),

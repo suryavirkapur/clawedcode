@@ -39,6 +39,8 @@ pub enum Command {
         system_prompt: Option<String>,
         #[arg(long)]
         json: bool,
+        #[arg(long, hide = true)]
+        stream_json: bool,
         #[arg(long)]
         show_thinking: bool,
         #[arg(long, short = 'y')]
@@ -52,6 +54,8 @@ pub enum Command {
         prompt: Option<String>,
         #[arg(long)]
         json: bool,
+        #[arg(long, hide = true)]
+        stream_json: bool,
         #[arg(long)]
         show_thinking: bool,
         #[arg(long, short = 'y')]
@@ -233,6 +237,7 @@ mod tests {
             prompt: "hello".to_string(),
             system_prompt: None,
             json: false,
+            stream_json: false,
             show_thinking: false,
             yes: false,
         }));
@@ -245,6 +250,7 @@ mod tests {
             session_id: "abc".to_string(),
             prompt: None,
             json: false,
+            stream_json: false,
             show_thinking: false,
             yes: false,
         }));

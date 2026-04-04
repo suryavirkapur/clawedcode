@@ -15,8 +15,9 @@ use crate::{
 use clawedcode_api::ApiEvent;
 use clawedcode_tools::ToolSpec;
 use futures_util::StreamExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
+    cell::RefCell,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -34,6 +35,8 @@ pub trait ExternalTurnExecutor: Send + Sync {
         session: &mut Session,
         visible_prompt: &str,
         execution_prompt: Option<&str>,
+        on_event: &mut dyn FnMut(TuiEvent),
+        request_approval: &mut dyn FnMut(ApprovalRequest) -> bool,
     ) -> anyhow::Result<ExternalTurnResult>;
 }
 
@@ -51,14 +54,14 @@ pub struct TuiContext {
     last_compatibility_refresh: Instant,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     pub tool_use_id: String,
     pub tool_name: String,
     pub input: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TuiEvent {
     ThinkingDelta {
         text: String,
@@ -184,31 +187,47 @@ impl TuiContext {
     ) {
         if let Some(executor) = &self.external_turn_executor {
             self.session.push(Role::User, visible_prompt);
-            match executor.submit_turn(&mut self.session, visible_prompt, execution_prompt) {
+            let handler = RefCell::new(handler);
+            let mut on_event = |event: TuiEvent| {
+                let handler = &mut *handler.borrow_mut();
+                handler.on_event(&event);
+            };
+            let mut request_approval = |request: ApprovalRequest| {
+                let handler = &mut *handler.borrow_mut();
+                handler.request_approval(&request)
+            };
+            match executor.submit_turn(
+                &mut self.session,
+                visible_prompt,
+                execution_prompt,
+                &mut on_event,
+                &mut request_approval,
+            ) {
                 Ok(result) => {
                     let mut assistant_blocks = Vec::new();
-                    assistant_blocks.push(ContentBlock::text(result.response.clone()));
+                    if !result.response.is_empty() {
+                        assistant_blocks.push(ContentBlock::text(result.response.clone()));
+                    }
                     if let Some(transport_session_id) = result.transport_session_id {
                         self.session.transport_session_id = Some(transport_session_id.clone());
                         assistant_blocks
                             .push(ContentBlock::thinking(transport_session_id_marker(&transport_session_id)));
                     }
-                    handler.on_event(&TuiEvent::MessageDelta {
-                        text: result.response.clone(),
-                    });
-                    handler.on_event(&TuiEvent::AssistantDone);
+                    if assistant_blocks.is_empty() {
+                        assistant_blocks.push(ContentBlock::text(""));
+                    }
                     self.session.push_blocks(Role::Assistant, assistant_blocks);
-                    handler.on_event(&TuiEvent::TurnComplete);
+                    on_event(TuiEvent::TurnComplete);
                 }
                 Err(err) => {
                     let message = format!("Transport error: {err}");
-                    handler.on_event(&TuiEvent::MessageDelta {
+                    on_event(TuiEvent::MessageDelta {
                         text: message.clone(),
                     });
-                    handler.on_event(&TuiEvent::AssistantDone);
+                    on_event(TuiEvent::AssistantDone);
                     self.session
                         .push_blocks(Role::Assistant, vec![ContentBlock::text(message)]);
-                    handler.on_event(&TuiEvent::TurnComplete);
+                    on_event(TuiEvent::TurnComplete);
                 }
             }
             return;
@@ -601,12 +620,18 @@ mod tests {
             session: &mut Session,
             visible_prompt: &str,
             execution_prompt: Option<&str>,
+            on_event: &mut dyn FnMut(TuiEvent),
+            _request_approval: &mut dyn FnMut(ApprovalRequest) -> bool,
         ) -> anyhow::Result<ExternalTurnResult> {
             self.calls.lock().unwrap().push((
                 visible_prompt.to_string(),
                 execution_prompt.map(str::to_string),
                 session.transport_session_id.clone(),
             ));
+            on_event(TuiEvent::MessageDelta {
+                text: "remote reply".to_string(),
+            });
+            on_event(TuiEvent::AssistantDone);
             Ok(ExternalTurnResult {
                 response: "remote reply".to_string(),
                 transport_session_id: Some("remote-session-123".to_string()),

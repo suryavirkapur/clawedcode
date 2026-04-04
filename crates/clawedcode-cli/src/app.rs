@@ -4,21 +4,25 @@ use clawedcode_core::{
     compat,
     config::AppConfig,
     config::default_data_dir,
-    interactive::{ExternalTurnExecutor, ExternalTurnResult, TuiContext},
+    interactive::{
+        ApprovalRequest, ExternalTurnExecutor, ExternalTurnResult, TuiContext, TuiEvent,
+    },
     permissions::PermissionMode,
     prompt::{builtin_prompts, resolve_prompt},
-    runtime::{ApprovalFn, Runtime, RuntimeOutput},
+    runtime::{ApprovalFn, Runtime},
     session::{Session, SessionMode},
+    tool_input::decode_tool_input,
 };
 use clawedcode_tools::builtin_tools;
 use clawedcode_tui as tui;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     ffi::OsString,
-    io::Read,
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::Command as ProcessCommand,
+    process::{Command as ProcessCommand, Stdio},
     sync::Arc,
+    thread,
 };
 
 use crate::bootstrap::{BootstrappedApp, ExecutionMode};
@@ -30,6 +34,70 @@ struct ResolvedConfig<'a> {
     builtin_prompts: Vec<&'a str>,
     builtin_tools: Vec<String>,
     compatibility: compat::CompatibilitySnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum InteractiveTransportStreamMessage {
+    Event {
+        event: InteractiveTransportStreamEvent,
+    },
+    ApprovalRequest {
+        tool_use_id: String,
+        tool_name: String,
+        input: serde_json::Value,
+    },
+    ApprovalWaiting {
+        tool_use_id: String,
+        tool_name: String,
+    },
+    ApprovalResponse {
+        tool_use_id: String,
+        tool_name: String,
+        approved: bool,
+    },
+    Final {
+        output: serde_json::Value,
+    },
+    Error {
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum InteractiveTransportStreamEvent {
+    ThinkingDelta {
+        text: String,
+    },
+    MessageDelta {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        is_error: bool,
+    },
+    Usage {
+        usage: serde_json::Value,
+    },
+    Completed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct InteractiveTransportApprovalResponse {
+    approved: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct InteractiveTransportFinalOutput {
+    session_id: String,
+    response: String,
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -93,9 +161,7 @@ pub async fn execute(boot: BootstrappedApp) -> Result<()> {
         ExecutionMode::DirectConnect(direct_connect_mode) => {
             execute_direct_connect(cli, config, compatibility, direct_connect_mode).await
         }
-        ExecutionMode::Ssh(ssh_mode) => {
-            execute_ssh(cli, config, compatibility, ssh_mode).await
-        }
+        ExecutionMode::Ssh(ssh_mode) => execute_ssh(cli, config, compatibility, ssh_mode).await,
         ExecutionMode::Remote(remote_mode) => {
             execute_remote(cli, config, compatibility, remote_mode).await
         }
@@ -155,13 +221,23 @@ async fn execute_run(
     let approval_fn = build_approval_fn(run_mode.yes);
 
     if run_mode.json {
-        let output = runtime.submit_with_approval(&mut session, &run_mode.prompt, &*approval_fn);
+        if run_mode.stream_json {
+            execute_streaming_submit_with_json_protocol(
+                &runtime,
+                &mut session,
+                &run_mode.prompt,
+                run_mode.show_thinking,
+            )
+            .await?;
+        } else {
+            let output =
+                runtime.submit_with_approval(&mut session, &run_mode.prompt, &*approval_fn);
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
 
         if let Some(path) = session_store_dir(data_dir) {
             let _ = session.save(&path);
         }
-
-        println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         let show_thinking = run_mode.show_thinking;
         let output = execute_streaming_submit_with_approval(
@@ -208,17 +284,26 @@ async fn execute_resume(
     session.execution_mode = SessionMode::Resume;
 
     if resume_mode.json {
-        let output = if let Some(prompt) = resume_mode.prompt.clone() {
-            runtime.submit_with_approval(&mut session, &prompt, &*approval_fn)
+        if resume_mode.stream_json {
+            let prompt = resume_mode.prompt.as_deref().unwrap_or("Continue.");
+            execute_streaming_submit_with_json_protocol(
+                &runtime,
+                &mut session,
+                prompt,
+                resume_mode.show_thinking,
+            )
+            .await?;
+        } else if let Some(prompt) = resume_mode.prompt.clone() {
+            let output = runtime.submit_with_approval(&mut session, &prompt, &*approval_fn);
+            println!("{}", serde_json::to_string_pretty(&output)?);
         } else {
-            runtime.submit_with_approval(&mut session, "Continue.", &*approval_fn)
-        };
+            let output = runtime.submit_with_approval(&mut session, "Continue.", &*approval_fn);
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
 
         if let Some(path) = session_store_dir(data_dir) {
             let _ = session.save(&path);
         }
-
-        println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         let prompt = resume_mode.prompt.as_deref().unwrap_or("Continue.");
         let show_thinking = resume_mode.show_thinking;
@@ -349,6 +434,181 @@ where
     Ok(output)
 }
 
+#[derive(Debug, Deserialize)]
+struct ApprovalResponseLine {
+    approved: bool,
+}
+
+fn protocol_stdout() -> Arc<std::sync::Mutex<std::io::Stdout>> {
+    Arc::new(std::sync::Mutex::new(std::io::stdout()))
+}
+
+fn emit_json_protocol_record(
+    stdout: &Arc<std::sync::Mutex<std::io::Stdout>>,
+    value: &serde_json::Value,
+) {
+    if let Ok(mut handle) = stdout.lock() {
+        let _ = serde_json::to_writer(&mut *handle, value);
+        let _ = handle.write_all(b"\n");
+        let _ = handle.flush();
+    }
+}
+
+fn parse_approval_response_line(line: &str) -> bool {
+    serde_json::from_str::<ApprovalResponseLine>(line.trim())
+        .map(|response| response.approved)
+        .unwrap_or(false)
+}
+
+fn json_protocol_event_record(event: &ApiEvent, show_thinking: bool) -> Option<serde_json::Value> {
+    match event {
+        ApiEvent::MessageDelta { text } => Some(serde_json::json!({
+            "type": "event",
+            "event": {
+                "kind": "message_delta",
+                "text": text,
+            }
+        })),
+        ApiEvent::ThinkingDelta { text } => {
+            if show_thinking {
+                Some(serde_json::json!({
+                    "type": "event",
+                    "event": {
+                        "kind": "thinking_delta",
+                        "text": text,
+                    }
+                }))
+            } else {
+                None
+            }
+        }
+        ApiEvent::ToolUse { tool_use } => Some(serde_json::json!({
+            "type": "event",
+            "event": {
+                "kind": "tool_use",
+                "id": tool_use.id,
+                "name": tool_use.name,
+                "input": tool_use.input,
+            }
+        })),
+        ApiEvent::ToolResult { tool_result } => Some(serde_json::json!({
+            "type": "event",
+            "event": {
+                "kind": "tool_result",
+                "tool_use_id": tool_result.tool_use_id,
+                "content": tool_result.content,
+                "is_error": tool_result.is_error,
+            }
+        })),
+        ApiEvent::Usage { usage } => Some(serde_json::json!({
+            "type": "event",
+            "event": {
+                "kind": "usage",
+                "usage": usage,
+            }
+        })),
+        ApiEvent::Completed => Some(serde_json::json!({
+            "type": "event",
+            "event": {
+                "kind": "completed",
+            }
+        })),
+    }
+}
+
+fn json_protocol_approval_request_record(
+    tool_use_id: &str,
+    tool_name: &str,
+    input: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "approval_request",
+        "tool_use_id": tool_use_id,
+        "tool_name": tool_name,
+        "input": input,
+    })
+}
+
+fn json_protocol_approval_waiting_record(tool_use_id: &str, tool_name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "approval_waiting",
+        "tool_use_id": tool_use_id,
+        "tool_name": tool_name,
+    })
+}
+
+fn json_protocol_approval_response_record(
+    tool_use_id: &str,
+    tool_name: &str,
+    approved: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "approval_response",
+        "tool_use_id": tool_use_id,
+        "tool_name": tool_name,
+        "approved": approved,
+    })
+}
+
+fn json_protocol_final_record(
+    output: &clawedcode_core::runtime::StreamingRuntimeOutput,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "final",
+        "output": output,
+    })
+}
+
+async fn execute_streaming_submit_with_json_protocol(
+    runtime: &Runtime,
+    session: &mut Session,
+    prompt: &str,
+    show_thinking: bool,
+) -> Result<clawedcode_core::runtime::StreamingRuntimeOutput> {
+    let stdout = protocol_stdout();
+    let approval_stdout = Arc::clone(&stdout);
+    let approval_fn = {
+        let approval_stdout = Arc::clone(&approval_stdout);
+        move |tool_use_id: &str, tool_name: &str, input: &serde_json::Value| {
+            emit_json_protocol_record(
+                &approval_stdout,
+                &json_protocol_approval_request_record(tool_use_id, tool_name, input),
+            );
+            emit_json_protocol_record(
+                &approval_stdout,
+                &json_protocol_approval_waiting_record(tool_use_id, tool_name),
+            );
+
+            let mut line = String::new();
+            let approved = std::io::stdin()
+                .read_line(&mut line)
+                .map(|_| parse_approval_response_line(&line))
+                .unwrap_or(false);
+
+            emit_json_protocol_record(
+                &approval_stdout,
+                &json_protocol_approval_response_record(tool_use_id, tool_name, approved),
+            );
+            approved
+        }
+    };
+
+    let mut on_event = {
+        let event_stdout = Arc::clone(&stdout);
+        move |event: &ApiEvent| {
+            if let Some(record) = json_protocol_event_record(event, show_thinking) {
+                emit_json_protocol_record(&event_stdout, &record);
+            }
+        }
+    };
+
+    let output = runtime
+        .submit_stream_with_approval(session, prompt, &mut on_event, &approval_fn)
+        .await;
+    emit_json_protocol_record(&stdout, &json_protocol_final_record(&output));
+    Ok(output)
+}
+
 async fn execute_headless(
     cli: Cli,
     config: AppConfig,
@@ -414,7 +674,10 @@ async fn execute_headless(
 
         if let Some(output_path) = output_path.as_ref() {
             std::fs::write(output_path, output.response.as_bytes()).with_context(|| {
-                format!("failed to write headless output to {}", output_path.display())
+                format!(
+                    "failed to write headless output to {}",
+                    output_path.display()
+                )
             })?;
         }
     }
@@ -472,8 +735,7 @@ fn direct_connect_binary() -> OsString {
 }
 
 fn remote_binary() -> OsString {
-    std::env::var_os("CLAWEDCODE_REMOTE_BIN")
-        .unwrap_or_else(|| OsString::from("clawedcode-remote"))
+    std::env::var_os("CLAWEDCODE_REMOTE_BIN").unwrap_or_else(|| OsString::from("clawedcode-remote"))
 }
 
 fn resolve_transport_prompt_from_reader<R: Read>(
@@ -494,9 +756,7 @@ fn resolve_transport_prompt_from_reader<R: Read>(
             reader.read_to_string(&mut input)?;
             let prompt = input.trim().to_string();
             if prompt.is_empty() {
-                anyhow::bail!(
-                    "{transport_name} transport received an empty prompt from stdin."
-                );
+                anyhow::bail!("{transport_name} transport received an empty prompt from stdin.");
             }
             Ok((prompt, TransportPromptSource::Stdin))
         }
@@ -643,10 +903,7 @@ fn append_common_interactive_run_args(
         args.push(OsString::from(system_prompt));
     }
     args.push(OsString::from("--json"));
-    // Interactive transport turns cannot bridge remote approval requests yet.
-    // Force remote auto-approval so the local TUI does not deadlock on an
-    // approval prompt it cannot answer over this transport boundary.
-    args.push(OsString::from("-y"));
+    args.push(OsString::from("--stream-json"));
 }
 
 fn append_common_interactive_resume_args(
@@ -662,7 +919,7 @@ fn append_common_interactive_resume_args(
     args.push(OsString::from("--prompt"));
     args.push(OsString::from(prompt));
     args.push(OsString::from("--json"));
-    args.push(OsString::from("-y"));
+    args.push(OsString::from("--stream-json"));
 }
 
 impl InteractiveTransportExecutor {
@@ -720,8 +977,10 @@ impl InteractiveTransportExecutor {
                 }
             }
             InteractiveTransportMode::Remote(mode) => {
-                let mut args =
-                    vec![OsString::from(&mode.orchestrator), OsString::from("clawedcode")];
+                let mut args = vec![
+                    OsString::from(&mode.orchestrator),
+                    OsString::from("clawedcode"),
+                ];
                 append_common_interactive_run_args(
                     &mut args,
                     &self.cwd,
@@ -771,8 +1030,10 @@ impl InteractiveTransportExecutor {
                 }
             }
             InteractiveTransportMode::Remote(mode) => {
-                let mut args =
-                    vec![OsString::from(&mode.orchestrator), OsString::from("clawedcode")];
+                let mut args = vec![
+                    OsString::from(&mode.orchestrator),
+                    OsString::from("clawedcode"),
+                ];
                 append_common_interactive_resume_args(
                     &mut args,
                     &self.cwd,
@@ -796,6 +1057,8 @@ impl ExternalTurnExecutor for InteractiveTransportExecutor {
         session: &mut Session,
         visible_prompt: &str,
         execution_prompt: Option<&str>,
+        on_event: &mut dyn FnMut(TuiEvent),
+        request_approval: &mut dyn FnMut(ApprovalRequest) -> bool,
     ) -> Result<ExternalTurnResult> {
         let prompt = execution_prompt.unwrap_or(visible_prompt);
         let spec = if let Some(transport_session_id) = session.transport_session_id.as_deref() {
@@ -803,18 +1066,9 @@ impl ExternalTurnExecutor for InteractiveTransportExecutor {
         } else {
             self.build_run_spec(prompt)
         };
-        let output = run_transport_command(&spec)?;
-        let response: RuntimeOutput = serde_json::from_str(&output.stdout).with_context(|| {
-            format!(
-                "failed to parse {} interactive transport JSON output",
-                spec.transport_name
-            )
-        })?;
-        session.transport_session_id = Some(response.session_id.clone());
-        Ok(ExternalTurnResult {
-            response: response.response,
-            transport_session_id: Some(response.session_id),
-        })
+        let output = run_transport_stream_command(&spec, on_event, request_approval)?;
+        session.transport_session_id = output.transport_session_id.clone();
+        Ok(output)
     }
 }
 
@@ -834,14 +1088,15 @@ fn transport_launch_banner(
             spec.destination,
             transport_program_display(&spec.program)
         ),
-        format!("[{}] Working directory: {}", spec.transport_name, cwd.display()),
+        format!(
+            "[{}] Working directory: {}",
+            spec.transport_name,
+            cwd.display()
+        ),
     ];
 
     if matches!(prompt_source, TransportPromptSource::Stdin) {
-        lines.push(format!(
-            "[{}] Prompt source: stdin",
-            spec.transport_name
-        ));
+        lines.push(format!("[{}] Prompt source: stdin", spec.transport_name));
     }
 
     lines
@@ -892,6 +1147,236 @@ fn run_transport_command(spec: &TransportCommandSpec) -> Result<TransportOutput>
     Ok(TransportOutput { stdout, stderr })
 }
 
+fn write_stream_response(stdin: &mut dyn Write, approved: bool) -> Result<()> {
+    let payload = InteractiveTransportApprovalResponse { approved };
+    serde_json::to_writer(&mut *stdin, &payload)
+        .context("failed to serialize approval response for interactive transport")?;
+    stdin
+        .write_all(b"\n")
+        .context("failed to write approval response to interactive transport stdin")?;
+    stdin
+        .flush()
+        .context("failed to flush approval response to interactive transport stdin")?;
+    Ok(())
+}
+
+fn parse_interactive_transport_stream_message(
+    line: &str,
+    spec: &TransportCommandSpec,
+) -> Result<InteractiveTransportStreamMessage> {
+    serde_json::from_str::<InteractiveTransportStreamMessage>(line.trim()).with_context(|| {
+        format!(
+            "failed to parse {} interactive transport stream record: {}",
+            spec.transport_name,
+            line.trim()
+        )
+    })
+}
+
+fn stream_event_to_tui_event(event: InteractiveTransportStreamEvent) -> Option<TuiEvent> {
+    match event {
+        InteractiveTransportStreamEvent::ThinkingDelta { text } => {
+            Some(TuiEvent::ThinkingDelta { text })
+        }
+        InteractiveTransportStreamEvent::MessageDelta { text } => {
+            Some(TuiEvent::MessageDelta { text })
+        }
+        InteractiveTransportStreamEvent::ToolUse { id, name, input } => {
+            let decoded_input = input
+                .as_str()
+                .map(|raw| decode_tool_input(&name, raw))
+                .unwrap_or(input);
+            Some(TuiEvent::ToolUse {
+                id,
+                name,
+                input: decoded_input,
+            })
+        }
+        InteractiveTransportStreamEvent::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => Some(TuiEvent::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        }),
+        InteractiveTransportStreamEvent::Usage { .. } => None,
+        InteractiveTransportStreamEvent::Completed => Some(TuiEvent::AssistantDone),
+    }
+}
+
+fn forward_interactive_transport_stderr(
+    stderr: impl BufRead + Send + 'static,
+    transport_name: &'static str,
+    destination: String,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        for line in stderr.lines() {
+            match line {
+                Ok(line) => eprintln!("[{transport_name}:{destination}] {line}"),
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+fn run_transport_stream_command(
+    spec: &TransportCommandSpec,
+    on_event: &mut dyn FnMut(TuiEvent),
+    request_approval: &mut dyn FnMut(ApprovalRequest) -> bool,
+) -> Result<ExternalTurnResult> {
+    let mut command = ProcessCommand::new(&spec.program);
+    command
+        .args(&spec.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!(
+                "{} transport binary not found via `{}` for `{}`",
+                spec.transport_name,
+                transport_program_display(&spec.program),
+                spec.destination
+            );
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to launch {} transport via `{}` for `{}`",
+                    spec.transport_name,
+                    transport_program_display(&spec.program),
+                    spec.destination
+                )
+            });
+        }
+    };
+
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to capture transport stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed to capture transport stderr")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("failed to capture transport stdin")?;
+    let stderr_handle = forward_interactive_transport_stderr(
+        BufReader::new(stderr),
+        spec.transport_name,
+        spec.destination.clone(),
+    );
+
+    let mut reader = BufReader::new(stdout);
+    let mut final_output: Option<InteractiveTransportFinalOutput> = None;
+    let mut saw_assistant_done = false;
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        let bytes = reader.read_line(&mut line).with_context(|| {
+            format!(
+                "failed reading {} interactive transport stream for `{}`",
+                spec.transport_name, spec.destination
+            )
+        })?;
+        if bytes == 0 {
+            break;
+        }
+
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        match parse_interactive_transport_stream_message(&line, spec)? {
+            InteractiveTransportStreamMessage::Event { event } => {
+                if matches!(event, InteractiveTransportStreamEvent::Completed) {
+                    saw_assistant_done = true;
+                }
+                if let Some(tui_event) = stream_event_to_tui_event(event) {
+                    on_event(tui_event);
+                }
+            }
+            InteractiveTransportStreamMessage::ApprovalRequest {
+                tool_use_id,
+                tool_name,
+                input,
+            } => {
+                let request = ApprovalRequest {
+                    tool_use_id,
+                    tool_name,
+                    input,
+                };
+                let approved = request_approval(request);
+                write_stream_response(&mut stdin, approved)?;
+            }
+            InteractiveTransportStreamMessage::ApprovalWaiting { .. }
+            | InteractiveTransportStreamMessage::ApprovalResponse { .. } => {}
+            InteractiveTransportStreamMessage::Final { output } => {
+                let output = serde_json::from_value::<InteractiveTransportFinalOutput>(output)
+                    .with_context(|| {
+                        format!(
+                            "failed to decode final output for {} transport via `{}`",
+                            spec.transport_name,
+                            transport_program_display(&spec.program)
+                        )
+                    })?;
+                final_output = Some(output);
+            }
+            InteractiveTransportStreamMessage::Error { message } => {
+                return Err(anyhow::anyhow!(message).context(format!(
+                    "{} transport via `{}` for `{}` returned an error stream record",
+                    spec.transport_name,
+                    transport_program_display(&spec.program),
+                    spec.destination
+                )));
+            }
+        }
+    }
+
+    let status = child.wait().with_context(|| {
+        format!(
+            "failed waiting for {} transport via `{}` for `{}`",
+            spec.transport_name,
+            transport_program_display(&spec.program),
+            spec.destination
+        )
+    })?;
+    let _ = stderr_handle.join();
+
+    if !status.success() {
+        anyhow::bail!(
+            "{} transport via `{}` for `{}` failed: exited with status {}",
+            spec.transport_name,
+            transport_program_display(&spec.program),
+            spec.destination,
+            status
+        );
+    }
+
+    let output = final_output.with_context(|| {
+        format!(
+            "{} transport via `{}` for `{}` did not emit a final record",
+            spec.transport_name,
+            transport_program_display(&spec.program),
+            spec.destination
+        )
+    })?;
+    if !saw_assistant_done {
+        on_event(TuiEvent::AssistantDone);
+    }
+    Ok(ExternalTurnResult {
+        response: output.response,
+        transport_session_id: Some(output.session_id),
+    })
+}
+
 fn prepare_ssh_headless(
     cwd: &Path,
     ssh_mode: &crate::bootstrap::SshMode,
@@ -911,7 +1396,8 @@ fn prepare_direct_connect_headless(
     cwd: &Path,
     dc_mode: &crate::bootstrap::DirectConnectMode,
 ) -> Result<(TransportCommandSpec, TransportPromptSource)> {
-    let (prompt, prompt_source) = resolve_transport_prompt("direct-connect", dc_mode.prompt.clone())?;
+    let (prompt, prompt_source) =
+        resolve_transport_prompt("direct-connect", dc_mode.prompt.clone())?;
     let spec = build_direct_connect_command_spec(cwd, dc_mode, &prompt);
     Ok((spec, prompt_source))
 }
@@ -954,8 +1440,7 @@ fn execute_transport_tui(
     session_mode: SessionMode,
     executor: Arc<dyn ExternalTurnExecutor>,
 ) -> Result<()> {
-    let sessions_dir = session_store_dir(data_dir)
-        .context("no sessions directory available")?;
+    let sessions_dir = session_store_dir(data_dir).context("no sessions directory available")?;
     let mut ctx = TuiContext::with_external_turn_executor(
         config,
         resolve_prompt(system_prompt_override.as_deref()),
@@ -1112,6 +1597,7 @@ fn bootstrap(cli: Cli) -> Result<BootstrappedApp> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::{
         io::Cursor,
         sync::{Mutex, MutexGuard, OnceLock},
@@ -1177,6 +1663,75 @@ mod tests {
     }
 
     #[test]
+    fn json_protocol_event_record_serializes_runtime_events() {
+        let message = json_protocol_event_record(
+            &ApiEvent::MessageDelta {
+                text: "hello".to_string(),
+            },
+            false,
+        )
+        .unwrap();
+        assert_eq!(message["type"], "event");
+        assert_eq!(message["event"]["kind"], "message_delta");
+        assert_eq!(message["event"]["text"], "hello");
+
+        let thinking = json_protocol_event_record(
+            &ApiEvent::ThinkingDelta {
+                text: "hidden".to_string(),
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(thinking["event"]["kind"], "thinking_delta");
+        assert_eq!(thinking["event"]["text"], "hidden");
+
+        assert!(
+            json_protocol_event_record(
+                &ApiEvent::ThinkingDelta {
+                    text: "hidden".to_string(),
+                },
+                false,
+            )
+            .is_none()
+        );
+
+        let tool_use = json_protocol_event_record(
+            &ApiEvent::ToolUse {
+                tool_use: clawedcode_api::ToolUseEvent {
+                    id: "call-1".to_string(),
+                    name: "shell".to_string(),
+                    input: "{\"command\":\"ls\"}".to_string(),
+                },
+            },
+            false,
+        )
+        .unwrap();
+        assert_eq!(tool_use["event"]["kind"], "tool_use");
+        assert_eq!(tool_use["event"]["id"], "call-1");
+        assert_eq!(tool_use["event"]["name"], "shell");
+
+        let approval =
+            json_protocol_approval_request_record("call-1", "shell", &json!({"command":"ls"}));
+        assert_eq!(approval["type"], "approval_request");
+        assert_eq!(approval["tool_use_id"], "call-1");
+        assert_eq!(approval["tool_name"], "shell");
+
+        let waiting = json_protocol_approval_waiting_record("call-1", "shell");
+        assert_eq!(waiting["type"], "approval_waiting");
+
+        let response = json_protocol_approval_response_record("call-1", "shell", true);
+        assert_eq!(response["type"], "approval_response");
+        assert_eq!(response["approved"], true);
+    }
+
+    #[test]
+    fn parse_approval_response_line_accepts_json_boolean() {
+        assert!(parse_approval_response_line(r#"{"approved":true}"#));
+        assert!(!parse_approval_response_line(r#"{"approved":false}"#));
+        assert!(!parse_approval_response_line("not json"));
+    }
+
+    #[test]
     fn resolve_transport_prompt_prefers_explicit_prompt() {
         let mut reader = Cursor::new("ignored stdin");
         let (prompt, source) = resolve_transport_prompt_from_reader(
@@ -1227,7 +1782,8 @@ mod tests {
             args: vec![],
         };
 
-        let lines = transport_launch_banner(&spec, Path::new("/repo"), TransportPromptSource::Stdin);
+        let lines =
+            transport_launch_banner(&spec, Path::new("/repo"), TransportPromptSource::Stdin);
         assert_eq!(
             lines,
             vec![
@@ -1635,7 +2191,9 @@ mod tests {
         let err = run_remote_headless(Path::new("/workspace"), &remote_mode)
             .expect_err("missing remote binary should fail");
         let message = err.to_string();
-        assert!(message.contains("remote transport binary not found via `/tmp/does-not-exist-remote`"));
+        assert!(
+            message.contains("remote transport binary not found via `/tmp/does-not-exist-remote`")
+        );
         assert!(message.contains("for `my-orchestrator.local`"));
 
         unsafe { std::env::remove_var("CLAWEDCODE_REMOTE_BIN") };
@@ -1657,7 +2215,7 @@ mod tests {
         std::fs::write(
             &script_path,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{capture}\"\nprintf '{{\"session_id\":\"remote-abc\",\"system_prompt\":\"system\",\"response\":\"remote ok\",\"tool_count\":0,\"skill_count\":0,\"mcp_server_count\":0,\"tools_executed\":0}}'\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{capture}\"\nprintf '{{\"type\":\"event\",\"event\":{{\"kind\":\"message_delta\",\"text\":\"remote ok\"}}}}\\n'\nprintf '{{\"type\":\"event\",\"event\":{{\"kind\":\"completed\"}}}}\\n'\nprintf '{{\"type\":\"final\",\"output\":{{\"session_id\":\"remote-abc\",\"system_prompt\":\"system\",\"response\":\"remote ok\",\"thinking\":\"\",\"tool_count\":0,\"skill_count\":0,\"mcp_server_count\":0,\"tools_executed\":0,\"tool_uses\":[]}}}}\\n'\n",
                 capture = capture_path.display()
             ),
         )
@@ -1684,15 +2242,47 @@ mod tests {
             },
         );
         let mut session = Session::with_mode(PathBuf::from("/workspace"), SessionMode::Ssh);
+        let mut first_events = Vec::new();
+        let mut first_approvals = Vec::new();
 
-        let first = executor.submit_turn(&mut session, "hello", None).unwrap();
+        let first = executor
+            .submit_turn(
+                &mut session,
+                "hello",
+                None,
+                &mut |event| first_events.push(event),
+                &mut |request| {
+                    first_approvals.push(request);
+                    true
+                },
+            )
+            .unwrap();
         assert_eq!(first.transport_session_id.as_deref(), Some("remote-abc"));
+        assert_eq!(first_events.len(), 2);
+        assert!(matches!(first_events[0], TuiEvent::MessageDelta { .. }));
+        assert!(matches!(first_events[1], TuiEvent::AssistantDone));
+        assert!(first_approvals.is_empty());
         session.transport_session_id = first.transport_session_id.clone();
 
+        let mut second_events = Vec::new();
+        let mut second_approvals = Vec::new();
         let second = executor
-            .submit_turn(&mut session, "next", Some("resume prompt"))
+            .submit_turn(
+                &mut session,
+                "next",
+                Some("resume prompt"),
+                &mut |event| second_events.push(event),
+                &mut |request| {
+                    second_approvals.push(request);
+                    true
+                },
+            )
             .unwrap();
         assert_eq!(second.transport_session_id.as_deref(), Some("remote-abc"));
+        assert_eq!(second_events.len(), 2);
+        assert!(matches!(second_events[0], TuiEvent::MessageDelta { .. }));
+        assert!(matches!(second_events[1], TuiEvent::AssistantDone));
+        assert!(second_approvals.is_empty());
 
         let argv = std::fs::read_to_string(&capture_path).unwrap();
         let args: Vec<&str> = argv.lines().collect();
@@ -1709,7 +2299,7 @@ mod tests {
                 "--system-prompt",
                 "system",
                 "--json",
-                "-y",
+                "--stream-json",
                 "devbox",
                 "clawedcode",
                 "--cwd",
@@ -1719,11 +2309,88 @@ mod tests {
                 "--prompt",
                 "resume prompt",
                 "--json",
-                "-y",
+                "--stream-json",
             ]
         );
 
         unsafe { std::env::remove_var("CLAWEDCODE_SSH_BIN") };
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn interactive_transport_stream_bridges_approval_requests() {
+        let _guard = env_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "clawed_interactive_approval_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script_path = dir.join("fake-remote.sh");
+        let stdin_capture_path = dir.join("approval-response.json");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nprintf '{{\"type\":\"event\",\"event\":{{\"kind\":\"tool_use\",\"id\":\"call-1\",\"name\":\"shell\",\"input\":{{\"command\":\"ls\"}}}}}}\\n'\nprintf '{{\"type\":\"approval_request\",\"tool_use_id\":\"call-1\",\"tool_name\":\"shell\",\"input\":{{\"command\":\"ls\"}}}}\\n'\nread response\nprintf '%s\\n' \"$response\" > \"{stdin_capture}\"\nprintf '{{\"type\":\"approval_response\",\"tool_use_id\":\"call-1\",\"tool_name\":\"shell\",\"approved\":true}}\\n'\nprintf '{{\"type\":\"event\",\"event\":{{\"kind\":\"completed\"}}}}\\n'\nprintf '{{\"type\":\"final\",\"output\":{{\"session_id\":\"approval-session\",\"system_prompt\":\"system\",\"response\":\"approved remote ok\",\"thinking\":\"\",\"tool_count\":1,\"skill_count\":0,\"mcp_server_count\":0,\"tools_executed\":1,\"tool_uses\":[]}}}}\\n'\n",
+                stdin_capture = stdin_capture_path.display()
+            ),
+        )
+        .unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).unwrap();
+        }
+
+        unsafe { std::env::set_var("CLAWEDCODE_REMOTE_BIN", &script_path) };
+        let executor = InteractiveTransportExecutor::new_remote(
+            PathBuf::from("/workspace"),
+            crate::bootstrap::RemoteMode {
+                orchestrator: "orchestrator.local".to_string(),
+                prompt: None,
+                system_prompt: Some("system".to_string()),
+                json: false,
+                show_thinking: false,
+                yes: false,
+            },
+        );
+        let mut session = Session::with_mode(PathBuf::from("/workspace"), SessionMode::Remote);
+        let mut seen_approval: Option<ApprovalRequest> = None;
+        let mut events = Vec::new();
+        let result = executor
+            .submit_turn(
+                &mut session,
+                "hello",
+                None,
+                &mut |event| events.push(event),
+                &mut |request| {
+                    seen_approval = Some(request);
+                    true
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            result.transport_session_id.as_deref(),
+            Some("approval-session")
+        );
+        assert_eq!(result.response, "approved remote ok");
+        assert!(matches!(events[0], TuiEvent::ToolUse { .. }));
+        assert!(matches!(events[1], TuiEvent::AssistantDone));
+        let request = seen_approval.expect("approval request should be bridged");
+        assert_eq!(request.tool_use_id, "call-1");
+        assert_eq!(request.tool_name, "shell");
+        assert_eq!(request.input["command"], "ls");
+
+        let approval_response = std::fs::read_to_string(&stdin_capture_path).unwrap();
+        assert!(approval_response.contains(r#""approved":true"#));
+
+        unsafe { std::env::remove_var("CLAWEDCODE_REMOTE_BIN") };
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1748,6 +2415,13 @@ mod tests {
         .build_run_spec("hello");
         assert_eq!(ssh_spec.program, OsString::from("/tmp/fake-ssh"));
         assert_eq!(ssh_spec.transport_name, "ssh");
+        let ssh_args: Vec<String> = ssh_spec
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(ssh_args.contains(&"--stream-json".to_string()));
+        assert!(!ssh_args.contains(&"-y".to_string()));
 
         let direct_spec = InteractiveTransportExecutor::new_direct_connect(
             PathBuf::from("/workspace"),
@@ -1763,6 +2437,13 @@ mod tests {
         .build_run_spec("hello");
         assert_eq!(direct_spec.program, OsString::from("/tmp/fake-dc"));
         assert_eq!(direct_spec.transport_name, "direct-connect");
+        let direct_args: Vec<String> = direct_spec
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(direct_args.contains(&"--stream-json".to_string()));
+        assert!(!direct_args.contains(&"-y".to_string()));
 
         let remote_spec = InteractiveTransportExecutor::new_remote(
             PathBuf::from("/workspace"),
@@ -1778,6 +2459,13 @@ mod tests {
         .build_run_spec("hello");
         assert_eq!(remote_spec.program, OsString::from("/tmp/fake-remote"));
         assert_eq!(remote_spec.transport_name, "remote");
+        let remote_args: Vec<String> = remote_spec
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(remote_args.contains(&"--stream-json".to_string()));
+        assert!(!remote_args.contains(&"-y".to_string()));
 
         unsafe { std::env::remove_var("CLAWEDCODE_SSH_BIN") };
         unsafe { std::env::remove_var("CLAWEDCODE_DIRECT_CONNECT_BIN") };
@@ -1787,224 +2475,219 @@ mod tests {
     use clawedcode_core::compat::CompatibilitySnapshot;
     use clawedcode_core::session::{Role, SessionMode};
 
-        fn temp_sessions_dir(name: &str) -> PathBuf {
-            let unique = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let dir = std::env::temp_dir().join(format!("clawed_resume_{name}_{unique}"));
-            std::fs::create_dir_all(&dir).unwrap();
-            dir
+    fn temp_sessions_dir(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("clawed_resume_{name}_{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn empty_compatibility() -> CompatibilitySnapshot {
+        CompatibilitySnapshot {
+            settings_files: vec![],
+            settings: serde_json::Value::Null,
+            skills: vec![],
+            memory_files: vec![],
+            memory: String::new(),
+            mcp_servers: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn make_cli(data_dir: &PathBuf) -> Cli {
+        Cli {
+            config: None,
+            data_dir: Some(data_dir.clone()),
+            cwd: PathBuf::from("/tmp"),
+            command: None,
+            headless: false,
+            remote: None,
+            direct_connect: None,
+            ssh: None,
+        }
+    }
+
+    fn run_resume_command(data_dir: &PathBuf, session_id: &str, prompt: Option<&str>) {
+        use std::{
+            future::Future,
+            pin::pin,
+            task::{Context, Poll, Waker},
+        };
+
+        let _guard = env_lock();
+        unsafe { std::env::remove_var("ANTHROPIC_MODEL") };
+        unsafe { std::env::remove_var("ANTHROPIC_BASE_URL") };
+        unsafe { std::env::remove_var("ANTHROPIC_AUTH_TOKEN") };
+        unsafe { std::env::set_var("CLAWEDCODE_PROVIDER", "mock") };
+
+        let mut future = pin!(execute_resume(
+            make_cli(data_dir),
+            AppConfig::default(),
+            empty_compatibility(),
+            crate::bootstrap::ResumeMode {
+                session_id: session_id.to_string(),
+                prompt: prompt.map(str::to_string),
+                json: true,
+                stream_json: false,
+                show_thinking: false,
+                yes: true,
+            },
+        ));
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        match Future::poll(future.as_mut(), &mut cx) {
+            Poll::Ready(result) => result.unwrap(),
+            Poll::Pending => panic!("json resume path should complete without awaiting"),
         }
 
-        fn empty_compatibility() -> CompatibilitySnapshot {
-            CompatibilitySnapshot {
-                settings_files: vec![],
-                settings: serde_json::Value::Null,
-                skills: vec![],
-                memory_files: vec![],
-                memory: String::new(),
-                mcp_servers: std::collections::BTreeMap::new(),
-            }
-        }
+        unsafe { std::env::remove_var("CLAWEDCODE_PROVIDER") };
+    }
 
-        fn make_cli(data_dir: &PathBuf) -> Cli {
-            Cli {
-                config: None,
-                data_dir: Some(data_dir.clone()),
-                cwd: PathBuf::from("/tmp"),
-                command: None,
-                headless: false,
-                remote: None,
-                direct_connect: None,
-                ssh: None,
-            }
-        }
+    #[test]
+    fn resume_uses_continue_as_default_prompt() {
+        let data_dir = temp_sessions_dir("default_prompt");
+        let sessions_dir = data_dir.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let mut session = Session::new(PathBuf::from("/tmp/test"));
+        session.push(Role::User, "First message");
+        session.push(Role::Assistant, "First response");
+        session.save(&sessions_dir).unwrap();
 
-        fn run_resume_command(
-            data_dir: &PathBuf,
-            session_id: &str,
-            prompt: Option<&str>,
-        ) {
-            use std::{
-                future::Future,
-                pin::pin,
-                task::{Context, Poll, Waker},
-            };
+        run_resume_command(&data_dir, &session.id.to_string(), None);
 
-            let _guard = env_lock();
-            unsafe { std::env::remove_var("ANTHROPIC_MODEL") };
-            unsafe { std::env::remove_var("ANTHROPIC_BASE_URL") };
-            unsafe { std::env::remove_var("ANTHROPIC_AUTH_TOKEN") };
-            unsafe { std::env::set_var("CLAWEDCODE_PROVIDER", "mock") };
+        let loaded = Session::load_by_id(&sessions_dir, &session.id.to_string()).unwrap();
+        assert_eq!(loaded.execution_mode, SessionMode::Resume);
+        assert_eq!(loaded.last_user_text(), Some("Continue."));
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
 
-            let mut future = pin!(execute_resume(
-                make_cli(data_dir),
-                AppConfig::default(),
-                empty_compatibility(),
-                crate::bootstrap::ResumeMode {
-                    session_id: session_id.to_string(),
-                    prompt: prompt.map(str::to_string),
-                    json: true,
-                    show_thinking: false,
-                    yes: true,
-                },
-            ));
-            let waker = Waker::noop();
-            let mut cx = Context::from_waker(waker);
-            match Future::poll(future.as_mut(), &mut cx) {
-                Poll::Ready(result) => result.unwrap(),
-                Poll::Pending => panic!("json resume path should complete without awaiting"),
-            }
+    #[test]
+    fn resume_persists_explicit_prompt_and_mode() {
+        let data_dir = temp_sessions_dir("explicit_prompt");
+        let sessions_dir = data_dir.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let mut session = Session::new(PathBuf::from("/tmp/test"));
+        session.push(Role::User, "Original question");
+        session.push(Role::Assistant, "Original answer");
+        session.save(&sessions_dir).unwrap();
 
-            unsafe { std::env::remove_var("CLAWEDCODE_PROVIDER") };
-        }
+        run_resume_command(&data_dir, &session.id.to_string(), Some("follow up"));
 
-        #[test]
-        fn resume_uses_continue_as_default_prompt() {
-            let data_dir = temp_sessions_dir("default_prompt");
-            let sessions_dir = data_dir.join("sessions");
-            std::fs::create_dir_all(&sessions_dir).unwrap();
-            let mut session = Session::new(PathBuf::from("/tmp/test"));
-            session.push(Role::User, "First message");
-            session.push(Role::Assistant, "First response");
-            session.save(&sessions_dir).unwrap();
+        let loaded = Session::load(&sessions_dir, session.id).unwrap();
+        assert_eq!(loaded.execution_mode, SessionMode::Resume);
+        assert_eq!(loaded.last_user_text(), Some("follow up"));
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
 
-            run_resume_command(&data_dir, &session.id.to_string(), None);
+    #[test]
+    fn continue_chooses_newest_session() {
+        let dir = temp_sessions_dir("continue_newest");
 
-            let loaded = Session::load_by_id(&sessions_dir, &session.id.to_string()).unwrap();
-            assert_eq!(loaded.execution_mode, SessionMode::Resume);
-            assert_eq!(loaded.last_user_text(), Some("Continue."));
-            std::fs::remove_dir_all(&data_dir).ok();
-        }
+        let older = Session::new(PathBuf::from("/tmp/older"));
+        older.save(&dir).unwrap();
 
-        #[test]
-        fn resume_persists_explicit_prompt_and_mode() {
-            let data_dir = temp_sessions_dir("explicit_prompt");
-            let sessions_dir = data_dir.join("sessions");
-            std::fs::create_dir_all(&sessions_dir).unwrap();
-            let mut session = Session::new(PathBuf::from("/tmp/test"));
-            session.push(Role::User, "Original question");
-            session.push(Role::Assistant, "Original answer");
-            session.save(&sessions_dir).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
 
-            run_resume_command(&data_dir, &session.id.to_string(), Some("follow up"));
+        let newer = Session::new(PathBuf::from("/tmp/newer"));
+        newer.save(&dir).unwrap();
 
-            let loaded = Session::load(&sessions_dir, session.id).unwrap();
-            assert_eq!(loaded.execution_mode, SessionMode::Resume);
-            assert_eq!(loaded.last_user_text(), Some("follow up"));
-            std::fs::remove_dir_all(&data_dir).ok();
-        }
+        let latest = find_latest_session(&dir).unwrap();
+        assert_eq!(latest.id, newer.id);
+        assert_eq!(latest.cwd, PathBuf::from("/tmp/newer"));
 
-        #[test]
-        fn continue_chooses_newest_session() {
-            let dir = temp_sessions_dir("continue_newest");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
-            let older = Session::new(PathBuf::from("/tmp/older"));
-            older.save(&dir).unwrap();
+    #[test]
+    fn continue_after_resume_still_chooses_newest() {
+        let data_dir = temp_sessions_dir("continue_after_resume");
+        let sessions_dir = data_dir.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
 
-            std::thread::sleep(Duration::from_millis(10));
+        let first = Session::new(PathBuf::from("/tmp/first"));
+        first.save(&sessions_dir).unwrap();
 
-            let newer = Session::new(PathBuf::from("/tmp/newer"));
-            newer.save(&dir).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
 
-            let latest = find_latest_session(&dir).unwrap();
-            assert_eq!(latest.id, newer.id);
-            assert_eq!(latest.cwd, PathBuf::from("/tmp/newer"));
+        let second = Session::new(PathBuf::from("/tmp/second"));
+        second.save(&sessions_dir).unwrap();
 
-            std::fs::remove_dir_all(&dir).ok();
-        }
+        std::thread::sleep(Duration::from_millis(10));
+        run_resume_command(&data_dir, &first.id.to_string(), Some("Resume message"));
 
-        #[test]
-        fn continue_after_resume_still_chooses_newest() {
-            let data_dir = temp_sessions_dir("continue_after_resume");
-            let sessions_dir = data_dir.join("sessions");
-            std::fs::create_dir_all(&sessions_dir).unwrap();
+        let latest = find_latest_session(&sessions_dir).unwrap();
+        assert_eq!(latest.id, first.id);
+        assert_eq!(latest.execution_mode, SessionMode::Resume);
+        assert_eq!(latest.last_user_text(), Some("Resume message"));
 
-            let first = Session::new(PathBuf::from("/tmp/first"));
-            first.save(&sessions_dir).unwrap();
+        std::fs::remove_dir_all(&data_dir).ok();
+    }
 
-            std::thread::sleep(Duration::from_millis(10));
+    #[test]
+    fn session_mode_resume_is_distinct_from_continue() {
+        let resume_session = Session::with_mode(PathBuf::from("/tmp/resume"), SessionMode::Resume);
+        let continue_session =
+            Session::with_mode(PathBuf::from("/tmp/continue"), SessionMode::Continue);
 
-            let second = Session::new(PathBuf::from("/tmp/second"));
-            second.save(&sessions_dir).unwrap();
+        assert_eq!(resume_session.execution_mode, SessionMode::Resume);
+        assert_eq!(continue_session.execution_mode, SessionMode::Continue);
+        assert_ne!(
+            resume_session.execution_mode,
+            continue_session.execution_mode
+        );
+    }
 
-            std::thread::sleep(Duration::from_millis(10));
-            run_resume_command(&data_dir, &first.id.to_string(), Some("Resume message"));
+    #[test]
+    fn session_save_load_preserves_execution_mode() {
+        let dir = temp_sessions_dir("mode_persistence");
 
-            let latest = find_latest_session(&sessions_dir).unwrap();
-            assert_eq!(latest.id, first.id);
-            assert_eq!(latest.execution_mode, SessionMode::Resume);
-            assert_eq!(latest.last_user_text(), Some("Resume message"));
+        for mode in [
+            SessionMode::Interactive,
+            SessionMode::Headless,
+            SessionMode::Resume,
+            SessionMode::Continue,
+            SessionMode::DirectConnect,
+            SessionMode::Ssh,
+            SessionMode::Remote,
+        ] {
+            let mut session = Session::with_mode(PathBuf::from("/tmp/test"), mode.clone());
+            session.push(Role::User, "test");
+            session.save(&dir).unwrap();
 
-            std::fs::remove_dir_all(&data_dir).ok();
-        }
-
-        #[test]
-        fn session_mode_resume_is_distinct_from_continue() {
-            let resume_session = Session::with_mode(
-                PathBuf::from("/tmp/resume"),
-                SessionMode::Resume,
+            let loaded = Session::load(&dir, session.id).unwrap();
+            assert_eq!(
+                loaded.execution_mode, mode,
+                "mode {:?} should persist",
+                mode
             );
-            let continue_session = Session::with_mode(
-                PathBuf::from("/tmp/continue"),
-                SessionMode::Continue,
-            );
-
-            assert_eq!(resume_session.execution_mode, SessionMode::Resume);
-            assert_eq!(continue_session.execution_mode, SessionMode::Continue);
-            assert_ne!(resume_session.execution_mode, continue_session.execution_mode);
         }
 
-        #[test]
-        fn session_save_load_preserves_execution_mode() {
-            let dir = temp_sessions_dir("mode_persistence");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
-            for mode in [
-                SessionMode::Interactive,
-                SessionMode::Headless,
-                SessionMode::Resume,
-                SessionMode::Continue,
-                SessionMode::DirectConnect,
-                SessionMode::Ssh,
-                SessionMode::Remote,
-            ] {
-                let mut session = Session::with_mode(PathBuf::from("/tmp/test"), mode.clone());
-                session.push(Role::User, "test");
-                session.save(&dir).unwrap();
+    #[test]
+    fn find_latest_returns_error_on_empty_dir() {
+        let dir = temp_sessions_dir("empty_dir");
+        std::fs::remove_dir_all(&dir).ok();
 
-                let loaded = Session::load(&dir, session.id).unwrap();
-                assert_eq!(
-                    loaded.execution_mode, mode,
-                    "mode {:?} should persist",
-                    mode
-                );
-            }
+        let result = find_latest_session(&dir);
+        assert!(result.is_err());
+    }
 
-            std::fs::remove_dir_all(&dir).ok();
-        }
+    #[test]
+    fn find_latest_ignores_corrupt_session_files() {
+        let dir = temp_sessions_dir("corrupt_files");
 
-        #[test]
-        fn find_latest_returns_error_on_empty_dir() {
-            let dir = temp_sessions_dir("empty_dir");
-            std::fs::remove_dir_all(&dir).ok();
+        let valid_session = Session::new(PathBuf::from("/tmp/valid"));
+        valid_session.save(&dir).unwrap();
 
-            let result = find_latest_session(&dir);
-            assert!(result.is_err());
-        }
+        std::fs::write(dir.join("corrupt.json"), "not valid json").unwrap();
 
-        #[test]
-        fn find_latest_ignores_corrupt_session_files() {
-            let dir = temp_sessions_dir("corrupt_files");
+        let latest = find_latest_session(&dir).unwrap();
+        assert_eq!(latest.id, valid_session.id);
 
-            let valid_session = Session::new(PathBuf::from("/tmp/valid"));
-            valid_session.save(&dir).unwrap();
-
-            std::fs::write(dir.join("corrupt.json"), "not valid json").unwrap();
-
-            let latest = find_latest_session(&dir).unwrap();
-            assert_eq!(latest.id, valid_session.id);
-
-            std::fs::remove_dir_all(&dir).ok();
-        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
