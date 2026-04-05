@@ -2775,7 +2775,12 @@ fn tasks_panel(ctx: &TuiContext) -> InfoPanel {
 }
 
 fn tools_panel(ctx: &TuiContext) -> InfoPanel {
-    let mut lines = Vec::new();
+    let mut lines = vec![format!(
+        "built-in={} · skills={} · mcp={}",
+        built_in_tool_count(ctx),
+        ctx.skills().len(),
+        mcp_tool_count(ctx)
+    )];
     append_panel_section(&mut lines, "Built-in tools", built_in_tool_lines(ctx));
     append_panel_section(&mut lines, "Skills", skill_surface_lines(ctx));
     append_panel_section(&mut lines, "MCP tools", mcp_surface_lines(ctx));
