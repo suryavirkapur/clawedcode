@@ -31,9 +31,11 @@ use ratatui::{
 };
 use std::{
     cmp::Reverse,
+    env,
     fs,
     io::{self, stdout},
     path::{Path, PathBuf},
+    process::Command,
     sync::{mpsc, Arc, Mutex},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -158,13 +160,37 @@ struct InfoPanel {
     lines: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+enum RenderRow {
+    User(String),
+    Assistant(String),
+    Thinking(String),
+    ToolUse {
+        id: String,
+        name: String,
+        input: String,
+    },
+    ToolStatus(String),
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        is_error: bool,
+    },
+    SubagentSummary {
+        child_session_id: String,
+        summary: String,
+    },
+    Info(String),
+    Spacer,
+}
+
 fn info_panel_hint_line() -> &'static str {
     "Esc/q/? close · ↑/↓ or j/k scroll"
 }
 
 struct ReplHandler {
-    transcript_lines: Vec<String>,
-    overlay_lines: Vec<String>,
+    transcript_rows: Vec<RenderRow>,
+    overlay_rows: Vec<RenderRow>,
     live_user_prompt: Option<String>,
     live_assistant_text: String,
     live_thinking: String,
@@ -177,8 +203,8 @@ struct ReplHandler {
 impl ReplHandler {
     fn new(show_thinking: bool) -> Self {
         Self {
-            transcript_lines: Vec::new(),
-            overlay_lines: Vec::new(),
+            transcript_rows: Vec::new(),
+            overlay_rows: Vec::new(),
             live_user_prompt: None,
             live_assistant_text: String::new(),
             live_thinking: String::new(),
@@ -190,27 +216,34 @@ impl ReplHandler {
     }
 
     fn rebuild_from_session(&mut self, session: &Session, show_thinking: bool) {
-        self.transcript_lines.clear();
+        self.transcript_rows.clear();
         let mut turn = TranscriptTurn::default();
         for msg in &session.messages {
-            if msg.role == Role::User && !turn.lines.is_empty() {
-                flush_turn_lines(&mut self.transcript_lines, &mut turn);
+            if msg.role == Role::User && !turn.rows.is_empty() {
+                flush_turn_rows(&mut self.transcript_rows, &mut turn);
             }
             append_message_to_turn(&mut turn, msg, show_thinking);
         }
-        flush_turn_lines(&mut self.transcript_lines, &mut turn);
+        flush_turn_rows(&mut self.transcript_rows, &mut turn);
     }
 
     fn visible_lines(&self) -> Vec<String> {
-        let mut lines = self.transcript_lines.clone();
-        lines.extend(self.live_lines());
-        lines.extend(self.overlay_lines.iter().cloned());
-        lines
+        self.visible_rows()
+            .into_iter()
+            .map(|row| row_text(&row))
+            .collect()
+    }
+
+    fn visible_rows(&self) -> Vec<RenderRow> {
+        let mut rows = self.transcript_rows.clone();
+        rows.extend(self.live_rows());
+        rows.extend(self.overlay_rows.iter().cloned());
+        rows
     }
 
     fn has_content(&self) -> bool {
-        !self.transcript_lines.is_empty()
-            || !self.overlay_lines.is_empty()
+        !self.transcript_rows.is_empty()
+            || !self.overlay_rows.is_empty()
             || self.live_user_prompt.is_some()
             || !self.live_assistant_text.is_empty()
             || !self.live_thinking.is_empty()
@@ -218,7 +251,7 @@ impl ReplHandler {
     }
 
     fn push_overlay(&mut self, line: impl Into<String>) {
-        self.overlay_lines.push(line.into());
+        self.overlay_rows.push(RenderRow::Info(line.into()));
     }
 
     fn show_panel(&mut self, title: impl Into<String>, lines: Vec<String>) {
@@ -244,41 +277,41 @@ impl ReplHandler {
         self.live_tools.clear();
     }
 
-    fn live_lines(&self) -> Vec<String> {
-        let mut lines = Vec::new();
+    fn live_rows(&self) -> Vec<RenderRow> {
+        let mut rows = Vec::new();
         let turn_is_open =
             self.live_user_prompt.is_some() || !self.live_assistant_text.trim().is_empty() || !self.live_tools.is_empty();
 
         if let Some(prompt) = &self.live_user_prompt {
-            lines.push(format!("You: {prompt}"));
-            lines.push(String::new());
+            rows.push(RenderRow::User(prompt.clone()));
+            rows.push(RenderRow::Spacer);
         }
 
         if self.show_thinking {
             let thinking = self.live_thinking.trim();
             if !thinking.is_empty() {
-                lines.push(format!("{TOOL_LINE_INDENT}[thinking] {thinking}"));
+                rows.push(RenderRow::Thinking(thinking.to_string()));
             }
         }
 
         if turn_is_open {
             let assistant = self.live_assistant_text.trim();
             if assistant.is_empty() {
-                lines.push("ClawedCode:".to_string());
+                rows.push(RenderRow::Assistant(String::new()));
             } else {
-                lines.push(format!("ClawedCode: {assistant}"));
+                rows.push(RenderRow::Assistant(assistant.to_string()));
             }
         }
 
         for entry in &self.live_tools {
-            lines.extend(render_live_tool_entry(entry));
+            rows.extend(render_live_tool_entry(entry));
         }
 
-        while lines.last().is_some_and(|line| line.is_empty()) {
-            lines.pop();
+        while matches!(rows.last(), Some(RenderRow::Spacer)) {
+            rows.pop();
         }
 
-        lines
+        rows
     }
 
     fn record_live_tool_use(
@@ -339,51 +372,47 @@ impl ReplHandler {
     }
 }
 
-fn render_live_tool_entry(entry: &LiveToolEntry) -> Vec<String> {
-    let mut lines = Vec::new();
+fn render_live_tool_entry(entry: &LiveToolEntry) -> Vec<RenderRow> {
+    let mut rows = Vec::new();
 
     for event in &entry.events {
         match event {
             LiveToolEventState::Use { name, input } => {
-                lines.push(format!(
-                    "{TOOL_LINE_INDENT}[tool] {name} (id={}) {}",
-                    entry.tool_use_id,
-                    serde_json::to_string(input).unwrap_or_default()
-                ));
+                rows.push(RenderRow::ToolUse {
+                    id: entry.tool_use_id.clone(),
+                    name: name.clone(),
+                    input: serde_json::to_string(input).unwrap_or_default(),
+                });
             }
             LiveToolEventState::PendingApproval => {
-                lines.push(format!(
+                rows.push(RenderRow::ToolStatus(format!(
                     "{TOOL_LINE_INDENT}[tool_pending] {} awaiting approval",
                     entry.tool_use_id
-                ));
+                )));
             }
             LiveToolEventState::Approved => {
-                lines.push(format!(
+                rows.push(RenderRow::ToolStatus(format!(
                     "{TOOL_LINE_INDENT}[tool_approved] {} approved",
                     entry.tool_use_id
-                ));
+                )));
             }
             LiveToolEventState::Denied => {
-                lines.push(format!(
+                rows.push(RenderRow::ToolStatus(format!(
                     "{TOOL_LINE_INDENT}[tool_denied] {} denied",
                     entry.tool_use_id
-                ));
+                )));
             }
             LiveToolEventState::Result { content, is_error } => {
-                let prefix = if *is_error {
-                    "[tool_error]"
-                } else {
-                    "[tool_result]"
-                };
-                lines.push(format!(
-                    "{TOOL_LINE_INDENT}{prefix} {}: {content}",
-                    entry.tool_use_id
-                ));
+                rows.push(RenderRow::ToolResult {
+                    tool_use_id: entry.tool_use_id.clone(),
+                    content: content.clone(),
+                    is_error: *is_error,
+                });
             }
         }
     }
 
-    lines
+    rows
 }
 
 impl TuiHandler for ReplHandler {
@@ -442,6 +471,25 @@ struct TranscriptViewport {
     unseen_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplScreen {
+    Main,
+    Transcript,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TranscriptModeState {
+    frozen_rows: Vec<RenderRow>,
+    viewport: TranscriptViewport,
+    dump_mode: bool,
+    export_status: Option<String>,
+    search_open: bool,
+    search_input: String,
+    search_query: String,
+    search_matches: Vec<usize>,
+    search_index: usize,
+}
+
 fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     let mut handler = ReplHandler::new(ctx.show_thinking);
     handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
@@ -449,10 +497,12 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
 
     let mut input_buffer = String::new();
     let mut cursor_pos: usize = 0;
+    let mut screen = ReplScreen::Main;
     let mut viewport = TranscriptViewport {
         pinned_to_bottom: true,
         ..TranscriptViewport::default()
     };
+    let mut transcript_mode = TranscriptModeState::default();
     let mut queued_prompts: Vec<String> = Vec::new();
     let mut awaiting_approval: Option<ApprovalRequest> = None;
     let mut active_turn: Option<ActiveTurn> = None;
@@ -491,6 +541,12 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
         terminal.draw(|frame| {
             let area = frame.area();
             last_area = area;
+
+            if screen == ReplScreen::Transcript {
+                render_transcript_screen(frame, area, &transcript_mode);
+                return;
+            }
+
             let queued_preview_lines = queued_prompt_preview_lines(&queued_prompts);
             let queued_height = if queued_preview_lines.is_empty() {
                 0
@@ -646,6 +702,127 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                     continue;
                 }
 
+                if screen == ReplScreen::Transcript {
+                    let transcript_height = last_area.height.saturating_sub(if transcript_mode.dump_mode {
+                        0
+                    } else {
+                        2
+                    }) as usize;
+                    let max_scroll = max_scroll_for_lines(
+                        transcript_mode.frozen_rows.len(),
+                        transcript_height.max(1),
+                    );
+
+                    if transcript_mode.search_open {
+                        match key.code {
+                            KeyCode::Esc => {
+                                transcript_mode.search_open = false;
+                                transcript_mode.search_input =
+                                    transcript_mode.search_query.clone();
+                                continue;
+                            }
+                            KeyCode::Enter => {
+                                transcript_mode.search_open = false;
+                                let query = transcript_mode.search_input.clone();
+                                update_transcript_search(&mut transcript_mode, query);
+                                continue;
+                            }
+                            KeyCode::Backspace => {
+                                transcript_mode.search_input.pop();
+                                let query = transcript_mode.search_input.clone();
+                                update_transcript_search(&mut transcript_mode, query);
+                                continue;
+                            }
+                            KeyCode::Char(c) => {
+                                transcript_mode.search_input.push(c);
+                                let query = transcript_mode.search_input.clone();
+                                update_transcript_search(&mut transcript_mode, query);
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    match key.code {
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            break;
+                        }
+                        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            screen = ReplScreen::Main;
+                            transcript_mode = TranscriptModeState::default();
+                            continue;
+                        }
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            screen = ReplScreen::Main;
+                            transcript_mode = TranscriptModeState::default();
+                            continue;
+                        }
+                        KeyCode::Char('/') => {
+                            transcript_mode.search_open = true;
+                            transcript_mode.search_input = transcript_mode.search_query.clone();
+                            continue;
+                        }
+                        KeyCode::Char('n') if !transcript_mode.search_matches.is_empty() => {
+                            navigate_transcript_search(&mut transcript_mode, true);
+                            continue;
+                        }
+                        KeyCode::Char('N') if !transcript_mode.search_matches.is_empty() => {
+                            navigate_transcript_search(&mut transcript_mode, false);
+                            continue;
+                        }
+                        KeyCode::Char('v') => {
+                            transcript_mode.export_status =
+                                Some(export_transcript_lines(&transcript_mode.frozen_rows)?);
+                            continue;
+                        }
+                        KeyCode::Char('[') => {
+                            transcript_mode.dump_mode = true;
+                            continue;
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            transcript_mode.viewport.scroll_offset =
+                                transcript_mode.viewport.scroll_offset.saturating_sub(1);
+                            continue;
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            transcript_mode.viewport.scroll_offset = transcript_mode
+                                .viewport
+                                .scroll_offset
+                                .saturating_add(1)
+                                .min(max_scroll);
+                            continue;
+                        }
+                        KeyCode::PageUp => {
+                            let step = transcript_height.saturating_sub(2).max(1);
+                            transcript_mode.viewport.scroll_offset = transcript_mode
+                                .viewport
+                                .scroll_offset
+                                .saturating_sub(step);
+                            continue;
+                        }
+                        KeyCode::PageDown => {
+                            let step = transcript_height.saturating_sub(2).max(1);
+                            transcript_mode.viewport.scroll_offset = transcript_mode
+                                .viewport
+                                .scroll_offset
+                                .saturating_add(step)
+                                .min(max_scroll);
+                            continue;
+                        }
+                        KeyCode::Home => {
+                            transcript_mode.viewport.scroll_offset = 0;
+                            continue;
+                        }
+                        KeyCode::End => {
+                            transcript_mode.viewport.scroll_offset = max_scroll;
+                            continue;
+                        }
+                        _ => {}
+                    }
+
+                    continue;
+                }
+
                 if awaiting_approval.is_some() {
                     match key.code {
                         KeyCode::Char('y') | KeyCode::Char('Y') => {
@@ -704,6 +881,16 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 }
 
                 match key.code {
+                    KeyCode::Char('o')
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && handler.has_content() =>
+                    {
+                        screen = ReplScreen::Transcript;
+                        transcript_mode =
+                            enter_transcript_mode(&handler, chunks[1].height as usize);
+                        transcript_mode.viewport.scroll_offset = viewport.scroll_offset;
+                        transcript_mode.viewport.pinned_to_bottom = false;
+                    }
                     KeyCode::Up if handler.has_content() && input_buffer.is_empty() => {
                         viewport.scroll_offset = viewport.scroll_offset.saturating_sub(1);
                         viewport.pinned_to_bottom = viewport.scroll_offset
@@ -832,7 +1019,7 @@ fn render_conversation(
     scroll_offset: usize,
 ) {
     if command_entries.is_empty() {
-        let transcript = Paragraph::new(handler.visible_lines().join("\n"))
+        let transcript = Paragraph::new(render_rows(&handler.visible_rows(), None, &[]))
             .wrap(Wrap { trim: false })
             .scroll((scroll_offset as u16, 0));
         frame.render_widget(transcript, area);
@@ -845,7 +1032,7 @@ fn render_conversation(
     ])
     .split(area);
 
-    let transcript = Paragraph::new(handler.visible_lines().join("\n"))
+    let transcript = Paragraph::new(render_rows(&handler.visible_rows(), None, &[]))
         .wrap(Wrap { trim: false })
         .scroll((scroll_offset as u16, 0));
 
@@ -908,6 +1095,48 @@ fn render_dashboard(
     }
 }
 
+fn render_transcript_screen(frame: &mut Frame, area: Rect, state: &TranscriptModeState) {
+    let transcript = Paragraph::new(transcript_render_lines(state))
+        .wrap(Wrap { trim: false })
+        .scroll((state.viewport.scroll_offset as u16, 0));
+
+    if state.dump_mode {
+        frame.render_widget(transcript, area);
+        return;
+    }
+
+    let chunks = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(area);
+
+    let transcript = transcript
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(MUTED)),
+        );
+    frame.render_widget(transcript, chunks[0]);
+
+    frame.render_widget(
+        Paragraph::new(transcript_footer_status_line(state))
+            .style(Style::default().fg(MUTED)),
+        chunks[1],
+    );
+
+    let bottom_line = if state.search_open {
+        format!("Search: {}", state.search_input)
+    } else {
+        transcript_footer_hint_line(state)
+    };
+    frame.render_widget(
+        Paragraph::new(bottom_line).style(Style::default().fg(MUTED)),
+        chunks[2],
+    );
+}
+
 fn render_command_palette(
     frame: &mut Frame,
     area: Rect,
@@ -954,6 +1183,108 @@ fn render_command_palette(
 
 fn command_palette_height(entries: &[CommandEntry]) -> u16 {
     entries.len().min(6) as u16 + 3
+}
+
+fn transcript_footer_status_line(state: &TranscriptModeState) -> String {
+    if let Some(status) = &state.export_status {
+        return status.clone();
+    }
+
+    match transcript_search_badge(state) {
+        Some((current, total)) => format!("Showing detailed transcript · {current}/{total}"),
+        None => "Showing detailed transcript".to_string(),
+    }
+}
+
+fn transcript_footer_hint_line(state: &TranscriptModeState) -> String {
+    if state.dump_mode {
+        return "Dump mode · ↑/↓/PgUp/PgDn/Home/End scroll · q or Ctrl+O exits"
+            .to_string();
+    }
+
+    if state.search_open {
+        return "Enter commits search · Esc cancels · n/N navigate matches after closing".to_string();
+    }
+
+    "Ctrl+O or q exits · / searches · n/N navigate · v exports · [ dump · ↑/↓/PgUp/PgDn/Home/End scroll".to_string()
+}
+
+fn transcript_search_badge(state: &TranscriptModeState) -> Option<(usize, usize)> {
+    if state.search_query.is_empty() || state.search_matches.is_empty() {
+        None
+    } else {
+        Some((state.search_index + 1, state.search_matches.len()))
+    }
+}
+
+fn transcript_search_current(state: &TranscriptModeState) -> Option<usize> {
+    state.search_matches.get(state.search_index).copied()
+}
+
+fn row_text(row: &RenderRow) -> String {
+    match row {
+        RenderRow::User(text) => {
+            if text.is_empty() {
+                "You:".to_string()
+            } else {
+                format!("You: {text}")
+            }
+        }
+        RenderRow::Assistant(text) => {
+            if text.is_empty() {
+                "ClawedCode:".to_string()
+            } else {
+                format!("ClawedCode: {text}")
+            }
+        }
+        RenderRow::Thinking(text) => format!("{TOOL_LINE_INDENT}[thinking] {text}"),
+        RenderRow::ToolUse { id, name, input } => {
+            format!("{TOOL_LINE_INDENT}[tool] {name} (id={id}) {input}")
+        }
+        RenderRow::ToolStatus(text) => text.clone(),
+        RenderRow::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => {
+            let prefix = if *is_error {
+                "[tool_error]"
+            } else {
+                "[tool_result]"
+            };
+            format!("{TOOL_LINE_INDENT}{prefix} {tool_use_id}: {content}")
+        }
+        RenderRow::SubagentSummary {
+            child_session_id,
+            summary,
+        } => format!("{TOOL_LINE_INDENT}[sub-agent: {child_session_id}] {summary}"),
+        RenderRow::Info(text) => text.clone(),
+        RenderRow::Spacer => String::new(),
+    }
+}
+
+fn render_rows(
+    rows: &[RenderRow],
+    selected_index: Option<usize>,
+    search_matches: &[usize],
+) -> Vec<Line<'static>> {
+    rows.iter()
+        .enumerate()
+        .flat_map(|(index, row)| {
+            let style = if selected_index == Some(index) {
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            } else if search_matches.contains(&index) {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            };
+
+            match row {
+                RenderRow::Spacer => vec![Line::from(String::new())],
+                _ => vec![Line::from(Span::styled(row_text(row), style))],
+            }
+        })
+        .collect()
 }
 
 fn launch_banner(ctx: &TuiContext) -> String {
@@ -1072,6 +1403,107 @@ fn max_transcript_scroll(handler: &ReplHandler, viewport_height: usize) -> usize
         .visible_lines()
         .len()
         .saturating_sub(viewport_height)
+}
+
+fn max_scroll_for_lines(line_count: usize, viewport_height: usize) -> usize {
+    line_count.saturating_sub(viewport_height)
+}
+
+fn transcript_mode_refresh_search(state: &mut TranscriptModeState) {
+    state.search_matches = transcript_search_matches(&state.frozen_rows, &state.search_query);
+    if state.search_matches.is_empty() {
+        state.search_index = 0;
+        return;
+    }
+    if state.search_index >= state.search_matches.len() {
+        state.search_index = 0;
+    }
+    state.viewport.scroll_offset = state.search_matches[state.search_index];
+}
+
+fn transcript_search_matches(rows: &[RenderRow], query: &str) -> Vec<usize> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let needle = trimmed.to_ascii_lowercase();
+    rows.iter()
+        .enumerate()
+        .filter_map(|(idx, row)| {
+            row_text(row)
+                .to_ascii_lowercase()
+                .contains(&needle)
+                .then_some(idx)
+        })
+        .collect()
+}
+
+fn export_transcript_lines(rows: &[RenderRow]) -> Result<String> {
+    let path = env::temp_dir().join(format!(
+        "clawedcode-transcript-{}.txt",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    ));
+    fs::write(
+        &path,
+        rows.iter().map(row_text).collect::<Vec<_>>().join("\n"),
+    )?;
+
+    if let Some(editor) = env::var("VISUAL").ok().or_else(|| env::var("EDITOR").ok()) {
+        let command = format!(r#"{editor} "{}""#, path.display());
+        Command::new("sh").arg("-lc").arg(command).spawn()?;
+        Ok(format!("opening {}", path.display()))
+    } else {
+        Ok(format!("wrote {}", path.display()))
+    }
+}
+
+fn enter_transcript_mode(handler: &ReplHandler, viewport_height: usize) -> TranscriptModeState {
+    let frozen_rows = handler.visible_rows();
+    let max_scroll = frozen_rows.len().saturating_sub(viewport_height);
+    TranscriptModeState {
+        frozen_rows,
+        viewport: TranscriptViewport {
+            scroll_offset: max_scroll,
+            pinned_to_bottom: true,
+            unseen_count: 0,
+        },
+        ..TranscriptModeState::default()
+    }
+}
+
+fn update_transcript_search(state: &mut TranscriptModeState, query: String) {
+    state.search_query = query;
+    state.search_index = 0;
+    transcript_mode_refresh_search(state);
+}
+
+fn navigate_transcript_search(state: &mut TranscriptModeState, forward: bool) {
+    if state.search_matches.is_empty() {
+        return;
+    }
+
+    let len = state.search_matches.len();
+    state.search_index = if forward {
+        (state.search_index + 1) % len
+    } else if state.search_index == 0 {
+        len - 1
+    } else {
+        state.search_index - 1
+    };
+
+    state.viewport.scroll_offset = state.search_matches[state.search_index];
+    state.viewport.pinned_to_bottom = false;
+}
+
+fn transcript_render_lines(state: &TranscriptModeState) -> Vec<Line<'static>> {
+    render_rows(
+        &state.frozen_rows,
+        transcript_search_current(state),
+        &state.search_matches,
+    )
 }
 
 fn prompt_prefix_for_state(
@@ -1267,17 +1699,17 @@ fn section_title(title: &'static str) -> Line<'static> {
 
 #[derive(Default)]
 struct TranscriptTurn {
-    lines: Vec<String>,
+    rows: Vec<RenderRow>,
 }
 
-fn flush_turn_lines(lines: &mut Vec<String>, turn: &mut TranscriptTurn) {
-    if turn.lines.is_empty() {
+fn flush_turn_rows(rows: &mut Vec<RenderRow>, turn: &mut TranscriptTurn) {
+    if turn.rows.is_empty() {
         return;
     }
-    if !lines.is_empty() && !lines.last().is_some_and(|line| line.is_empty()) {
-        lines.push(String::new());
+    if !rows.is_empty() && !matches!(rows.last(), Some(RenderRow::Spacer)) {
+        rows.push(RenderRow::Spacer);
     }
-    lines.append(&mut turn.lines);
+    rows.append(&mut turn.rows);
 }
 
 fn append_message_to_turn(turn: &mut TranscriptTurn, msg: &Message, show_thinking: bool) {
@@ -1291,7 +1723,7 @@ fn append_message_to_turn(turn: &mut TranscriptTurn, msg: &Message, show_thinkin
                 matches!(block, ContentBlock::Text { text } if !text.trim().is_empty())
             });
             if !has_text && !msg.content_blocks.is_empty() {
-                turn.lines.push("ClawedCode:".to_string());
+                turn.rows.push(RenderRow::Assistant(String::new()));
             }
             append_message_blocks(turn, "ClawedCode", &msg.content_blocks, show_thinking, false);
         }
@@ -1323,7 +1755,11 @@ fn append_message_blocks(
             ContentBlock::Text { text } => {
                 let text = text.trim();
                 if !text.is_empty() {
-                    turn.lines.push(format!("{role_prefix}: {text}"));
+                    turn.rows.push(match role_prefix {
+                        "You" => RenderRow::User(text.to_string()),
+                        "ClawedCode" => RenderRow::Assistant(text.to_string()),
+                        _ => RenderRow::Info(format!("{role_prefix}: {text}")),
+                    });
                     wrote_block = true;
                 }
             }
@@ -1333,7 +1769,7 @@ fn append_message_blocks(
                 {
                     let thinking = thinking.trim();
                     if !thinking.is_empty() {
-                        turn.lines.push(format!("{TOOL_LINE_INDENT}[thinking] {thinking}"));
+                        turn.rows.push(RenderRow::Thinking(thinking.to_string()));
                         wrote_block = true;
                     }
                 }
@@ -1341,10 +1777,11 @@ fn append_message_blocks(
             ContentBlock::ToolUse {
                 id, name, input, ..
             } => {
-                turn.lines.push(format!(
-                    "{TOOL_LINE_INDENT}[tool] {name} (id={id}) {}",
-                    serde_json::to_string(input).unwrap_or_default()
-                ));
+                turn.rows.push(RenderRow::ToolUse {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: serde_json::to_string(input).unwrap_or_default(),
+                });
                 wrote_block = true;
             }
             ContentBlock::ToolResult {
@@ -1352,31 +1789,28 @@ fn append_message_blocks(
                 content,
                 is_error,
             } => {
-                let prefix = if *is_error {
-                    "[tool_error]"
-                } else {
-                    "[tool_result]"
-                };
-                turn.lines
-                    .push(format!("{TOOL_LINE_INDENT}{prefix} {tool_use_id}: {content}"));
+                turn.rows.push(RenderRow::ToolResult {
+                    tool_use_id: tool_use_id.clone(),
+                    content: content.clone(),
+                    is_error: *is_error,
+                });
                 wrote_block = true;
             }
             ContentBlock::SubAgentSummary {
                 child_session_id,
                 summary,
             } => {
-                turn.lines.push(format!(
-                    "{TOOL_LINE_INDENT}[sub-agent: {}] {}",
-                    &child_session_id[..8.min(child_session_id.len())],
-                    summary
-                ));
+                turn.rows.push(RenderRow::SubagentSummary {
+                    child_session_id: child_session_id[..8.min(child_session_id.len())].to_string(),
+                    summary: summary.clone(),
+                });
                 wrote_block = true;
             }
         }
     }
 
     if wrote_block && add_spacing_after && !has_toolish_block {
-        turn.lines.push(String::new());
+        turn.rows.push(RenderRow::Spacer);
     }
 }
 
@@ -1612,7 +2046,7 @@ fn handle_slash_command(
                     return Ok(true);
                 }
                 "/clear" => {
-                    handler.overlay_lines.clear();
+                    handler.overlay_rows.clear();
                     handler.clear_panel();
                     let _ = ctx.save_session();
                     return Ok(true);
@@ -1708,7 +2142,7 @@ fn handle_slash_command(
                             let forked_short = short_session_id(&forked_id).to_string();
                             ctx.replace_session(forked);
                             let _ = ctx.save_session();
-                            handler.overlay_lines.clear();
+                            handler.overlay_rows.clear();
                             handler.clear_panel();
                             handler.push_overlay(format!("[info] Forked {source_short} -> {forked_short}"));
                         }
@@ -2723,15 +3157,15 @@ mod command_policy_tests {
         assert!(active_turn.is_none());
         assert!(
             handler
-                .overlay_lines
+                .overlay_rows
                 .iter()
-                .any(|line| line.contains("Unknown command `/update`"))
+                .any(|line| row_text(line).contains("Unknown command `/update`"))
         );
         assert!(
             handler
-                .overlay_lines
+                .overlay_rows
                 .iter()
-                .all(|line| !line.contains("Updated clawedcode"))
+                .all(|line| !row_text(line).contains("Updated clawedcode"))
         );
 
         unsafe { std::env::remove_var("CLAWEDCODE_INSTALL_METHOD") };
@@ -2763,9 +3197,9 @@ mod command_policy_tests {
         assert!(active_turn.is_none());
         assert!(
             handler
-                .overlay_lines
+                .overlay_rows
                 .iter()
-                .any(|line| line.contains("Unknown command `/hidden-skill`"))
+                .any(|line| row_text(line).contains("Unknown command `/hidden-skill`"))
         );
 
         fs::remove_dir_all(root).ok();
@@ -3003,6 +3437,66 @@ mod command_policy_tests {
     }
 
     #[test]
+    fn transcript_search_matches_are_case_insensitive() {
+        let rows = vec![
+            RenderRow::User("alpha".to_string()),
+            RenderRow::Assistant("Beta target".to_string()),
+            RenderRow::Info("gamma TARGET".to_string()),
+        ];
+
+        assert_eq!(transcript_search_matches(&rows, "target"), vec![1, 2]);
+    }
+
+    #[test]
+    fn transcript_search_badge_reflects_current_match() {
+        let state = TranscriptModeState {
+            search_query: "target".to_string(),
+            search_matches: vec![4, 8, 12],
+            search_index: 1,
+            ..TranscriptModeState::default()
+        };
+
+        assert_eq!(transcript_search_badge(&state), Some((2, 3)));
+    }
+
+    #[test]
+    fn render_row_text_formats_rows_consistently() {
+        assert_eq!(row_text(&RenderRow::User("hello".into())), "You: hello");
+        assert_eq!(
+            row_text(&RenderRow::ToolResult {
+                tool_use_id: "abc".into(),
+                content: "ok".into(),
+                is_error: false,
+            }),
+            "  [tool_result] abc: ok"
+        );
+        assert_eq!(row_text(&RenderRow::Spacer), "");
+    }
+
+    #[test]
+    fn export_transcript_lines_writes_temp_file_without_editor() {
+        static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let _guard = ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("lock env guard");
+        unsafe { std::env::remove_var("VISUAL") };
+        unsafe { std::env::remove_var("EDITOR") };
+
+        let status = export_transcript_lines(&[
+            RenderRow::User("one".to_string()),
+            RenderRow::Assistant("two".to_string()),
+        ])
+            .expect("export succeeds");
+        assert!(status.starts_with("wrote "));
+
+        let path = status.trim_start_matches("wrote ");
+        let exported = fs::read_to_string(path).expect("read exported transcript");
+        assert_eq!(exported, "You: one\nClawedCode: two");
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
     fn transport_label_appears_in_banner_help_and_dashboard() {
         let root = temp_dir("transport_label_surfaces");
         let project = root.join("project");
@@ -3045,7 +3539,7 @@ mod command_policy_tests {
         );
 
         append_message_to_turn(&mut turn, &message, true);
-        let rendered = turn.lines.join("\n");
+        let rendered = turn.rows.iter().map(row_text).collect::<Vec<_>>().join("\n");
 
         assert!(rendered.contains("ClawedCode: Remote hello"));
         assert!(!rendered.contains("clawedcode-transport-session-id"));
@@ -3537,9 +4031,12 @@ mod command_policy_tests {
             assert_eq!(ctx.session().execution_mode, SessionMode::Interactive);
             assert_eq!(ctx.session().messages, source.messages);
             assert!(handler
-                .overlay_lines
+                .overlay_rows
                 .iter()
-                .any(|line| line.contains("Forked ") && line.contains(" -> ")));
+                .any(|line| {
+                    let text = row_text(line);
+                    text.contains("Forked ") && text.contains(" -> ")
+                }));
 
             fs::remove_dir_all(root).ok();
         }
