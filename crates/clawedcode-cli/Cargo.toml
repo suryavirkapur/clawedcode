@@ -17,11 +17,11 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
-clawedcode-api = { path = "../clawedcode-api", version = "0.0.9", features = ["anthropic"] }
-clawedcode-core = { path = "../clawedcode-core", version = "0.0.9" }
-clawedcode-mcp = { path = "../clawedcode-mcp", version = "0.0.9" }
-clawedcode-tui = { path = "../clawedcode-tui", version = "0.0.9" }
-clawedcode-tools = { path = "../clawedcode-tools", version = "0.0.9" }
+clawedcode-api = { path = "../clawedcode-api", version = "0.1.0", features = ["anthropic"] }
+clawedcode-core = { path = "../clawedcode-core", version = "0.1.0" }
+clawedcode-mcp = { path = "../clawedcode-mcp", version = "0.1.0" }
+clawedcode-tui = { path = "../clawedcode-tui", version = "0.1.0" }
+clawedcode-tools = { path = "../clawedcode-tools", version = "0.1.0" }
 
 [[bin]]
 name = "clawedcode"

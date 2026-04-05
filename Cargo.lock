@@ -222,7 +222,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clawedcode"
-version = "0.0.9"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "atty",
@@ -240,7 +240,7 @@ dependencies = [
 
 [[package]]
 name = "clawedcode-api"
-version = "0.0.9"
+version = "0.1.0"
 dependencies = [
  "clawedcode-mcp",
  "clawedcode-tools",
@@ -256,7 +256,7 @@ dependencies = [
 
 [[package]]
 name = "clawedcode-core"
-version = "0.0.9"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -278,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "clawedcode-mcp"
-version = "0.0.9"
+version = "0.1.0"
 dependencies = [
  "reqwest",
  "serde",
@@ -287,7 +287,7 @@ dependencies = [
 
 [[package]]
 name = "clawedcode-tools"
-version = "0.0.9"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "directories",
@@ -300,7 +300,7 @@ dependencies = [
 
 [[package]]
 name = "clawedcode-tui"
-version = "0.0.9"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
