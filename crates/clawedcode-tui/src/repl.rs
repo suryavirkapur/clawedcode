@@ -157,7 +157,34 @@ struct LiveToolEntry {
 #[derive(Debug, Clone)]
 struct InfoPanel {
     title: String,
+    status: Option<String>,
     lines: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct BottomChromeState {
+    left: String,
+    right: Option<String>,
+    hint: String,
+    prompt_prefix: String,
+}
+
+impl BottomChromeState {
+    fn status_left(&self) -> &str {
+        &self.left
+    }
+
+    fn status_right(&self) -> Option<&str> {
+        self.right.as_deref()
+    }
+
+    fn hint(&self) -> &str {
+        &self.hint
+    }
+
+    fn prompt_prefix(&self) -> &str {
+        &self.prompt_prefix
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -257,6 +284,7 @@ impl ReplHandler {
     fn show_panel(&mut self, title: impl Into<String>, lines: Vec<String>) {
         self.info_panel = Some(InfoPanel {
             title: title.into(),
+            status: None,
             lines,
         });
     }
@@ -541,6 +569,15 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
         terminal.draw(|frame| {
             let area = frame.area();
             last_area = area;
+            let chrome = footer_chrome(
+                ctx,
+                &input_buffer,
+                active_turn.is_some(),
+                awaiting_approval.as_ref(),
+                queued_prompts.len(),
+                handler.info_panel.as_ref(),
+                &viewport,
+            );
 
             if screen == ReplScreen::Transcript {
                 render_transcript_screen(frame, area, &transcript_mode);
@@ -565,23 +602,6 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
             .split(area);
 
             let command_entries = filtered_command_entries(ctx, &input_buffer);
-            let footer_status = footer_status_line(
-                ctx,
-                active_turn.is_some(),
-                awaiting_approval.as_ref(),
-                queued_prompts.len(),
-                handler.info_panel.as_ref(),
-                &viewport,
-            );
-            let footer_hint = footer_hint_line(
-                ctx,
-                &input_buffer,
-                active_turn.is_some(),
-                awaiting_approval.as_ref(),
-                queued_prompts.len(),
-                handler.info_panel.as_ref(),
-                &viewport,
-            );
 
             if viewport.pinned_to_bottom {
                 viewport.scroll_offset =
@@ -617,27 +637,15 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 );
             }
 
+            render_footer_bar(frame, chunks[3], chrome.status_left(), chrome.status_right());
             frame.render_widget(
-                Paragraph::new(footer_status.clone())
-                    .style(Style::default().fg(MUTED)),
-                chunks[3],
-            );
-
-            frame.render_widget(
-                Paragraph::new(footer_hint)
-                    .style(Style::default().fg(MUTED)),
+                Paragraph::new(chrome.hint()).style(Style::default().fg(MUTED)),
                 chunks[4],
-            );
-
-            let prompt_prefix = prompt_prefix_for_state(
-                &input_buffer,
-                active_turn.is_some(),
-                awaiting_approval.as_ref(),
             );
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled(
-                        prompt_prefix,
+                        chrome.prompt_prefix(),
                         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(input_buffer.clone()),
@@ -665,7 +673,12 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 frame.render_widget(modal, modal_area);
             } else if let Some(panel) = &handler.info_panel {
                 let modal_area = centered_rect(72, 72, area);
-                let mut panel_lines = panel.lines.clone();
+                let mut panel_lines = Vec::new();
+                if let Some(status) = &panel.status {
+                    panel_lines.push(status.clone());
+                    panel_lines.push(String::new());
+                }
+                panel_lines.extend(panel.lines.clone());
                 panel_lines.push(String::new());
                 panel_lines.push(info_panel_hint_line().to_string());
                 let modal = Paragraph::new(panel_lines.join("\n"))
@@ -1120,11 +1133,7 @@ fn render_transcript_screen(frame: &mut Frame, area: Rect, state: &TranscriptMod
         );
     frame.render_widget(transcript, chunks[0]);
 
-    frame.render_widget(
-        Paragraph::new(transcript_footer_status_line(state))
-            .style(Style::default().fg(MUTED)),
-        chunks[1],
-    );
+    render_transcript_footer(frame, chunks[1], state);
 
     let bottom_line = if state.search_open {
         format!("Search: {}", state.search_input)
@@ -1185,28 +1194,78 @@ fn command_palette_height(entries: &[CommandEntry]) -> u16 {
     entries.len().min(6) as u16 + 3
 }
 
-fn transcript_footer_status_line(state: &TranscriptModeState) -> String {
-    if let Some(status) = &state.export_status {
-        return status.clone();
+fn render_footer_bar(frame: &mut Frame, area: Rect, left: &str, right: Option<&str>) {
+    if let Some(right) = right.filter(|value| !value.is_empty()) {
+        let right_width = right.chars().count().min(area.width.saturating_sub(1) as usize) as u16;
+        let chunks = Layout::horizontal([Constraint::Min(1), Constraint::Length(right_width)])
+            .split(area);
+        frame.render_widget(
+            Paragraph::new(left.to_string()).style(Style::default().fg(MUTED)),
+            chunks[0],
+        );
+        frame.render_widget(
+            Paragraph::new(right.to_string())
+                .style(Style::default().fg(MUTED))
+                .alignment(Alignment::Right),
+            chunks[1],
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new(left.to_string()).style(Style::default().fg(MUTED)),
+            area,
+        );
     }
+}
 
-    match transcript_search_badge(state) {
-        Some((current, total)) => format!("Showing detailed transcript · {current}/{total}"),
-        None => "Showing detailed transcript".to_string(),
+fn render_transcript_footer(frame: &mut Frame, area: Rect, state: &TranscriptModeState) {
+    let (left, right, _) = transcript_footer_parts(state);
+    render_footer_bar(frame, area, &left, right.as_deref());
+}
+
+fn append_panel_section(lines: &mut Vec<String>, title: &str, body: Vec<String>) {
+    if !lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines.push(format!("{title}:"));
+    for line in body {
+        lines.push(format!("  - {line}"));
+    }
+}
+
+fn transcript_footer_parts(state: &TranscriptModeState) -> (String, Option<String>, String) {
+    let status_right = if let Some(status) = &state.export_status {
+        Some(status.clone())
+    } else {
+        transcript_search_badge(state).map(|(current, total)| format!("{current}/{total}"))
+    };
+
+    let status_left = "Showing detailed transcript · Ctrl+O to return".to_string();
+    let hint = if state.dump_mode {
+        "Dump mode · ↑/↓/PgUp/PgDn/Home/End scroll · q exits".to_string()
+    } else if state.search_open {
+        "Search transcript · Enter commits · Esc cancels".to_string()
+    } else if state.search_matches.is_empty() {
+        "/ search · v export · [ dump · ↑/↓/PgUp/PgDn/Home/End scroll".to_string()
+    } else {
+        "/ search · n/N navigate · v export · [ dump · ↑/↓/PgUp/PgDn/Home/End scroll"
+            .to_string()
+    };
+
+    (status_left, status_right, hint)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn transcript_footer_status_line(state: &TranscriptModeState) -> String {
+    let (left, right, _) = transcript_footer_parts(state);
+    match right {
+        Some(right) => format!("{left} · {right}"),
+        None => left,
     }
 }
 
 fn transcript_footer_hint_line(state: &TranscriptModeState) -> String {
-    if state.dump_mode {
-        return "Dump mode · ↑/↓/PgUp/PgDn/Home/End scroll · q or Ctrl+O exits"
-            .to_string();
-    }
-
-    if state.search_open {
-        return "Enter commits search · Esc cancels · n/N navigate matches after closing".to_string();
-    }
-
-    "Ctrl+O or q exits · / searches · n/N navigate · v exports · [ dump · ↑/↓/PgUp/PgDn/Home/End scroll".to_string()
+    let (_, _, hint) = transcript_footer_parts(state);
+    hint
 }
 
 fn transcript_search_badge(state: &TranscriptModeState) -> Option<(usize, usize)> {
@@ -1314,6 +1373,7 @@ fn launch_banner(ctx: &TuiContext) -> String {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn footer_status_line(
     ctx: &TuiContext,
     active_turn: bool,
@@ -1396,6 +1456,53 @@ fn footer_hint_line(
     }
 
     "Enter to send · ? for shortcuts · / for commands · /sessions for recent sessions · /tools for tools".to_string()
+}
+
+fn footer_chrome(
+    ctx: &TuiContext,
+    input_buffer: &str,
+    active_turn: bool,
+    awaiting_approval: Option<&ApprovalRequest>,
+    queued_count: usize,
+    info_panel: Option<&InfoPanel>,
+    viewport: &TranscriptViewport,
+) -> BottomChromeState {
+    let left = if let Some(panel) = info_panel {
+        format!("Viewing {}", panel.title)
+    } else if !viewport.pinned_to_bottom {
+        if viewport.unseen_count == 0 {
+            "Scrolled transcript".to_string()
+        } else {
+            format!("Scrolled transcript · {} unseen", viewport.unseen_count)
+        }
+    } else if let Some(req) = awaiting_approval {
+        format!("Waiting for approval: {}", req.tool_name)
+    } else if active_turn {
+        if queued_count == 0 {
+            "Assistant is working".to_string()
+        } else {
+            format!("Assistant is working · {queued_count} queued")
+        }
+    } else if let Some(background) = background_activity_summary(ctx) {
+        background
+    } else {
+        "Idle".to_string()
+    };
+
+    BottomChromeState {
+        left,
+        right: Some(session_compact_status(ctx)),
+        hint: footer_hint_line(
+            ctx,
+            input_buffer,
+            active_turn,
+            awaiting_approval,
+            queued_count,
+            info_panel,
+            viewport,
+        ),
+        prompt_prefix: prompt_prefix_for_state(input_buffer, active_turn, awaiting_approval),
+    }
 }
 
 fn max_transcript_scroll(handler: &ReplHandler, viewport_height: usize) -> usize {
@@ -2619,52 +2726,67 @@ fn session_compact_status(ctx: &TuiContext) -> String {
 fn help_panel(ctx: &TuiContext) -> InfoPanel {
     InfoPanel {
         title: "Shortcuts and Commands".to_string(),
+        status: Some(session_compact_status(ctx)),
         lines: help_overlay_lines(ctx),
     }
 }
 
 fn sessions_panel(ctx: &TuiContext) -> InfoPanel {
     let sessions = list_saved_sessions(ctx, 8);
+    let session_count = sessions.len();
     let mut lines = vec![
-        format!(
-            "Current session: {} · cwd {}",
-            short_session_id(&ctx.session().id.to_string()),
-            display_path(&ctx.session().cwd)
-        ),
         "Use /fork <session-id-or-prefix> to branch from a saved session.".to_string(),
-        "".to_string(),
     ];
-    if sessions.is_empty() {
-        lines.push("No saved sessions found.".to_string());
-    } else {
-        for session in sessions {
-            lines.push(format_saved_session_line(&session, &ctx.session().id));
-        }
-    }
+    append_panel_section(
+        &mut lines,
+        "Recent sessions",
+        if sessions.is_empty() {
+            vec!["No saved sessions found.".to_string()]
+        } else {
+            sessions
+                .into_iter()
+                .map(|session| format_saved_session_line(&session, &ctx.session().id))
+                .collect()
+        },
+    );
     InfoPanel {
         title: "Recent Sessions".to_string(),
+        status: Some(format!(
+            "{session_count} saved session(s) · current {}",
+            short_session_id(&ctx.session().id.to_string())
+        )),
         lines,
     }
 }
 
 fn tasks_panel(ctx: &TuiContext) -> InfoPanel {
+    let shell_count = list_background_tasks()
+        .into_iter()
+        .filter(|task| task.session_id == ctx.session().id.to_string())
+        .count();
+    let agent_count = list_subagent_tasks_for_parent(ctx.session().id).len();
+    let mut lines = Vec::new();
+    append_panel_section(&mut lines, "Background tasks", background_task_lines(ctx));
     InfoPanel {
         title: "Background Tasks".to_string(),
-        lines: background_task_lines(ctx),
+        status: Some(format!("shell {shell_count} · agent {agent_count}")),
+        lines,
     }
 }
 
 fn tools_panel(ctx: &TuiContext) -> InfoPanel {
-    let mut lines = vec![format!(
-        "built-in={} · skills={} · mcp={}",
-        built_in_tool_count(ctx),
-        ctx.skills().len(),
-        mcp_tool_count(ctx)
-    )];
-    lines.push(String::new());
-    lines.extend(tool_surface_lines(ctx));
+    let mut lines = Vec::new();
+    append_panel_section(&mut lines, "Built-in tools", built_in_tool_lines(ctx));
+    append_panel_section(&mut lines, "Skills", skill_surface_lines(ctx));
+    append_panel_section(&mut lines, "MCP tools", mcp_surface_lines(ctx));
     InfoPanel {
         title: "Active Tools".to_string(),
+        status: Some(format!(
+            "built-in {} · skills {} · mcp {}",
+            built_in_tool_count(ctx),
+            ctx.skills().len(),
+            mcp_tool_count(ctx)
+        )),
         lines,
     }
 }
@@ -2688,32 +2810,49 @@ fn help_overlay_lines(ctx: &TuiContext) -> Vec<String> {
             "Transport: {}",
             ctx.transport_label().unwrap_or("local session")
         ),
-        "Shortcuts:".to_string(),
-        "  Enter        send prompt".to_string(),
-        "  Enter busy   queue the next prompt while the assistant works".to_string(),
-        "  ?            show this shortcut overlay".to_string(),
-        "  /            start slash command input".to_string(),
-        "  y / n        approve or deny the focused tool request".to_string(),
-        "  q / Ctrl+C   exit the REPL".to_string(),
-        "Prompt features:".to_string(),
-        "  !            bash-style intent prefix".to_string(),
-        "  @            file/reference prefix".to_string(),
-        "  &            background-task intent prefix".to_string(),
-        "Built-in commands:".to_string(),
     ];
 
-    for entry in builtins {
-        lines.push(format!("{:<12} {}", entry.name, entry.description));
-    }
-
-    lines.push("Discovered skills:".to_string());
-    if skills.is_empty() {
-        lines.push("(none)".to_string());
-    } else {
-        for entry in skills {
-            lines.push(format!("{:<12} {}", entry.name, entry.description));
-        }
-    }
+    append_panel_section(
+        &mut lines,
+        "Shortcuts",
+        vec![
+            "Enter        send prompt".to_string(),
+            "Enter busy   queue the next prompt while the assistant works".to_string(),
+            "?            show this shortcut overlay".to_string(),
+            "/            start slash command input".to_string(),
+            "y / n        approve or deny the focused tool request".to_string(),
+            "q / Ctrl+C   exit the REPL".to_string(),
+        ],
+    );
+    append_panel_section(
+        &mut lines,
+        "Prompt features",
+        vec![
+            "!            bash-style intent prefix".to_string(),
+            "@            file/reference prefix".to_string(),
+            "&            background-task intent prefix".to_string(),
+        ],
+    );
+    append_panel_section(
+        &mut lines,
+        "Built-in commands",
+        builtins
+            .into_iter()
+            .map(|entry| format!("{:<12} {}", entry.name, entry.description))
+            .collect(),
+    );
+    append_panel_section(
+        &mut lines,
+        "Discovered skills",
+        if skills.is_empty() {
+            vec!["(none)".to_string()]
+        } else {
+            skills
+                .into_iter()
+                .map(|entry| format!("{:<12} {}", entry.name, entry.description))
+                .collect()
+        },
+    );
 
     lines
 }
@@ -2803,6 +2942,56 @@ fn tool_surface_lines(ctx: &TuiContext) -> Vec<String> {
     }
 
     lines
+}
+
+fn built_in_tool_lines(ctx: &TuiContext) -> Vec<String> {
+    let mut builtins: Vec<_> = ctx
+        .tool_specs()
+        .iter()
+        .filter(|tool| !tool.name.starts_with("mcp__"))
+        .map(|tool| tool.name.clone())
+        .collect();
+    builtins.sort();
+    if builtins.is_empty() {
+        vec!["No built-in tools discovered".to_string()]
+    } else {
+        builtins
+            .into_iter()
+            .map(|name| format!("{name}"))
+            .collect()
+    }
+}
+
+fn skill_surface_lines(ctx: &TuiContext) -> Vec<String> {
+    let mut skills: Vec<_> = ctx
+        .skills()
+        .iter()
+        .map(|skill| skill.slash_command.clone())
+        .collect();
+    skills.sort();
+    if skills.is_empty() {
+        vec!["(none)".to_string()]
+    } else {
+        skills
+            .into_iter()
+            .map(|slash_command| format!("{slash_command}"))
+            .collect()
+    }
+}
+
+fn mcp_surface_lines(ctx: &TuiContext) -> Vec<String> {
+    let mut mcp_tools: Vec<_> = ctx
+        .tool_specs()
+        .iter()
+        .filter(|tool| tool.name.starts_with("mcp__"))
+        .map(|tool| tool.name.clone())
+        .collect();
+    mcp_tools.sort();
+    if mcp_tools.is_empty() {
+        vec!["(none)".to_string()]
+    } else {
+        mcp_tools.into_iter().collect()
+    }
 }
 
 fn truncate_summary(text: &str) -> String {
