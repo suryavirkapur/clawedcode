@@ -1,6 +1,8 @@
 use anyhow::Result;
 use clawedcode_api::ApiEvent;
-use clawedcode_core::background_task::{TaskStatus as ShellTaskStatus, list_background_tasks};
+use clawedcode_core::background_task::{
+    TaskStatus as ShellTaskStatus, list_background_tasks, stop_background_task,
+};
 use clawedcode_core::compat::SkillDescriptor;
 use clawedcode_core::content::ContentBlock;
 use clawedcode_core::interactive::{ApprovalRequest, TuiContext, TuiEvent, TuiHandler};
@@ -1429,6 +1431,24 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                     // `ctrl+x ctrl+e` chord — same external-editor action.
                     KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         pending_ctrl_x = true;
+                    }
+                    // `ctrl+x ctrl+k` — kill running background tasks.
+                    KeyCode::Char('k')
+                        if key.modifiers.contains(KeyModifiers::CONTROL) && pending_ctrl_x =>
+                    {
+                        pending_ctrl_x = false;
+                        let stopped = list_background_tasks()
+                            .into_iter()
+                            .filter(|task| {
+                                matches!(
+                                    task.status,
+                                    ShellTaskStatus::Running | ShellTaskStatus::Pending
+                                )
+                            })
+                            .filter(|task| stop_background_task(&task.id).is_some())
+                            .count();
+                        handler
+                            .push_overlay(format!("[info] Stopped {stopped} background task(s)"));
                     }
                     KeyCode::Char('e')
                         if key.modifiers.contains(KeyModifiers::CONTROL) && pending_ctrl_x =>
@@ -5100,6 +5120,11 @@ fn help_overlay_lines(ctx: &TuiContext) -> Vec<String> {
             "Ctrl+_       undo the last edit".to_string(),
             "Ctrl+S       stash / restore the draft".to_string(),
             "Ctrl+G       edit the prompt in $EDITOR".to_string(),
+            "Ctrl+X Ctrl+E  same external editor".to_string(),
+            "Ctrl+X Ctrl+K  kill running background tasks".to_string(),
+            "Ctrl+P / N   history previous / next".to_string(),
+            "Ctrl+Home/End  transcript top / bottom".to_string(),
+            "Alt+P        pick a model".to_string(),
             "Alt+T        toggle thinking display".to_string(),
             "Shift+Tab    cycle permission mode".to_string(),
             "Ctrl+C ×2    exit the REPL".to_string(),
