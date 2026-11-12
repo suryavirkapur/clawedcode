@@ -271,6 +271,10 @@ const BUILTIN_COMMANDS: &[&str] = &[
     "/init",
     "/resume",
     "/compact",
+    "/export",
+    "/memory",
+    "/mcp",
+    "/context",
     "/exit",
     "/quit",
 ];
@@ -3866,6 +3870,104 @@ fn handle_slash_command(
                     *active_turn = Some(turn);
                     return Ok(true);
                 }
+                "/export" => {
+                    let arg = prompt
+                        .strip_prefix("/export")
+                        .map(str::trim)
+                        .unwrap_or_default();
+                    let path = if arg.is_empty() {
+                        ctx.session().cwd.join(format!(
+                            "clawedcode-transcript-{}.txt",
+                            short_session_id(&ctx.session().id.to_string())
+                        ))
+                    } else {
+                        std::path::PathBuf::from(arg)
+                    };
+                    let body = handler
+                        .visible_rows()
+                        .iter()
+                        .map(row_text)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    match fs::write(&path, body) {
+                        Ok(()) => handler.push_overlay(format!(
+                            "[info] Transcript written to {}",
+                            path.display()
+                        )),
+                        Err(err) => handler.push_overlay(format!("[error] Export failed: {err}")),
+                    }
+                    return Ok(true);
+                }
+                "/memory" => {
+                    let path = ctx.session().cwd.join("CLAUDE.md");
+                    if !path.exists() {
+                        let _ = fs::write(&path, "# CLAUDE.md\n");
+                    }
+                    match open_path_in_editor(&path) {
+                        Ok(()) => handler.push_overlay(format!("[info] Edited {}", path.display())),
+                        Err(err) => handler.push_overlay(format!("[error] Editor failed: {err}")),
+                    }
+                    return Ok(true);
+                }
+                "/mcp" => {
+                    let mut lines = Vec::new();
+                    if ctx.mcp_servers().is_empty() {
+                        lines.push("No MCP servers configured.".to_string());
+                    } else {
+                        for (name, config) in ctx.mcp_servers() {
+                            let detail = config
+                                .command()
+                                .map(|cmd| {
+                                    if config.args().is_empty() {
+                                        cmd
+                                    } else {
+                                        format!("{} {}", cmd, config.args().join(" "))
+                                    }
+                                })
+                                .unwrap_or_else(|| "(remote)".to_string());
+                            lines.push(format!("{name}: {detail}"));
+                        }
+                    }
+                    handler.show_panel("MCP servers".to_string(), lines);
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/context" => {
+                    let session = ctx.session();
+                    let messages = session.messages.len();
+                    let user = session
+                        .messages
+                        .iter()
+                        .filter(|m| m.role == Role::User)
+                        .count();
+                    let assistant = session
+                        .messages
+                        .iter()
+                        .filter(|m| m.role == Role::Assistant)
+                        .count();
+                    let tool = session
+                        .messages
+                        .iter()
+                        .filter(|m| m.role == Role::Tool)
+                        .count();
+                    let chars: usize = session
+                        .messages
+                        .iter()
+                        .map(|m| m.primary_text().map(str::len).unwrap_or(0))
+                        .sum();
+                    handler.show_panel(
+                        "Context".to_string(),
+                        vec![
+                            format!("Session: {}", session.id),
+                            format!("Working directory: {}", session.cwd.display()),
+                            format!("Model: {}", ctx.model_name()),
+                            format!("Messages: {messages} (user {user} · assistant {assistant} · tool {tool})"),
+                            format!("Approx. context size: {} chars (~{} tokens)", chars, chars / 4),
+                        ],
+                    );
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
                 _ => {
                     handler
                         .push_overlay(format!("[info] Unknown command `{command}`. Use `/help`."));
@@ -3982,6 +4084,26 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
         CommandEntry {
             name: "/compact".to_string(),
             description: "Summarize the conversation and continue with less context".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/export".to_string(),
+            description: "Write the transcript to a text file".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/memory".to_string(),
+            description: "Edit project CLAUDE.md in your editor".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/mcp".to_string(),
+            description: "List configured MCP servers".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/context".to_string(),
+            description: "Show session context size and message counts".to_string(),
             source: CommandSource::BuiltIn,
         },
         CommandEntry {
@@ -4739,6 +4861,23 @@ fn todos_panel(ctx: &TuiContext) -> InfoPanel {
 
 /// `ctrl+g` external editor — drops the buffer into a temp file, opens
 /// $VISUAL/$EDITOR in cooked mode, then reads the result back.
+/// Open an existing file in $VISUAL/$EDITOR, leaving alternate screen first.
+fn open_path_in_editor(path: &Path) -> Result<()> {
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".to_string());
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    let status = std::process::Command::new(editor).arg(path).status();
+    let _ = enable_raw_mode();
+    let _ = execute!(io::stdout(), EnterAlternateScreen);
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(anyhow::anyhow!("editor exited with {s}")),
+        Err(err) => Err(anyhow::anyhow!(err)),
+    }
+}
+
 fn open_external_editor(initial: &str) -> Option<String> {
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))

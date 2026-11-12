@@ -475,6 +475,12 @@ impl TuiContext {
         &self.runtime.compatibility.skills
     }
 
+    pub fn mcp_servers(
+        &self,
+    ) -> &std::collections::BTreeMap<String, clawedcode_mcp::McpServerConfig> {
+        &self.runtime.compatibility.mcp_servers
+    }
+
     pub fn tool_specs(&self) -> &[ToolSpec] {
         self.runtime.tool_specs()
     }
