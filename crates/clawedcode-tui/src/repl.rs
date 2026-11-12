@@ -595,6 +595,7 @@ struct ReplHandler {
     quit_requested: bool,
     model_picker: Option<usize>,
     theme_picker: Option<usize>,
+    resume_picker: Option<usize>,
     vim_enabled: bool,
     vim_insert: bool,
     /// `/rewind` message selector — index into `rewind_candidates`.
@@ -621,6 +622,7 @@ impl ReplHandler {
             quit_requested: false,
             model_picker: None,
             theme_picker: None,
+            resume_picker: None,
             vim_enabled: false,
             vim_insert: true,
             rewind_picker: None,
@@ -1078,6 +1080,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
             }
             .max(model_picker_height(handler.model_picker, ctx))
             .max(theme_picker_height(handler.theme_picker))
+            .max(resume_picker_height(handler.resume_picker, ctx))
             .max(rewind_picker_height(handler.rewind_picker, ctx));
             let spinner_height = if active_turn.is_some() && awaiting_approval.is_none() {
                 1
@@ -1158,6 +1161,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 render_model_picker(frame, chunks[2], sel, ctx);
             } else if let Some(sel) = handler.theme_picker {
                 render_theme_picker(frame, chunks[2], sel);
+            } else if let Some(sel) = handler.resume_picker {
+                render_resume_picker(frame, chunks[2], sel, ctx);
             } else if let Some(sel) = handler.rewind_picker {
                 render_rewind_picker(frame, chunks[2], sel, ctx);
             }
@@ -1395,6 +1400,33 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         }
                         KeyCode::Esc => {
                             handler.theme_picker = None;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                if let Some(sel) = handler.resume_picker {
+                    let candidates = list_saved_sessions(ctx, 8);
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            handler.resume_picker = Some(sel.saturating_sub(1));
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            handler.resume_picker =
+                                Some((sel + 1).min(candidates.len().saturating_sub(1)));
+                        }
+                        KeyCode::Enter => {
+                            if let Some(session) = candidates.get(sel) {
+                                let id = session.id.clone();
+                                handler.resume_picker = None;
+                                apply_resume_choice(ctx, &mut handler, &id);
+                            } else {
+                                handler.resume_picker = None;
+                            }
+                        }
+                        KeyCode::Esc => {
+                            handler.resume_picker = None;
                         }
                         _ => {}
                     }
@@ -5570,28 +5602,19 @@ fn handle_slash_command(
                         .map(str::trim)
                         .unwrap_or_default();
                     if prefix.is_empty() {
-                        handler.push_overlay(
-                            "[info] Usage: /resume <session-id-or-prefix>".to_string(),
-                        );
+                        // Reference behavior: bare /resume opens the session
+                        // picker rather than printing usage.
+                        let candidates = list_saved_sessions(ctx, 8);
+                        if candidates.is_empty() {
+                            handler.push_overlay("[info] No saved sessions to resume.".to_string());
+                        } else {
+                            handler.resume_picker = Some(0);
+                        }
                         let _ = ctx.save_session();
                         return Ok(true);
                     }
                     let _ = ctx.save_session();
-                    match resolve_saved_session(ctx, prefix) {
-                        Ok(source) => {
-                            let short = short_session_id(&source.id.to_string()).to_string();
-                            ctx.replace_session(source);
-                            let _ = ctx.save_session();
-                            handler.overlay_rows.clear();
-                            handler.clear_panel();
-                            handler.push_overlay(format!("[info] Resumed {short}"));
-                            handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
-                        }
-                        Err(err) => handler.push_overlay(format!(
-                            "[error] Resume failed: {}",
-                            compact_fork_error(prefix, &err)
-                        )),
-                    }
+                    apply_resume_choice(ctx, handler, prefix);
                     return Ok(true);
                 }
                 "/compact" => {
@@ -6611,6 +6634,86 @@ fn apply_theme_choice(ctx: &mut TuiContext, handler: &mut ReplHandler, theme: &s
         }
     }
     handler.push_overlay(format!("[info] Theme set to {theme}"));
+}
+
+fn apply_resume_choice(ctx: &mut TuiContext, handler: &mut ReplHandler, prefix: &str) {
+    match resolve_saved_session(ctx, prefix) {
+        Ok(source) => {
+            let short = short_session_id(&source.id.to_string()).to_string();
+            ctx.replace_session(source);
+            let _ = ctx.save_session();
+            handler.overlay_rows.clear();
+            handler.clear_panel();
+            handler.push_overlay(format!("[info] Resumed {short}"));
+            handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
+        }
+        Err(err) => handler.push_overlay(format!(
+            "[error] Resume failed: {}",
+            compact_fork_error(prefix, &err)
+        )),
+    }
+}
+
+fn resume_picker_height(picker: Option<usize>, ctx: &TuiContext) -> u16 {
+    if picker.is_none() {
+        return 0;
+    }
+    // border + title + blank + options + footer
+    list_saved_sessions(ctx, 8).len() as u16 + 4
+}
+
+fn render_resume_picker(frame: &mut Frame, area: Rect, selected: usize, ctx: &TuiContext) {
+    if area.height == 0 {
+        return;
+    }
+    let border_width = area.width.saturating_sub(2) as usize;
+    frame.render_widget(
+        Paragraph::new(format!("╭{}╮", "─".repeat(border_width)))
+            .style(Style::default().fg(pal().accent)),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    let mut lines = vec![
+        Line::from(Span::styled(
+            " Select a session to resume",
+            Style::default().fg(pal().accent),
+        )),
+        Line::from(""),
+    ];
+    for (index, session) in list_saved_sessions(ctx, 8).iter().enumerate() {
+        let focused = index == selected;
+        let marker = if focused { "❯" } else { " " };
+        let current = if session.is_current { " (current)" } else { "" };
+        let style = if focused {
+            Style::default().fg(pal().accent)
+        } else {
+            Style::default().fg(pal().text)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {marker}"), style),
+            Span::styled(
+                format!(
+                    "{} — {}{}",
+                    short_session_id(&session.id),
+                    session.preview,
+                    current
+                ),
+                style,
+            ),
+        ]));
+    }
+    lines.push(Line::from(Span::styled(
+        " Enter to select · Esc to cancel",
+        Style::default().fg(pal().dim),
+    )));
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect::new(
+            area.x,
+            area.y + 1,
+            area.width,
+            area.height.saturating_sub(1),
+        ),
+    );
 }
 
 /// User messages eligible for `/rewind`: (message index, preview text).
