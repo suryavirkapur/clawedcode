@@ -742,6 +742,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     let mut history_search: Option<(String, Option<usize>)> = None;
     let mut history_search_stash = String::new();
     let mut last_esc: Option<std::time::Instant> = None;
+    let mut pending_ctrl_x = false;
     let mut last_ctrl_c: Option<std::time::Instant> = None;
     let mut exit_hint: Option<std::time::Instant> = None;
     let mut undo_stack: Vec<(String, usize)> = Vec::new();
@@ -1425,6 +1426,20 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         }
                         let _ = terminal.clear();
                     }
+                    // `ctrl+x ctrl+e` chord — same external-editor action.
+                    KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        pending_ctrl_x = true;
+                    }
+                    KeyCode::Char('e')
+                        if key.modifiers.contains(KeyModifiers::CONTROL) && pending_ctrl_x =>
+                    {
+                        pending_ctrl_x = false;
+                        if let Some(edited) = open_external_editor(&input_buffer) {
+                            input_buffer = edited;
+                            cursor_pos = input_buffer.len();
+                        }
+                        let _ = terminal.clear();
+                    }
                     KeyCode::Up if palette_open => {
                         palette_touched = true;
                         palette_index = palette_index.saturating_sub(1);
@@ -1461,31 +1476,65 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         palette_touched = false;
                     }
                     KeyCode::Up if history_index.is_some() || !history.is_empty() => {
-                        if history_index.is_none() {
-                            history_stash = input_buffer.clone();
-                            history_index = Some(history.len() - 1);
-                        } else if let Some(index) = history_index {
-                            if index > 0 {
-                                history_index = Some(index - 1);
-                            }
-                        }
-                        if let Some(index) = history_index {
-                            if let Some(entry) = history.get(index) {
-                                input_buffer = entry.clone();
-                                cursor_pos = input_buffer.len();
-                            }
-                        }
+                        history_nav(
+                            &mut input_buffer,
+                            &mut cursor_pos,
+                            &history,
+                            &mut history_index,
+                            &mut history_stash,
+                            -1,
+                        );
                     }
                     KeyCode::Down if history_index.is_some() => {
-                        let index = history_index.unwrap();
-                        if index + 1 < history.len() {
-                            history_index = Some(index + 1);
-                            input_buffer = history[index + 1].clone();
-                        } else {
-                            history_index = None;
-                            input_buffer = history_stash.clone();
-                        }
-                        cursor_pos = input_buffer.len();
+                        history_nav(
+                            &mut input_buffer,
+                            &mut cursor_pos,
+                            &history,
+                            &mut history_index,
+                            &mut history_stash,
+                            1,
+                        );
+                    }
+                    KeyCode::Char('p')
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && (history_index.is_some() || !history.is_empty()) =>
+                    {
+                        history_nav(
+                            &mut input_buffer,
+                            &mut cursor_pos,
+                            &history,
+                            &mut history_index,
+                            &mut history_stash,
+                            -1,
+                        );
+                    }
+                    KeyCode::Char('n')
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && history_index.is_some() =>
+                    {
+                        history_nav(
+                            &mut input_buffer,
+                            &mut cursor_pos,
+                            &history,
+                            &mut history_index,
+                            &mut history_stash,
+                            1,
+                        );
+                    }
+                    KeyCode::Home
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && handler.has_content() =>
+                    {
+                        viewport.scroll_offset = 0;
+                        viewport.pinned_to_bottom = false;
+                    }
+                    KeyCode::End
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && handler.has_content() =>
+                    {
+                        viewport.scroll_offset = max_transcript_scroll(&handler, transcript_height);
+                        viewport.pinned_to_bottom = true;
+                        viewport.unseen_count = 0;
                     }
                     KeyCode::PageUp if handler.has_content() => {
                         let step = transcript_height.saturating_sub(2).max(1);
@@ -1763,6 +1812,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         }
                     }
                     KeyCode::Char(c) => {
+                        pending_ctrl_x = false;
                         input_buffer.insert(cursor_pos, c);
                         cursor_pos += c.len_utf8();
                         history_index = None;
@@ -2696,23 +2746,71 @@ fn render_rows(
         .collect()
 }
 
+/// Move through prompt history: `dir` -1 = older (Up/Ctrl+P), +1 = newer
+/// (Down/Ctrl+N). Mirrors the reference's history bindings.
+fn history_nav(
+    input_buffer: &mut String,
+    cursor_pos: &mut usize,
+    history: &[String],
+    history_index: &mut Option<usize>,
+    history_stash: &mut String,
+    dir: i8,
+) {
+    match dir {
+        -1 => {
+            if history_index.is_none() {
+                if history.is_empty() {
+                    return;
+                }
+                *history_stash = input_buffer.clone();
+                *history_index = Some(history.len() - 1);
+            } else if let Some(index) = *history_index
+                && index > 0
+            {
+                *history_index = Some(index - 1);
+            }
+            if let Some(entry) = history_index.and_then(|i| history.get(i)) {
+                *input_buffer = entry.clone();
+                *cursor_pos = input_buffer.len();
+            }
+        }
+        _ => {
+            let Some(index) = *history_index else {
+                return;
+            };
+            if index + 1 < history.len() {
+                *history_index = Some(index + 1);
+                *input_buffer = history[index + 1].clone();
+            } else {
+                *history_index = None;
+                *input_buffer = history_stash.clone();
+            }
+            *cursor_pos = input_buffer.len();
+        }
+    }
+}
+
 /// User messages render as a full-width band on `userMessageBackground`
 /// (rgb(55,55,55) in the dark theme), text only — no `>` prefix.
 fn render_user_message(text: &str, width: usize) -> Vec<Line<'static>> {
     // `! cmd` bash-input bands use the reference's bash colors.
-    let bash = text.starts_with("! ");
+    let bash = text.starts_with('!');
     let bg = if bash { BASH_MSG_BG } else { USER_MSG_BG };
     let style = Style::default().bg(bg);
     let text_style = Style::default().fg(Color::White).bg(bg);
     let bang_style = Style::default().fg(BASH_FG).bg(bg);
     let mut result = Vec::new();
     let push_band = |result: &mut Vec<Line<'static>>, raw: &str| {
-        let text_len = raw.chars().count() + 1; // 1-char right padding
-        let pad = width.saturating_sub(text_len);
-        if bash && raw.starts_with("! ") {
+        let rendered_len = if bash && raw.starts_with('!') {
+            2 + raw[1..].trim_start().chars().count()
+        } else {
+            raw.chars().count()
+        };
+        let pad = width.saturating_sub(rendered_len + 1); // 1-char right padding
+        if bash && raw.starts_with('!') {
             result.push(Line::from(vec![
                 Span::styled("! ", bang_style),
-                Span::styled(raw[2..].to_string(), text_style),
+                Span::styled(raw[1..].trim_start().to_string(), text_style),
                 Span::styled(" ".repeat(pad + 1), style),
             ]));
         } else {
