@@ -790,6 +790,9 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     let mut approval_amend: Option<String> = None;
     let mut approval_explain = false;
     let mut approval_debug = false;
+    /// ask_user_question dialog: collected answers + current question index.
+    let mut question_index: usize = 0;
+    let mut question_answers: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
     let mut active_turn: Option<ActiveTurn> = None;
     let mut info_panel_scroll: usize = 0;
     let mut last_area = Rect::default();
@@ -848,6 +851,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
             approval_selection = 0;
             approval_amend = None;
             approval_explain = false;
+            question_index = 0;
+            question_answers.clear();
             approval_debug = false;
         }
 
@@ -908,13 +913,18 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
             };
             let palette_height =
                 command_palette_height(&command_entries).max(file_palette_height(&file_entries));
-            let approval_height = approval_selector_height(
-                awaiting_approval.as_ref(),
-                approval_selection,
-                approval_amend.is_some(),
-                approval_explain,
-                approval_debug,
-            )
+            let approval_height = match awaiting_approval.as_ref() {
+                Some(req) if is_question_request(req) => {
+                    question_dialog_height(req, question_index, approval_amend.is_some())
+                }
+                _ => approval_selector_height(
+                    awaiting_approval.as_ref(),
+                    approval_selection,
+                    approval_amend.is_some(),
+                    approval_explain,
+                    approval_debug,
+                ),
+            }
             .max(model_picker_height(handler.model_picker, ctx))
             .max(rewind_picker_height(handler.rewind_picker, ctx));
             let spinner_height = if active_turn.is_some() && awaiting_approval.is_none() {
@@ -969,7 +979,19 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 render_file_palette(frame, chunks[1], &file_entries, palette_index);
             }
 
-            if awaiting_approval.is_some() && approval_height > 0 {
+            if awaiting_approval.is_some()
+                && approval_height > 0
+                && is_question_request(awaiting_approval.as_ref().unwrap())
+            {
+                render_question_dialog(
+                    frame,
+                    chunks[2],
+                    awaiting_approval.as_ref().unwrap(),
+                    question_index,
+                    approval_selection,
+                    approval_amend.as_deref(),
+                );
+            } else if awaiting_approval.is_some() && approval_height > 0 {
                 render_approval_selector(
                     frame,
                     chunks[2],
@@ -1272,17 +1294,92 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                                 let feedback = (!feedback.is_empty()).then_some(feedback);
                                 let choice = approval_selection;
                                 approval_amend = None;
-                                choose(
-                                    choice,
-                                    feedback,
-                                    &mut awaiting_approval,
-                                    &mut handler,
-                                    &active_turn,
-                                    &always_allowed,
-                                );
+                                let is_question = awaiting_approval
+                                    .as_ref()
+                                    .map(is_question_request)
+                                    .unwrap_or(false);
+                                if is_question {
+                                    advance_question(
+                                        feedback,
+                                        &mut awaiting_approval,
+                                        &mut question_index,
+                                        &mut question_answers,
+                                        &mut approval_selection,
+                                        &mut handler,
+                                        &active_turn,
+                                    );
+                                } else {
+                                    choose(
+                                        choice,
+                                        feedback,
+                                        &mut awaiting_approval,
+                                        &mut handler,
+                                        &active_turn,
+                                        &always_allowed,
+                                    );
+                                }
                             }
                             KeyCode::Esc => {
                                 approval_amend = None;
+                            }
+                            _ => {}
+                        }
+                        viewport.pinned_to_bottom = true;
+                        viewport.unseen_count = 0;
+                        continue;
+                    }
+
+                    // ask_user_question: dedicated dialog handling.
+                    if awaiting_approval
+                        .as_ref()
+                        .map(is_question_request)
+                        .unwrap_or(false)
+                    {
+                        let req = awaiting_approval.as_ref().unwrap().clone();
+                        let questions = request_questions(&req);
+                        let q = questions
+                            .get(question_index.min(questions.len().saturating_sub(1)))
+                            .cloned();
+                        let option_count = q.as_ref().map(|q| q.options.len() + 1).unwrap_or(1);
+                        match key.code {
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                approval_selection = approval_selection.saturating_sub(1);
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                approval_selection = (approval_selection + 1).min(option_count - 1);
+                            }
+                            KeyCode::Tab => approval_amend = Some(String::new()),
+                            KeyCode::Esc => {
+                                // Decline all remaining questions.
+                                awaiting_approval = None;
+                                if let Some(turn) = &active_turn {
+                                    let _ = turn.approvals.send(ApprovalOutcome {
+                                        approved: false,
+                                        feedback: None,
+                                    });
+                                }
+                                question_index = 0;
+                                question_answers.clear();
+                            }
+                            KeyCode::Enter => {
+                                let is_other = approval_selection == option_count - 1;
+                                if is_other {
+                                    approval_amend = Some(String::new());
+                                } else {
+                                    let label = q
+                                        .as_ref()
+                                        .and_then(|q| q.options.get(approval_selection))
+                                        .map(|o| o.label.clone());
+                                    advance_question(
+                                        label,
+                                        &mut awaiting_approval,
+                                        &mut question_index,
+                                        &mut question_answers,
+                                        &mut approval_selection,
+                                        &mut handler,
+                                        &active_turn,
+                                    );
+                                }
                             }
                             _ => {}
                         }
@@ -2569,6 +2666,229 @@ fn render_approval_selector(
 /// Max diff rows shown inside the file-edit approval dialog.
 const MAX_DIFF_PREVIEW_ROWS: usize = 9;
 
+/// Record the current question's answer and either advance to the next
+/// question or send the collected answers back to the waiting tool call.
+fn advance_question(
+    answer: Option<String>,
+    awaiting_approval: &mut Option<ApprovalRequest>,
+    question_index: &mut usize,
+    question_answers: &mut serde_json::Map<String, serde_json::Value>,
+    selection: &mut usize,
+    handler: &mut ReplHandler,
+    active_turn: &Option<ActiveTurn>,
+) {
+    let Some(req) = awaiting_approval.as_ref() else {
+        return;
+    };
+    let questions = request_questions(req);
+    let current = questions.get(*question_index).cloned();
+    if let (Some(q), Some(answer)) = (&current, answer) {
+        question_answers.insert(q.question.clone(), serde_json::Value::String(answer));
+    }
+
+    if *question_index + 1 < questions.len() {
+        *question_index += 1;
+        *selection = 0;
+        return;
+    }
+
+    // All questions answered — ship the JSON map as the outcome feedback.
+    let payload = serde_json::to_string(question_answers).unwrap_or_default();
+    *awaiting_approval = None;
+    if let Some(turn) = active_turn {
+        let _ = turn.approvals.send(ApprovalOutcome {
+            approved: !question_answers.is_empty(),
+            feedback: Some(payload),
+        });
+    }
+    *question_index = 0;
+    question_answers.clear();
+    *selection = 0;
+    handler.state = AppState::Idle;
+}
+
+/// ask_user_question requests render the reference's AskUserQuestion
+/// dialog (header chip + question + labeled options + "Other") instead
+/// of the Yes/No permission dialog.
+fn is_question_request(request: &ApprovalRequest) -> bool {
+    request.tool_name == clawedcode_tools::ASK_USER_QUESTION_TOOL_NAME
+}
+
+#[derive(Debug, Clone)]
+struct QuestionOption {
+    label: String,
+    description: String,
+}
+
+#[derive(Debug, Clone)]
+struct UserQuestion {
+    question: String,
+    header: String,
+    options: Vec<QuestionOption>,
+    multi_select: bool,
+}
+
+fn request_questions(request: &ApprovalRequest) -> Vec<UserQuestion> {
+    request
+        .input
+        .get("questions")
+        .and_then(|q| q.as_array())
+        .map(|qs| {
+            qs.iter()
+                .map(|q| UserQuestion {
+                    question: q
+                        .get("question")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    header: q
+                        .get("header")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    multi_select: q
+                        .get("multiSelect")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    options: q
+                        .get("options")
+                        .and_then(|o| o.as_array())
+                        .map(|os| {
+                            os.iter()
+                                .map(|o| QuestionOption {
+                                    label: o
+                                        .get("label")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    description: o
+                                        .get("description")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// border + chip/question + blank + options+descriptions + Other + blank +
+/// (amend line) + footer
+fn question_dialog_height(request: &ApprovalRequest, question_index: usize, amending: bool) -> u16 {
+    let questions = request_questions(request);
+    let Some(question) = questions.get(question_index.min(questions.len().saturating_sub(1)))
+    else {
+        return 0;
+    };
+    // each option: label row + description row; Other adds 1
+    7 + (question.options.len() * 2) as u16 + u16::from(amending)
+}
+
+fn render_question_dialog(
+    frame: &mut Frame,
+    area: Rect,
+    request: &ApprovalRequest,
+    question_index: usize,
+    selected: usize,
+    amend: Option<&str>,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let questions = request_questions(request);
+    let Some(question) = questions.get(question_index.min(questions.len().saturating_sub(1)))
+    else {
+        return;
+    };
+    let border_width = area.width.saturating_sub(2) as usize;
+    frame.render_widget(
+        Paragraph::new(format!("╭{}╮", "─".repeat(border_width)))
+            .style(Style::default().fg(PERMISSION_FG)),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!(" [{}]", question.header),
+                Style::default().fg(PERMISSION_FG),
+            ),
+            Span::styled(
+                format!(" {}", question.question),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+        Line::from(""),
+    ];
+
+    let total = question.options.len() + 1; // + Other
+    for (index, option) in question.options.iter().enumerate() {
+        let focused = index == selected;
+        let marker = if focused { "❯" } else { " " };
+        let style = if focused {
+            Style::default().fg(PERMISSION_FG)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {marker} "), style),
+            Span::styled(option.label.clone(), style),
+        ]));
+        lines.push(Line::from(Span::styled(
+            format!("    {}", option.description),
+            Style::default().fg(DIM),
+        )));
+    }
+    let other_focused = selected == total - 1;
+    let other_style = if other_focused {
+        Style::default().fg(PERMISSION_FG)
+    } else {
+        Style::default().fg(DIM)
+    };
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!(" {} ", if other_focused { "❯" } else { " " }),
+            other_style,
+        ),
+        Span::styled("Other".to_string(), other_style),
+    ]));
+
+    if let Some(buffer) = amend {
+        lines.push(Line::from(vec![
+            Span::styled(" ❯ ", Style::default().fg(ACCENT)),
+            Span::styled(buffer.to_string(), Style::default().fg(Color::White)),
+            Span::styled("▌", Style::default().fg(ACCENT)),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    let progress = if questions.len() > 1 {
+        format!(" · {}/{}", question_index + 1, questions.len())
+    } else {
+        String::new()
+    };
+    let footer = if amend.is_some() {
+        format!(" Enter to submit · Esc to cancel{progress}")
+    } else {
+        format!(" ↑/↓ select · Enter to answer · Esc to skip{progress}")
+    };
+    lines.push(Line::from(Span::styled(footer, Style::default().fg(DIM))));
+
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect::new(
+            area.x,
+            area.y + 1,
+            area.width,
+            area.height.saturating_sub(1),
+        ),
+    );
+}
+
 /// Animated "working" line above the input box: `✻ Verb… (esc to interrupt · Ns)`.
 fn spinner_line(turn_started_at: Option<std::time::Instant>, tokens: u64) -> Line<'static> {
     let elapsed = turn_started_at
@@ -3301,6 +3621,13 @@ fn tool_display_arg(name: &str, raw_input: &str) -> String {
         "shell" => get_str(&["command"]).map(first_line),
         "read_file" => get_str(&["path", "file_path"]),
         "apply_patch" => patch_display_target(raw_input),
+        "ask_user_question" => input
+            .get("questions")
+            .and_then(|q| q.as_array())
+            .and_then(|qs| qs.first())
+            .and_then(|q| q.get("question"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
         "Agent" | "Task" => get_str(&["description", "prompt"]).map(first_line),
         "TaskCreate" => get_str(&["subject"]).map(first_line),
         "TaskUpdate" => get_str(&["taskId", "task_id"]).map(|id| {
@@ -3948,17 +4275,23 @@ fn spawn_turn_worker(
             let tx = event_tx.clone();
             let approval_fn =
                 move |tool_use_id: &str, tool_name: &str, input: &serde_json::Value| {
-                    if !is_write_like(tool_name) {
+                    if !is_write_like(tool_name)
+                        && tool_name != clawedcode_tools::ASK_USER_QUESTION_TOOL_NAME
+                    {
                         return true.into();
                     }
 
-                    let allow_key = always_allow_key(tool_name, input);
-                    if always_allowed
-                        .lock()
-                        .map(|set| set.contains(tool_name) || set.contains(&allow_key))
-                        .unwrap_or(false)
-                    {
-                        return true.into();
+                    if tool_name == clawedcode_tools::ASK_USER_QUESTION_TOOL_NAME {
+                        // Never remembered — every question needs a fresh answer.
+                    } else {
+                        let allow_key = always_allow_key(tool_name, input);
+                        if always_allowed
+                            .lock()
+                            .map(|set| set.contains(tool_name) || set.contains(&allow_key))
+                            .unwrap_or(false)
+                        {
+                            return true.into();
+                        }
                     }
 
                     let request = ApprovalRequest {

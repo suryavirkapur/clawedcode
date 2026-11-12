@@ -1288,6 +1288,9 @@ impl Runtime {
                     };
                     return ContentBlock::tool_error(tool_use_id, reason);
                 }
+                if tool_name == clawedcode_tools::ASK_USER_QUESTION_TOOL_NAME {
+                    return ask_user_question_result(tool_use_id, &input, outcome.feedback);
+                }
                 self.execute_tool_inner(tool_use_id, tool_name, input, session)
             }
             PermissionDecision::Allow => {
@@ -1353,6 +1356,63 @@ impl Runtime {
         };
 
         finish_tool_result(tool_use_id, tool.execute(input, &session.cwd))
+    }
+}
+
+/// Build the `ask_user_question` tool result from the UI's answer payload.
+/// The approval channel carries the answers as a JSON object in
+/// `feedback` (`{"question": "answer"}`); a bare string answers the first
+/// question. Denials never reach this — they take the denied branch.
+fn ask_user_question_result(
+    tool_use_id: &str,
+    input: &serde_json::Value,
+    feedback: Option<String>,
+) -> ContentBlock {
+    let questions: Vec<String> = input
+        .get("questions")
+        .and_then(|q| q.as_array())
+        .map(|qs| {
+            qs.iter()
+                .filter_map(|q| {
+                    q.get("question")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let answers: serde_json::Map<String, serde_json::Value> = feedback
+        .as_deref()
+        .and_then(|f| serde_json::from_str::<serde_json::Value>(f).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_else(|| {
+            let mut map = serde_json::Map::new();
+            if let (Some(q), Some(a)) = (questions.first(), feedback.as_deref()) {
+                map.insert(q.clone(), serde_json::Value::String(a.to_string()));
+            }
+            map
+        });
+
+    if answers.is_empty() {
+        return ContentBlock::ToolResult {
+            tool_use_id: tool_use_id.to_string(),
+            content: "User declined to answer questions".to_string(),
+            is_error: false,
+        };
+    }
+
+    let answers_text = answers
+        .iter()
+        .map(|(q, a)| format!("\"{q}\"=\"{}\"", a.as_str().unwrap_or_default()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    ContentBlock::ToolResult {
+        tool_use_id: tool_use_id.to_string(),
+        content: format!(
+            "User has answered your questions: {answers_text}. You can now continue with the user's answers in mind."
+        ),
+        is_error: false,
     }
 }
 

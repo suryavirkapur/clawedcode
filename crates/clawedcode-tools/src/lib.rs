@@ -307,6 +307,34 @@ impl Tool for ApplyPatch {
     }
 }
 
+/// The reference's AskUserQuestionTool — prompts the user with a
+/// multiple-choice question. The interactive surface answers it through
+/// the approval channel; this execute is the non-interactive fallback.
+pub struct AskUserQuestion;
+
+pub const ASK_USER_QUESTION_TOOL_NAME: &str = "ask_user_question";
+
+impl Tool for AskUserQuestion {
+    fn name(&self) -> &str {
+        ASK_USER_QUESTION_TOOL_NAME
+    }
+
+    fn description(&self) -> &str {
+        "Prompt the user with a multiple-choice question"
+    }
+
+    fn needs_approval(&self) -> bool {
+        true
+    }
+
+    fn execute(&self, _input: serde_json::Value, _cwd: &Path) -> ToolResult {
+        ToolResult {
+            content: "User declined to answer questions".into(),
+            is_error: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum PatchHunk {
     AddFile {
@@ -541,7 +569,12 @@ fn apply_update_chunk(file_lines: &mut Vec<String>, chunk: &UpdateChunk) -> Resu
 
 /// Returns all built-in tool instances.
 pub fn builtin_tool_instances() -> Vec<Box<dyn Tool>> {
-    vec![Box::new(ReadFile), Box::new(Shell), Box::new(ApplyPatch)]
+    vec![
+        Box::new(ReadFile),
+        Box::new(Shell),
+        Box::new(ApplyPatch),
+        Box::new(AskUserQuestion),
+    ]
 }
 
 /// Returns the ToolSpec list for API compatibility (kept for existing code).
@@ -767,6 +800,45 @@ pub fn builtin_tools() -> Vec<ToolSpec> {
                     }
                 },
                 "required": ["task_id"]
+            }),
+        },
+        ToolSpec {
+            name: ASK_USER_QUESTION_TOOL_NAME.to_string(),
+            description: "Ask the user a multiple-choice question during a turn and use their answer to continue. Questions have a short header chip, the question text, and 2-4 options.".to_string(),
+            needs_approval: true,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "questions": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 4,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "question": {"type": "string"},
+                                "header": {"type": "string"},
+                                "options": {
+                                    "type": "array",
+                                    "minItems": 2,
+                                    "maxItems": 4,
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "label": {"type": "string"},
+                                            "description": {"type": "string"},
+                                            "preview": {"type": "string"}
+                                        },
+                                        "required": ["label", "description"]
+                                    }
+                                },
+                                "multiSelect": {"type": "boolean"}
+                            },
+                            "required": ["question", "header", "options"]
+                        }
+                    }
+                },
+                "required": ["questions"]
             }),
         },
         ToolSpec {

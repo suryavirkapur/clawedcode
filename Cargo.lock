@@ -306,6 +306,7 @@ dependencies = [
  "chrono",
  "clawedcode-api",
  "clawedcode-core",
+ "clawedcode-tools",
  "crossterm 0.29.0",
  "libc",
  "ratatui",
