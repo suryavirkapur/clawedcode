@@ -18,3 +18,4 @@ tokio.workspace = true
 uuid.workspace = true
 clawedcode-api = { path = "../clawedcode-api", version = "0.1.1" }
 clawedcode-core = { path = "../clawedcode-core", version = "0.1.1" }
+libc = "0.2.191"

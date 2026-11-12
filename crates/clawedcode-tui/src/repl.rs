@@ -1500,6 +1500,11 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         }
                         let _ = terminal.clear();
                     }
+                    #[cfg(unix)]
+                    KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        suspend_process();
+                        let _ = terminal.clear();
+                    }
                     // `ctrl+x ctrl+e` chord — same external-editor action.
                     KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         pending_ctrl_x = true;
@@ -5124,6 +5129,17 @@ fn open_path_in_editor(path: &Path) -> Result<()> {
     }
 }
 
+/// `ctrl+z` — leave the alternate screen and suspend the process; when the
+/// user resumes with `fg`, raw mode and the alternate screen come back.
+#[cfg(unix)]
+fn suspend_process() {
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    unsafe { libc::raise(libc::SIGTSTP) };
+    let _ = enable_raw_mode();
+    let _ = execute!(io::stdout(), EnterAlternateScreen);
+}
+
 fn open_external_editor(initial: &str) -> Option<String> {
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
@@ -5255,6 +5271,7 @@ fn help_overlay_lines(ctx: &TuiContext) -> Vec<String> {
             "Alt+P        pick a model".to_string(),
             "Alt+T        toggle thinking display".to_string(),
             "Shift+Tab    cycle permission mode".to_string(),
+            "Ctrl+Z       suspend (resume with fg)".to_string(),
             "Ctrl+C ×2    exit the REPL".to_string(),
         ],
     );
