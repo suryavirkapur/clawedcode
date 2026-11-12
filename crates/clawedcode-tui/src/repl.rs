@@ -3352,7 +3352,7 @@ fn maybe_submit_queued_prompt(
     Ok(())
 }
 
-fn welcome_right_lines(ctx: &TuiContext, _width: usize) -> Vec<Line<'static>> {
+fn welcome_right_lines(ctx: &TuiContext, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
     if let Some(label) = ctx.transport_label() {
@@ -3418,6 +3418,59 @@ fn welcome_right_lines(ctx: &TuiContext, _width: usize) -> Vec<Line<'static>> {
     }
 
     lines
+        .into_iter()
+        .flat_map(|line| wrap_styled_line(line, width))
+        .collect()
+}
+
+/// Word-wrap a styled line to `width`, preserving per-span styling and
+/// breaking on spaces when possible — keeps welcome-box columns from
+/// spilling into each other when Paragraph wraps the full interior.
+fn wrap_styled_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let chars: Vec<(char, Style)> = line
+        .spans
+        .iter()
+        .flat_map(|span| span.content.chars().map(move |c| (c, span.style)))
+        .collect();
+    if width == 0 || chars.len() <= width {
+        return vec![line];
+    }
+
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < chars.len() {
+        let mut end = (start + width).min(chars.len());
+        if end < chars.len() {
+            if let Some(pos) = chars[start..end].iter().rposition(|(c, _)| *c == ' ') {
+                if pos > 0 {
+                    end = start + pos + 1;
+                }
+            }
+        }
+        let mut seg_end = end;
+        while seg_end > start && chars[seg_end - 1].0 == ' ' {
+            seg_end -= 1;
+        }
+        let mut spans: Vec<Span> = Vec::new();
+        let mut buf = String::new();
+        let mut cur_style = chars[start].1;
+        for (c, style) in &chars[start..seg_end] {
+            if *style != cur_style {
+                spans.push(Span::styled(std::mem::take(&mut buf), cur_style));
+                cur_style = *style;
+            }
+            buf.push(*c);
+        }
+        if !buf.is_empty() {
+            spans.push(Span::styled(buf, cur_style));
+        }
+        out.push(Line::from(spans));
+        start = end;
+        while start < chars.len() && chars[start].0 == ' ' {
+            start += 1;
+        }
+    }
+    out
 }
 
 fn section_title(title: &'static str) -> Line<'static> {
