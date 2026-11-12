@@ -1747,47 +1747,92 @@ fn render_dashboard(
         .split(area)
     };
 
+    // Reference welcome: a rounded `claude`-bordered box titled
+    // " ClawedCode v{x} ", mascot + metadata on the left, feeds on the right.
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(Line::from(vec![
+            Span::styled(" ClawedCode", Style::default().fg(ACCENT)),
+            Span::styled(
+                format!(" v{} ", env!("CARGO_PKG_VERSION")),
+                Style::default().fg(DIM),
+            ),
+        ]))
+        .padding(ratatui::widgets::Padding::horizontal(1));
+    let inner = block.inner(chunks[0]);
+    frame.render_widget(block, chunks[0]);
     frame.render_widget(
-        Paragraph::new(welcome_lines(ctx)).wrap(Wrap { trim: false }),
-        chunks[0],
+        Paragraph::new(welcome_lines(ctx, inner.width as usize)).wrap(Wrap { trim: false }),
+        inner,
     );
 
     let _ = (input_buffer, command_entries);
 }
 
-/// Claude Code-style welcome block: logo on the left, product metadata
-/// on the right, then tips/onboarding and recent activity.
-fn welcome_lines(ctx: &TuiContext) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    let logo_width = CLAUDE_LOGO
-        .iter()
-        .map(|line| line.chars().count())
-        .max()
-        .unwrap_or(0);
+/// Left column of the welcome box: bold greeting, Clawd mascot, then
+/// centered dim model and cwd lines — matches the reference LogoV2 layout.
+fn welcome_left_lines(ctx: &TuiContext, width: usize) -> Vec<Line<'static>> {
+    let center = |text: String, style: Style| {
+        let pad = width.saturating_sub(text.chars().count()) / 2;
+        Line::from(vec![Span::raw(" ".repeat(pad)), Span::styled(text, style)])
+    };
 
-    let meta = [
-        format!("ClawedCode v{}", env!("CARGO_PKG_VERSION")),
-        format!("{} · {}", ctx.model_name(), provider_label()),
-        display_path(&ctx.session().cwd),
+    let mut lines = vec![
+        center(
+            "Welcome back!".to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Line::from(""),
     ];
-
-    for (index, logo) in CLAUDE_LOGO.iter().enumerate() {
-        let padding = " ".repeat(logo_width - logo.chars().count() + 3);
-        let meta_text = meta.get(index).cloned().unwrap_or_default();
-        let meta_style = if index == 0 {
-            Style::default().add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(MUTED)
-        };
-        lines.push(Line::from(vec![
-            Span::styled((*logo).to_string(), Style::default().fg(ACCENT)),
-            Span::raw(padding),
-            Span::styled(meta_text, meta_style),
-        ]));
+    for logo in CLAUDE_LOGO.iter().take(2) {
+        lines.push(center((*logo).to_string(), Style::default().fg(ACCENT)));
     }
-
     lines.push(Line::from(""));
-    lines.extend(welcome_right_lines(ctx));
+    lines.push(center(
+        ctx.model_name().to_string(),
+        Style::default().fg(MUTED),
+    ));
+    lines.push(center(
+        display_path(&ctx.session().cwd),
+        Style::default().fg(MUTED),
+    ));
+    lines
+}
+
+/// Claude Code-style welcome box: mascot/metadata column on the left and the
+/// tips/onboarding/activity feed on the right, split by a dim divider.
+fn welcome_lines(ctx: &TuiContext, width: usize) -> Vec<Line<'static>> {
+    let left_width = (width / 2).min(38).max(24);
+    let right_width = width.saturating_sub(left_width + 3);
+
+    let left = welcome_left_lines(ctx, left_width);
+    let right = welcome_right_lines(ctx, right_width);
+    let rows = left.len().max(right.len());
+
+    let mut lines = Vec::with_capacity(rows);
+    for index in 0..rows {
+        let mut spans = Vec::new();
+        match left.get(index) {
+            Some(line) => {
+                let used: usize = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.chars().count())
+                    .sum();
+                spans.extend(line.spans.iter().cloned());
+                spans.push(Span::raw(" ".repeat(left_width.saturating_sub(used))));
+            }
+            None => spans.push(Span::raw(" ".repeat(left_width))),
+        }
+        spans.push(Span::styled(" │ ", Style::default().fg(DIM)));
+        if let Some(line) = right.get(index) {
+            spans.extend(line.spans.iter().cloned());
+        }
+        let _ = right_width;
+        lines.push(Line::from(spans));
+    }
     lines
 }
 
@@ -2865,7 +2910,7 @@ fn maybe_submit_queued_prompt(
     Ok(())
 }
 
-fn welcome_right_lines(ctx: &TuiContext) -> Vec<Line<'static>> {
+fn welcome_right_lines(ctx: &TuiContext, _width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
     if let Some(label) = ctx.transport_label() {
@@ -5190,13 +5235,13 @@ mod command_policy_tests {
         let mut ctx = make_context_at(project, sessions_dir);
         ctx.set_transport_label(Some("ssh devbox".to_string()));
 
-        let banner = welcome_lines(&ctx)
+        let banner = welcome_lines(&ctx, 100)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
         let help = help_overlay_lines(&ctx).join("\n");
-        let dashboard = welcome_right_lines(&ctx)
+        let dashboard = welcome_right_lines(&ctx, 60)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
@@ -5289,7 +5334,7 @@ mod command_policy_tests {
         unsafe { std::env::set_var("CLAWEDCODE_DATA_DIR", &data_dir) };
 
         let ctx = make_context_at(project, sessions_dir);
-        let rendered = welcome_right_lines(&ctx)
+        let rendered = welcome_right_lines(&ctx, 60)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
@@ -5318,7 +5363,7 @@ mod command_policy_tests {
         clawedcode_core::onboarding::maybe_mark_project_onboarding_complete(&project);
 
         let ctx = make_context_at(project, sessions_dir);
-        let rendered = welcome_right_lines(&ctx)
+        let rendered = welcome_right_lines(&ctx, 60)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
