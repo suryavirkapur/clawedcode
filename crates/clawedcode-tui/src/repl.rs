@@ -456,6 +456,8 @@ const BUILTIN_COMMANDS: &[&str] = &[
     "/cost",
     "/session",
     "/output-style",
+    "/commit-push-pr",
+    "/pr-comments",
     "/commit",
     "/review",
     "/security-review",
@@ -5306,6 +5308,46 @@ fn handle_slash_command(
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
+                "/commit-push-pr" => {
+                    if active_turn.is_some() {
+                        handler.push_overlay("[info] A turn is already running.".to_string());
+                    } else {
+                        let args = prompt
+                            .strip_prefix("/commit-push-pr")
+                            .map(str::trim)
+                            .unwrap_or_default();
+                        let execution = build_commit_push_pr_prompt(&ctx.session().cwd, args);
+                        handler.begin_live_turn("/commit-push-pr".to_string());
+                        *active_turn = Some(spawn_turn_worker(
+                            ctx,
+                            "/commit-push-pr".to_string(),
+                            Some(execution),
+                            always_allowed.clone(),
+                        ));
+                    }
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/pr-comments" => {
+                    if active_turn.is_some() {
+                        handler.push_overlay("[info] A turn is already running.".to_string());
+                    } else {
+                        let args = prompt
+                            .strip_prefix("/pr-comments")
+                            .map(str::trim)
+                            .unwrap_or_default();
+                        let execution = build_pr_comments_prompt(args);
+                        handler.begin_live_turn("/pr-comments".to_string());
+                        *active_turn = Some(spawn_turn_worker(
+                            ctx,
+                            "/pr-comments".to_string(),
+                            Some(execution),
+                            always_allowed.clone(),
+                        ));
+                    }
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
                 "/commit" => {
                     if active_turn.is_some() {
                         handler.push_overlay("[info] A turn is already running.".to_string());
@@ -6104,6 +6146,16 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
         CommandEntry {
             name: "/output-style".to_string(),
             description: "Show or pick output style".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/commit-push-pr".to_string(),
+            description: "Commit, push, and open a PR".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/pr-comments".to_string(),
+            description: "Fetch GitHub PR comments".to_string(),
             source: CommandSource::BuiltIn,
         },
         CommandEntry {
@@ -7131,6 +7183,139 @@ Based on the above changes, create a single git commit:
 2. Stage relevant files and create the commit using HEREDOC syntax
 
 3. After creating the commit, run `git status` to confirm the commit succeeded and report the result."#
+    )
+}
+
+/// `/commit-push-pr`: reference prompt — git context inlined, branch/PR steps
+/// with the git safety protocol. `defaultBranch` comes from origin/HEAD or
+/// falls back to main.
+fn build_commit_push_pr_prompt(cwd: &Path, args: &str) -> String {
+    let username = shell_capture(cwd, "whoami", &[]);
+    let status = shell_capture(cwd, "git", &["status"]);
+    let diff = shell_capture(cwd, "git", &["diff", "HEAD"]);
+    let branch = shell_capture(cwd, "git", &["branch", "--show-current"]);
+    let default_branch = shell_capture(
+        cwd,
+        "git",
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    );
+    let default_branch = default_branch
+        .trim()
+        .strip_prefix("origin/")
+        .filter(|b| !b.is_empty() && !b.starts_with('('))
+        .unwrap_or("main")
+        .to_string();
+    let branch_diff = shell_capture(cwd, "git", &["diff", &format!("{default_branch}...HEAD")]);
+    let pr_view = shell_capture(cwd, "gh", &["pr", "view", "--json", "number"]);
+    let pr_view =
+        if pr_view.starts_with('(') && pr_view.contains("exit") || pr_view.starts_with("(failed") {
+            String::new()
+        } else {
+            pr_view
+        };
+    let attribution =
+        "\n\nGenerated with ClawedCode\n\nCo-Authored-By: ClawedCode <noreply@clawedcode>";
+    let extra = if args.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\n## Additional instructions from user\n\n{}",
+            args.trim()
+        )
+    };
+    format!(
+        r#"## Context
+
+- `SAFEUSER`: {username}
+- `whoami`: {username}
+- `git status`: {status}
+- `git diff HEAD`: {diff}
+- `git branch --show-current`: {branch}
+- `git diff {default_branch}...HEAD`: {branch_diff}
+- `gh pr view --json number 2>/dev/null || true`: {pr_view}
+
+## Git Safety Protocol
+
+- NEVER update the git config
+- NEVER run destructive/irreversible git commands (like push --force, hard reset, etc) unless the user explicitly requests them
+- NEVER skip hooks (--no-verify, --no-gpg-sign, etc) unless the user explicitly requests it
+- NEVER run force push to main/master, warn the user if they request it
+- Do not commit files that likely contain secrets (.env, credentials.json, etc)
+- Never use git commands with the -i flag (like git rebase -i or git add -i) since they require interactive input which is not supported
+
+## Your task
+
+Analyze all changes that will be included in the pull request, making sure to look at all relevant commits (NOT just the latest commit, but ALL commits that will be included in the pull request from the git diff {default_branch}...HEAD output above).
+
+Based on the above changes:
+1. Create a new branch if on {default_branch} (use the user name from context for the branch name prefix, e.g., `username/feature-name`)
+2. Create a single commit with an appropriate message using heredoc syntax, ending with the attribution text shown in the example below:
+```
+git commit -m "$(cat <<'EOF'
+Commit message here.{attribution}
+EOF
+)"
+```
+3. Push the branch to origin
+4. If a PR already exists for this branch (check the gh pr view output above), update the PR title and body using `gh pr edit` to reflect the current diff. Otherwise, create a pull request using `gh pr create` with heredoc syntax for the body.
+   - IMPORTANT: Keep PR titles short (under 70 characters). Use the body for details.
+```
+gh pr create --title "Short, descriptive title" --body "$(cat <<'EOF'
+## Summary
+<1-3 bullet points>
+
+## Test plan
+[Bulleted markdown checklist of TODOs for testing the pull request...]
+EOF
+)"
+```
+
+You have the capability to call multiple tools in a single response. You MUST do all of the above in a single message.
+
+Return the PR URL when you're done, so the user can see it.{extra}"#
+    )
+}
+
+/// `/pr-comments`: fetch and format GitHub PR comments via gh (verbatim
+/// reference prompt template).
+fn build_pr_comments_prompt(args: &str) -> String {
+    let extra = if args.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n\nAdditional user input: {}", args.trim())
+    };
+    format!(
+        r#"You are an AI assistant integrated into a git-based version control system. Your task is to fetch and display comments from a GitHub pull request.
+
+Follow these steps:
+
+1. Use `gh pr view --json number,headRepository` to get the PR number and repository info
+2. Use `gh api /repos/{{owner}}/{{repo}}/issues/{{number}}/comments` to get PR-level comments
+3. Use `gh api /repos/{{owner}}/{{repo}}/pulls/{{number}}/comments` to get review comments. Pay particular attention to the following fields: `body`, `diff_hunk`, `path`, `line`, etc. If the comment references some code, consider fetching it using eg `gh api /repos/{{owner}}/{{repo}}/contents/{{path}}?ref={{branch}} | jq .content -r | base64 -d`
+4. Parse and format all comments in a readable way
+5. Return ONLY the formatted comments, with no additional text
+
+Format the comments as:
+
+## Comments
+
+[For each comment thread:]
+- @author file.ts#line:
+  ```diff
+  [diff_hunk from the API response]
+  ```
+  > quoted comment text
+
+  [any replies indented]
+
+If there are no comments, return "No comments found."
+
+Remember:
+1. Only show the actual comments, no explanatory text
+2. Include both PR-level and code review comments
+3. Preserve the threading/nesting of comment replies
+4. Show the file and line number context for code review comments
+5. Use jq to parse the JSON responses from the GitHub API{extra}"#
     )
 }
 
