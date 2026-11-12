@@ -440,6 +440,12 @@ const BUILTIN_COMMANDS: &[&str] = &[
     "/rename",
     "/config",
     "/vim",
+    "/issue",
+    "/bug",
+    "/feedback",
+    "/release-notes",
+    "/onboarding",
+    "/good-claude",
     "/tag",
     "/add-dir",
     "/todos",
@@ -5116,6 +5122,44 @@ fn handle_slash_command(
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
+                "/issue" | "/bug" | "/feedback" => {
+                    handler.show_panel(
+                        "Report an issue".to_string(),
+                        vec![
+                            "Open https://github.com/suryavirkapur/clawedcode/issues".to_string(),
+                            "Include /doctor output for environment details.".to_string(),
+                        ],
+                    );
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/release-notes" => {
+                    handler.show_panel(
+                        "Release notes".to_string(),
+                        vec![
+                            format!("ClawedCode v{}", env!("CARGO_PKG_VERSION")),
+                            "See CHANGELOG/commits for details.".to_string(),
+                        ],
+                    );
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/onboarding" => {
+                    let steps = onboarding_steps(&ctx.session().cwd);
+                    let lines = steps
+                        .iter()
+                        .map(|s| format!("{} {}", if s.is_complete { "☒" } else { "☐" }, s.text))
+                        .collect();
+                    handler.show_panel("Onboarding".to_string(), lines);
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/good-claude" => {
+                    // Reference easter egg: a small moment of encouragement.
+                    handler.push_overlay("[info] 🎉 Good Clawd! Keep going.");
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
                 "/tag" => {
                     let arg = prompt
                         .strip_prefix("/tag")
@@ -6001,6 +6045,26 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
         CommandEntry {
             name: "/vim".to_string(),
             description: "Toggle vim modal editing".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/issue".to_string(),
+            description: "Report an issue".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/feedback".to_string(),
+            description: "Send feedback".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/release-notes".to_string(),
+            description: "View release notes".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/onboarding".to_string(),
+            description: "Show onboarding tips".to_string(),
             source: CommandSource::BuiltIn,
         },
         CommandEntry {
