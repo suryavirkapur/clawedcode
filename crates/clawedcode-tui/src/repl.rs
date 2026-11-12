@@ -52,6 +52,8 @@ const AUTO_ACCEPT_FG: Color = Color::Rgb(175, 135, 255);
 const PLAN_MODE_FG: Color = Color::Rgb(72, 150, 140);
 const PROMPT_BORDER: Color = Color::Rgb(136, 136, 136);
 const USER_MSG_BG: Color = Color::Rgb(55, 55, 55);
+const BASH_FG: Color = Color::Rgb(253, 93, 177);
+const BASH_MSG_BG: Color = Color::Rgb(65, 60, 65);
 const DASHBOARD_HEIGHT: u16 = 16;
 const BULLET: &str = "⏺";
 const HOOK_PREFIX: &str = "  ⎿  ";
@@ -1795,6 +1797,10 @@ fn welcome_left_lines(ctx: &TuiContext, width: usize) -> Vec<Line<'static>> {
         Style::default().fg(MUTED),
     ));
     lines.push(center(
+        provider_label().to_string(),
+        Style::default().fg(MUTED),
+    ));
+    lines.push(center(
         display_path(&ctx.session().cwd),
         Style::default().fg(MUTED),
     ));
@@ -2536,16 +2542,28 @@ fn render_rows(
 /// User messages render as a full-width band on `userMessageBackground`
 /// (rgb(55,55,55) in the dark theme), text only — no `>` prefix.
 fn render_user_message(text: &str, width: usize) -> Vec<Line<'static>> {
-    let style = Style::default().bg(USER_MSG_BG);
-    let text_style = Style::default().fg(Color::White).bg(USER_MSG_BG);
+    // `! cmd` bash-input bands use the reference's bash colors.
+    let bash = text.starts_with("! ");
+    let bg = if bash { BASH_MSG_BG } else { USER_MSG_BG };
+    let style = Style::default().bg(bg);
+    let text_style = Style::default().fg(Color::White).bg(bg);
+    let bang_style = Style::default().fg(BASH_FG).bg(bg);
     let mut result = Vec::new();
     let push_band = |result: &mut Vec<Line<'static>>, raw: &str| {
         let text_len = raw.chars().count() + 1; // 1-char right padding
         let pad = width.saturating_sub(text_len);
-        result.push(Line::from(vec![
-            Span::styled(raw.to_string(), text_style),
-            Span::styled(" ".repeat(pad + 1), style),
-        ]));
+        if bash && raw.starts_with("! ") {
+            result.push(Line::from(vec![
+                Span::styled("! ", bang_style),
+                Span::styled(raw[2..].to_string(), text_style),
+                Span::styled(" ".repeat(pad + 1), style),
+            ]));
+        } else {
+            result.push(Line::from(vec![
+                Span::styled(raw.to_string(), text_style),
+                Span::styled(" ".repeat(pad + 1), style),
+            ]));
+        }
     };
 
     if text.is_empty() {
@@ -3050,10 +3068,6 @@ fn append_message_blocks(
                         .unwrap_or("")
                         .trim();
                     turn.rows.push(RenderRow::User(format!("! {command}")));
-                    turn.rows.push(RenderRow::ToolUse {
-                        name: "shell".to_string(),
-                        input: format!("{{\"command\":{command:?}}}"),
-                    });
                     if let Some(output) = text.split("<bash-output>").nth(1) {
                         let output = output.trim_end_matches("</bash-output>").trim_end();
                         if !output.is_empty() {
@@ -3128,11 +3142,6 @@ fn spawn_bash_worker(session: Session, command: String) -> ActiveTurn {
     let join = thread::spawn(move || {
         let mut session = session;
         let tool_use_id = format!("bash-mode-{}", uuid::Uuid::new_v4());
-        let _ = event_tx.send(TurnWorkerEvent::Ui(TuiEvent::ToolUse {
-            id: tool_use_id.clone(),
-            name: "shell".to_string(),
-            input: serde_json::json!({ "command": command }),
-        }));
         let (content, is_error) = match std::process::Command::new("sh")
             .arg("-c")
             .arg(&command)
@@ -5045,7 +5054,6 @@ mod command_policy_tests {
         handler.rebuild_from_session(&session, false);
         let lines = handler.visible_lines().join("\n");
         assert!(lines.contains("! ls -la"));
-        assert!(lines.contains("Bash(ls -la)"));
         assert!(lines.contains("total 42"));
         assert!(!lines.contains("bash-input"));
     }
