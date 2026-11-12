@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const MAX_BUILTIN_NORMALIZATION_DEPTH: usize = 3;
 
@@ -10,11 +10,9 @@ pub fn decode_tool_input(tool_name: &str, raw: &str) -> Value {
 
     match serde_json::from_str::<Value>(raw) {
         Ok(Value::Null) => json!({}),
-        Ok(Value::String(value)) => {
-            unwrap_stringified_json_object(&value)
-                .map(|value| normalize_builtin_value(tool_name, value))
-                .unwrap_or_else(|| normalize_builtin_value(tool_name, Value::String(value)))
-        }
+        Ok(Value::String(value)) => unwrap_stringified_json_object(&value)
+            .map(|value| normalize_builtin_value(tool_name, value))
+            .unwrap_or_else(|| normalize_builtin_value(tool_name, Value::String(value))),
         Ok(value) => normalize_builtin_value(tool_name, value),
         Err(_) => coerce_single_string_builtin(tool_name, raw).unwrap_or(Value::Null),
     }
@@ -37,12 +35,7 @@ fn normalize_builtin_value(tool_name: &str, value: Value) -> Value {
     normalize_builtin_value_inner(tool_name, key, value, 0)
 }
 
-fn normalize_builtin_value_inner(
-    tool_name: &str,
-    key: &str,
-    value: Value,
-    depth: usize,
-) -> Value {
+fn normalize_builtin_value_inner(tool_name: &str, key: &str, value: Value, depth: usize) -> Value {
     if depth >= MAX_BUILTIN_NORMALIZATION_DEPTH {
         return value;
     }
@@ -76,12 +69,8 @@ fn normalize_builtin_value_inner(
                         return json!({ key: raw });
                     }
                     other => {
-                        let normalized = normalize_builtin_value_inner(
-                            tool_name,
-                            key,
-                            other.clone(),
-                            depth + 1,
-                        );
+                        let normalized =
+                            normalize_builtin_value_inner(tool_name, key, other.clone(), depth + 1);
                         if contains_builtin_key(key, &normalized) {
                             return normalized;
                         }
@@ -92,12 +81,8 @@ fn normalize_builtin_value_inner(
             if map.len() == 1 {
                 let (wrapper_key, inner) = map.iter().next().unwrap();
                 if is_common_wrapper_key(wrapper_key) {
-                    let normalized = normalize_builtin_value_inner(
-                        tool_name,
-                        key,
-                        inner.clone(),
-                        depth + 1,
-                    );
+                    let normalized =
+                        normalize_builtin_value_inner(tool_name, key, inner.clone(), depth + 1);
                     if contains_builtin_key(key, &normalized) {
                         return normalized;
                     }
@@ -115,7 +100,10 @@ fn contains_builtin_key(key: &str, value: &Value) -> bool {
 }
 
 fn is_common_wrapper_key(key: &str) -> bool {
-    matches!(key, "arguments" | "args" | "input" | "tool_input" | "payload")
+    matches!(
+        key,
+        "arguments" | "args" | "input" | "tool_input" | "payload"
+    )
 }
 
 fn unwrap_stringified_json_object(raw: &str) -> Option<Value> {

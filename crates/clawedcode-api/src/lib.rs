@@ -1070,7 +1070,10 @@ pub mod openai_provider {
         )
     }
 
-    fn build_openai_messages(request: &CompletionRequest, is_deepseek: bool) -> Vec<serde_json::Value> {
+    fn build_openai_messages(
+        request: &CompletionRequest,
+        is_deepseek: bool,
+    ) -> Vec<serde_json::Value> {
         let mut messages = Vec::new();
         if !request.system_prompt_body.is_empty() {
             messages.push(serde_json::json!({
@@ -1088,7 +1091,9 @@ pub mod openai_provider {
             for block in &msg.content {
                 match block {
                     ProviderContentBlock::Text { text } => text_parts.push(text.clone()),
-                    ProviderContentBlock::Thinking { thinking } => thinking_parts.push(thinking.clone()),
+                    ProviderContentBlock::Thinking { thinking } => {
+                        thinking_parts.push(thinking.clone())
+                    }
                     ProviderContentBlock::ToolUse { id, name, input } => {
                         tool_uses.push(serde_json::json!({
                             "id": id,
@@ -1099,7 +1104,11 @@ pub mod openai_provider {
                             }
                         }));
                     }
-                    ProviderContentBlock::ToolResult { tool_use_id, content, .. } => {
+                    ProviderContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } => {
                         tool_results.push(serde_json::json!({
                             "role": "tool",
                             "tool_call_id": tool_use_id,
@@ -1130,7 +1139,8 @@ pub mod openai_provider {
                 }
 
                 if is_deepseek && !thinking_parts.is_empty() {
-                    msg_obj["reasoning_content"] = serde_json::Value::String(thinking_parts.join(""));
+                    msg_obj["reasoning_content"] =
+                        serde_json::Value::String(thinking_parts.join(""));
                 }
 
                 if !tool_uses.is_empty() {
@@ -1147,7 +1157,8 @@ pub mod openai_provider {
         fn complete(
             &self,
             request: &CompletionRequest,
-        ) -> Pin<Box<dyn Future<Output = Result<CompletionResponse, ProviderError>> + Send + '_>> {
+        ) -> Pin<Box<dyn Future<Output = Result<CompletionResponse, ProviderError>> + Send + '_>>
+        {
             let req = request.clone();
             let api_key = self.api_key.clone();
             let client = self.client.clone();
@@ -1180,13 +1191,16 @@ pub mod openai_provider {
                     let resp = match tokio::time::timeout(timeout.per_request, send_fut).await {
                         Ok(Ok(r)) => r,
                         Ok(Err(e)) => {
-                            last_err = Some(ProviderError::Network { message: e.to_string() });
+                            last_err = Some(ProviderError::Network {
+                                message: e.to_string(),
+                            });
                             if attempt < retry.max_attempts {
                                 let backoff_ms = (retry.base_delay.as_millis() as u64)
                                     .saturating_mul(1u64 << (attempt - 1));
                                 tokio::time::sleep(Duration::from_millis(
                                     backoff_ms.min(retry.max_delay.as_millis() as u64),
-                                )).await;
+                                ))
+                                .await;
                                 continue;
                             }
                             break;
@@ -1206,7 +1220,10 @@ pub mod openai_provider {
                     let status = resp.status().as_u16();
                     if !resp.status().is_success() {
                         let text = resp.text().await.unwrap_or_default();
-                        let err = ProviderError::Api { status, message: text };
+                        let err = ProviderError::Api {
+                            status,
+                            message: text,
+                        };
                         last_err = Some(err);
                         let retryable = (500..=599).contains(&status) || status == 429;
                         if retryable && attempt < retry.max_attempts {
@@ -1216,11 +1233,13 @@ pub mod openai_provider {
                         break;
                     }
 
-                    let json: serde_json::Value = resp.json().await.map_err(|e| ProviderError::Parse {
-                        message: e.to_string(),
-                    })?;
+                    let json: serde_json::Value =
+                        resp.json().await.map_err(|e| ProviderError::Parse {
+                            message: e.to_string(),
+                        })?;
 
-                    let response = json["choices"].get(0)
+                    let response = json["choices"]
+                        .get(0)
                         .and_then(|c| c["message"]["content"].as_str())
                         .unwrap_or_default()
                         .to_string();
@@ -1279,13 +1298,19 @@ pub mod openai_provider {
                 let resp = match tokio::time::timeout(timeout.per_request, send_fut).await {
                     Ok(Ok(r)) => r,
                     Ok(Err(e)) => {
-                        let _ = tx.send(Err(ProviderError::Network { message: e.to_string() })).await;
+                        let _ = tx
+                            .send(Err(ProviderError::Network {
+                                message: e.to_string(),
+                            }))
+                            .await;
                         return;
                     }
                     Err(_) => {
-                        let _ = tx.send(Err(ProviderError::Timeout {
-                            elapsed_ms: timeout.per_request.as_millis() as u64,
-                        })).await;
+                        let _ = tx
+                            .send(Err(ProviderError::Timeout {
+                                elapsed_ms: timeout.per_request.as_millis() as u64,
+                            }))
+                            .await;
                         return;
                     }
                 };
@@ -1293,7 +1318,12 @@ pub mod openai_provider {
                 if !resp.status().is_success() {
                     let status = resp.status().as_u16();
                     let text = resp.text().await.unwrap_or_default();
-                    let _ = tx.send(Err(ProviderError::Api { status, message: text })).await;
+                    let _ = tx
+                        .send(Err(ProviderError::Api {
+                            status,
+                            message: text,
+                        }))
+                        .await;
                     return;
                 }
 
@@ -1307,7 +1337,11 @@ pub mod openai_provider {
                     let chunk = match chunk {
                         Ok(c) => c,
                         Err(e) => {
-                            let _ = tx.send(Err(ProviderError::Network { message: e.to_string() })).await;
+                            let _ = tx
+                                .send(Err(ProviderError::Network {
+                                    message: e.to_string(),
+                                }))
+                                .await;
                             return;
                         }
                     };
@@ -1343,20 +1377,24 @@ pub mod openai_provider {
 
                         if let Some(choice) = event["choices"].get(0) {
                             let delta = &choice["delta"];
-                            
+
                             if let Some(text) = delta["content"].as_str() {
                                 if !text.is_empty() {
-                                    let _ = tx.send(Ok(ApiEvent::MessageDelta {
-                                        text: text.to_string(),
-                                    })).await;
+                                    let _ = tx
+                                        .send(Ok(ApiEvent::MessageDelta {
+                                            text: text.to_string(),
+                                        }))
+                                        .await;
                                 }
                             }
 
                             if let Some(reasoning) = delta["reasoning_content"].as_str() {
                                 if !reasoning.is_empty() {
-                                    let _ = tx.send(Ok(ApiEvent::ThinkingDelta {
-                                        text: reasoning.to_string(),
-                                    })).await;
+                                    let _ = tx
+                                        .send(Ok(ApiEvent::ThinkingDelta {
+                                            text: reasoning.to_string(),
+                                        }))
+                                        .await;
                                 }
                             }
 
@@ -1364,11 +1402,17 @@ pub mod openai_provider {
                                 for tc in tool_calls {
                                     let index = tc["index"].as_u64().unwrap_or(0) as usize;
                                     let id = tc["id"].as_str().map(|s| s.to_string());
-                                    let name = tc["function"]["name"].as_str().map(|s| s.to_string());
-                                    let arguments = tc["function"]["arguments"].as_str().map(|s| s.to_string());
+                                    let name =
+                                        tc["function"]["name"].as_str().map(|s| s.to_string());
+                                    let arguments =
+                                        tc["function"]["arguments"].as_str().map(|s| s.to_string());
 
                                     while current_tool_calls.len() <= index {
-                                        current_tool_calls.push((String::new(), String::new(), String::new()));
+                                        current_tool_calls.push((
+                                            String::new(),
+                                            String::new(),
+                                            String::new(),
+                                        ));
                                     }
 
                                     if let Some(id) = id {
@@ -1393,13 +1437,15 @@ pub mod openai_provider {
                                     } else {
                                         args.clone()
                                     };
-                                    let _ = tx.send(Ok(ApiEvent::ToolUse {
-                                        tool_use: ToolUseEvent {
-                                            id: id.clone(),
-                                            name: name.clone(),
-                                            input,
-                                        }
-                                    })).await;
+                                    let _ = tx
+                                        .send(Ok(ApiEvent::ToolUse {
+                                            tool_use: ToolUseEvent {
+                                                id: id.clone(),
+                                                name: name.clone(),
+                                                input,
+                                            },
+                                        }))
+                                        .await;
                                 }
                                 current_tool_calls.clear();
                             }

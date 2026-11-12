@@ -1,7 +1,7 @@
 use crate::{
     background_task::{
-        get_background_task, poll_background_task, read_background_task_output,
-        spawn_background_shell, stop_background_task, TASK_OUTPUT_TOOL_NAME, TASK_STOP_TOOL_NAME,
+        TASK_OUTPUT_TOOL_NAME, TASK_STOP_TOOL_NAME, get_background_task, poll_background_task,
+        read_background_task_output, spawn_background_shell, stop_background_task,
     },
     compat::CompatibilitySnapshot,
     config::{AppConfig, default_data_dir},
@@ -376,7 +376,10 @@ impl Runtime {
                 continue;
             };
 
-            let is_supported = matches!(config, McpServerConfig::Stdio { .. } | McpServerConfig::Http { .. });
+            let is_supported = matches!(
+                config,
+                McpServerConfig::Stdio { .. } | McpServerConfig::Http { .. }
+            );
             if !is_supported {
                 continue;
             }
@@ -568,11 +571,16 @@ impl Runtime {
                                     thinking: thinking.clone(),
                                 }
                             }
-                            crate::content::ContentBlock::SubAgentSummary { child_session_id, summary } => {
-                                clawedcode_api::ProviderContentBlock::Text {
-                                    text: format!("[sub-agent: {}] {}", &child_session_id[..8], summary),
-                                }
-                            }
+                            crate::content::ContentBlock::SubAgentSummary {
+                                child_session_id,
+                                summary,
+                            } => clawedcode_api::ProviderContentBlock::Text {
+                                text: format!(
+                                    "[sub-agent: {}] {}",
+                                    &child_session_id[..8],
+                                    summary
+                                ),
+                            },
                         })
                         .collect(),
                 })
@@ -593,6 +601,10 @@ impl Runtime {
 
     pub fn permission_mode(&self) -> PermissionMode {
         self.permission_engine.mode()
+    }
+
+    pub fn set_permission_mode(&mut self, mode: PermissionMode) {
+        self.permission_engine = PermissionEngine::new(mode);
     }
 
     fn run_in_runtime<F, T>(&self, f: F) -> T
@@ -1049,10 +1061,7 @@ impl Runtime {
                 Err(err) => {
                     prepared.insert(
                         tool_use_id.clone(),
-                        PreparedAgentExecution::Ready(ContentBlock::tool_error(
-                            tool_use_id,
-                            err,
-                        )),
+                        PreparedAgentExecution::Ready(ContentBlock::tool_error(tool_use_id, err)),
                     );
                     continue;
                 }
@@ -1061,10 +1070,7 @@ impl Runtime {
             if let Some(error) = self.agent_tool_preflight_error(session) {
                 prepared.insert(
                     tool_use_id.clone(),
-                    PreparedAgentExecution::Ready(ContentBlock::tool_error(
-                        tool_use_id,
-                        error,
-                    )),
+                    PreparedAgentExecution::Ready(ContentBlock::tool_error(tool_use_id, error)),
                 );
                 continue;
             }
@@ -1219,9 +1225,7 @@ impl Runtime {
             return ContentBlock::tool_error(tool_use_id, format!("Unknown tool: {tool_name}"));
         };
 
-        let decision = self
-            .permission_engine
-            .decide(needs_approval, write_like);
+        let decision = self.permission_engine.decide(needs_approval, write_like);
 
         match decision {
             PermissionDecision::Deny => ContentBlock::tool_error(
@@ -1240,7 +1244,9 @@ impl Runtime {
                 }
                 self.execute_tool_inner(tool_use_id, tool_name, input, session)
             }
-            PermissionDecision::Allow => self.execute_tool_inner(tool_use_id, tool_name, input, session),
+            PermissionDecision::Allow => {
+                self.execute_tool_inner(tool_use_id, tool_name, input, session)
+            }
         }
     }
 
@@ -1269,14 +1275,14 @@ impl Runtime {
             return self.execute_agent_tool(tool_use_id, input, session);
         }
 
-        if let Some(result) = execute_task_tool(tool_name, input.clone(), session).unwrap_or_else(
-            |err| {
+        if let Some(result) =
+            execute_task_tool(tool_name, input.clone(), session).unwrap_or_else(|err| {
                 Some(ToolResult {
                     content: err,
                     is_error: true,
                 })
-            },
-        ) {
+            })
+        {
             return finish_tool_result(tool_use_id, result);
         }
 
@@ -1288,8 +1294,7 @@ impl Runtime {
             return execute_task_stop_tool(tool_use_id, input);
         }
 
-        if tool_name == "shell"
-            && input_bool_field(&input, &["run_in_background"]).unwrap_or(false)
+        if tool_name == "shell" && input_bool_field(&input, &["run_in_background"]).unwrap_or(false)
         {
             return execute_background_shell(tool_use_id, input, session);
         }
@@ -1444,21 +1449,30 @@ fn session_store_dir() -> Option<PathBuf> {
         .map(|dir| dir.join("sessions"))
 }
 
-fn execute_background_shell(tool_use_id: &str, input: serde_json::Value, session: &Session) -> ContentBlock {
+fn execute_background_shell(
+    tool_use_id: &str,
+    input: serde_json::Value,
+    session: &Session,
+) -> ContentBlock {
     let command = match input.get("command").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
         None => {
             return ContentBlock::tool_error(tool_use_id, "Missing 'command' parameter");
         }
     };
-    
+
     let description = if command.len() > 50 {
         format!("{}...", &command[..50])
     } else {
         command.clone()
     };
-    
-    match spawn_background_shell(command, description, session.cwd.clone(), &session.id.to_string()) {
+
+    match spawn_background_shell(
+        command,
+        description,
+        session.cwd.clone(),
+        &session.id.to_string(),
+    ) {
         Ok(task) => {
             let result = serde_json::json!({
                 "task_id": task.id,
@@ -1466,9 +1480,14 @@ fn execute_background_shell(tool_use_id: &str, input: serde_json::Value, session
                 "status": "running",
                 "message": format!("Background task started: {}", task.id)
             });
-            ContentBlock::tool_result(tool_use_id, serde_json::to_string_pretty(&result).unwrap_or_default())
+            ContentBlock::tool_result(
+                tool_use_id,
+                serde_json::to_string_pretty(&result).unwrap_or_default(),
+            )
         }
-        Err(e) => ContentBlock::tool_error(tool_use_id, format!("Failed to start background task: {e}")),
+        Err(e) => {
+            ContentBlock::tool_error(tool_use_id, format!("Failed to start background task: {e}"))
+        }
     }
 }
 
@@ -1501,7 +1520,12 @@ fn execute_task_output_tool(tool_use_id: &str, input: serde_json::Value) -> Cont
         Some(task) => {
             let output = match read_background_task_output(&task_id) {
                 Ok(o) => o,
-                Err(e) => return ContentBlock::tool_error(tool_use_id, format!("Failed to read output: {e}")),
+                Err(e) => {
+                    return ContentBlock::tool_error(
+                        tool_use_id,
+                        format!("Failed to read output: {e}"),
+                    );
+                }
             };
 
             let mut task_json = serde_json::json!({
@@ -1521,7 +1545,10 @@ fn execute_task_output_tool(tool_use_id: &str, input: serde_json::Value) -> Cont
                 "retrieval_status": retrieval_status,
                 "task": task_json,
             });
-            ContentBlock::tool_result(tool_use_id, serde_json::to_string_pretty(&result).unwrap_or_default())
+            ContentBlock::tool_result(
+                tool_use_id,
+                serde_json::to_string_pretty(&result).unwrap_or_default(),
+            )
         }
         None => ContentBlock::tool_error(tool_use_id, format!("Task not found: {task_id}")),
     }
@@ -1540,7 +1567,10 @@ fn execute_task_stop_tool(tool_use_id: &str, input: serde_json::Value) -> Conten
             if task.status != crate::background_task::TaskStatus::Running {
                 return ContentBlock::tool_error(
                     tool_use_id,
-                    format!("Task {} is not running (status: {:?})", task_id, task.status),
+                    format!(
+                        "Task {} is not running (status: {:?})",
+                        task_id, task.status
+                    ),
                 );
             }
             match stop_background_task(&task_id) {
@@ -1552,9 +1582,14 @@ fn execute_task_stop_tool(tool_use_id: &str, input: serde_json::Value) -> Conten
                         "command": stopped_task.command,
                         "status": "killed",
                     });
-                    ContentBlock::tool_result(tool_use_id, serde_json::to_string_pretty(&result).unwrap_or_default())
+                    ContentBlock::tool_result(
+                        tool_use_id,
+                        serde_json::to_string_pretty(&result).unwrap_or_default(),
+                    )
                 }
-                None => ContentBlock::tool_error(tool_use_id, format!("Failed to stop task {task_id}")),
+                None => {
+                    ContentBlock::tool_error(tool_use_id, format!("Failed to stop task {task_id}"))
+                }
             }
         }
         None => ContentBlock::tool_error(tool_use_id, format!("Task not found: {task_id}")),
@@ -1566,7 +1601,10 @@ fn is_write_like(tool_name: &str) -> bool {
 }
 
 fn is_task_store_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "TaskCreate" | "TaskList" | "TaskGet" | "TaskUpdate")
+    matches!(
+        tool_name,
+        "TaskCreate" | "TaskList" | "TaskGet" | "TaskUpdate"
+    )
 }
 
 fn is_agent_tool(tool_name: &str) -> bool {
@@ -1588,7 +1626,8 @@ fn current_retrieval_status(task_id: &str) -> &'static str {
         Some(task)
             if matches!(
                 task.status,
-                crate::background_task::TaskStatus::Pending | crate::background_task::TaskStatus::Running
+                crate::background_task::TaskStatus::Pending
+                    | crate::background_task::TaskStatus::Running
             ) =>
         {
             "not_ready"
@@ -1638,7 +1677,8 @@ fn wait_for_task_completion(task_id: &str, timeout_ms: u64) -> std::io::Result<&
             Some(task)
                 if matches!(
                     task.status,
-                    crate::background_task::TaskStatus::Pending | crate::background_task::TaskStatus::Running
+                    crate::background_task::TaskStatus::Pending
+                        | crate::background_task::TaskStatus::Running
                 ) =>
             {
                 if Instant::now() >= deadline {
@@ -1782,7 +1822,11 @@ mod tests {
             &self,
             _request: &CompletionRequest,
         ) -> Pin<
-            Box<dyn std::future::Future<Output = Result<CompletionResponse, ProviderError>> + Send + '_>,
+            Box<
+                dyn std::future::Future<Output = Result<CompletionResponse, ProviderError>>
+                    + Send
+                    + '_,
+            >,
         > {
             Box::pin(async {
                 Ok(CompletionResponse {
@@ -2284,7 +2328,12 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
     fn runtime_registers_agent_and_task_tools() {
         let runtime = make_runtime();
 
-        assert!(runtime.tools.iter().any(|tool| tool.name == AGENT_TOOL_NAME));
+        assert!(
+            runtime
+                .tools
+                .iter()
+                .any(|tool| tool.name == AGENT_TOOL_NAME)
+        );
         assert!(
             runtime
                 .tools
@@ -2326,7 +2375,12 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
 
         assert_eq!(session.child_sessions.len(), 1);
         assert_eq!(session.child_sessions[0].to_string(), child_id);
-        assert!(data_dir.join("sessions").join(format!("{child_id}.json")).exists());
+        assert!(
+            data_dir
+                .join("sessions")
+                .join(format!("{child_id}.json"))
+                .exists()
+        );
 
         unsafe { std::env::remove_var("CLAWEDCODE_DATA_DIR") };
         fs::remove_dir_all(data_dir).ok();
@@ -2335,8 +2389,7 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
     #[test]
     fn child_sessions_cannot_spawn_nested_agent_tools() {
         let runtime = make_runtime();
-        let mut child_session =
-            Session::new_child(PathBuf::from("/tmp"), uuid::Uuid::new_v4());
+        let mut child_session = Session::new_child(PathBuf::from("/tmp"), uuid::Uuid::new_v4());
         child_session.push(Role::System, "You are a child session.");
 
         let result = runtime.execute_tool(
@@ -2395,10 +2448,7 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
         let tool_message = session
             .messages
             .iter()
-            .find(|message| {
-                message.role == Role::Tool
-                    && message.content_blocks.len() == 2
-            })
+            .find(|message| message.role == Role::Tool && message.content_blocks.len() == 2)
             .expect("expected tool message with two results");
 
         let parse_result = |block: &ContentBlock| match block {
@@ -2417,10 +2467,12 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
         assert_eq!(second["description"], "Second task");
 
         for child_id in &session.child_sessions {
-            assert!(data_dir
-                .join("sessions")
-                .join(format!("{child_id}.json"))
-                .exists());
+            assert!(
+                data_dir
+                    .join("sessions")
+                    .join(format!("{child_id}.json"))
+                    .exists()
+            );
         }
 
         unsafe { std::env::remove_var("CLAWEDCODE_DATA_DIR") };
@@ -2711,11 +2763,14 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
         );
         assert!(texts[0].contains("You are a test assistant."));
         // With compaction, the first 2 non-system messages are summarized
-        assert_eq!(&texts[1..], [
-            "[Earlier conversation compacted: 1 user messages, 1 assistant responses, 0 tool results]",
-            "second",
-            "second reply"
-        ]);
+        assert_eq!(
+            &texts[1..],
+            [
+                "[Earlier conversation compacted: 1 user messages, 1 assistant responses, 0 tool results]",
+                "second",
+                "second reply"
+            ]
+        );
     }
 
     #[test]
@@ -2968,9 +3023,21 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
         assert!(request.system_prompt_body.contains("## Session Guidance"));
         assert!(request.system_prompt_body.contains("## Language"));
         assert!(request.system_prompt_body.contains("## Environment"));
-        assert!(request.system_prompt_body.contains("Primary working directory: /tmp"));
-        assert!(request.system_prompt_body.contains("Model: deepseek-v4-pro"));
-        assert!(request.system_prompt_body.contains("Current setting: default"));
+        assert!(
+            request
+                .system_prompt_body
+                .contains("Primary working directory: /tmp")
+        );
+        assert!(
+            request
+                .system_prompt_body
+                .contains("Model: deepseek-v4-pro")
+        );
+        assert!(
+            request
+                .system_prompt_body
+                .contains("Current setting: default")
+        );
         assert!(request.system_prompt_body.contains("shell"));
         assert!(request.system_prompt_body.contains("read_file"));
         assert!(request.system_prompt_body.contains("apply_patch"));
@@ -3012,9 +3079,17 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
         let session = runtime.start_session(PathBuf::from("/tmp"));
         let request = runtime.build_request(&session);
 
-        assert!(request.system_prompt_body.contains("## MCP Server Instructions"));
+        assert!(
+            request
+                .system_prompt_body
+                .contains("## MCP Server Instructions")
+        );
         assert!(request.system_prompt_body.contains("example-http"));
-        assert!(request.system_prompt_body.contains("https://example.com/mcp"));
+        assert!(
+            request
+                .system_prompt_body
+                .contains("https://example.com/mcp")
+        );
     }
 
     #[test]
@@ -3202,8 +3277,14 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
 
         let stopped_one = crate::background_task::get_background_task(&task_one.id).unwrap();
         let stopped_two = crate::background_task::get_background_task(&task_two.id).unwrap();
-        assert_eq!(stopped_one.status, crate::background_task::TaskStatus::Killed);
-        assert_eq!(stopped_two.status, crate::background_task::TaskStatus::Killed);
+        assert_eq!(
+            stopped_one.status,
+            crate::background_task::TaskStatus::Killed
+        );
+        assert_eq!(
+            stopped_two.status,
+            crate::background_task::TaskStatus::Killed
+        );
 
         unsafe { std::env::remove_var("CLAWEDCODE_DATA_DIR") };
         fs::remove_dir_all(data_dir).ok();
@@ -3327,10 +3408,12 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
         let success_json = parse(success);
         assert_eq!(success_json["retrieval_status"], "success");
         assert_eq!(success_json["task"]["status"], "completed");
-        assert!(success_json["task"]["output"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("done"));
+        assert!(
+            success_json["task"]["output"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("done")
+        );
 
         unsafe { std::env::remove_var("CLAWEDCODE_DATA_DIR") };
         fs::remove_dir_all(data_dir).ok();
@@ -3420,10 +3503,12 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
         let success_json = parse(success);
         assert_eq!(success_json["retrieval_status"], "success");
         assert_eq!(success_json["task"]["status"], "completed");
-        assert!(success_json["task"]["output"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("done"));
+        assert!(
+            success_json["task"]["output"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("done")
+        );
 
         unsafe { std::env::remove_var("CLAWEDCODE_DATA_DIR") };
         fs::remove_dir_all(data_dir).ok();
@@ -3504,10 +3589,12 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
                 assert!(!is_error, "unexpected tool error: {content}");
                 let json: serde_json::Value = serde_json::from_str(&content).unwrap();
                 assert_eq!(json["retrieval_status"], "success");
-                assert!(json["task"]["output"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .contains("done"));
+                assert!(
+                    json["task"]["output"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("done")
+                );
             }
             other => panic!("expected tool result, got {other:?}"),
         }
@@ -3526,7 +3613,11 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
             &self,
             _request: &CompletionRequest,
         ) -> Pin<
-            Box<dyn std::future::Future<Output = Result<CompletionResponse, ProviderError>> + Send + '_>,
+            Box<
+                dyn std::future::Future<Output = Result<CompletionResponse, ProviderError>>
+                    + Send
+                    + '_,
+            >,
         > {
             Box::pin(async { unreachable!("use stream instead") })
         }
@@ -3643,10 +3734,12 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
             .expect("tool result content");
         let json: serde_json::Value = serde_json::from_str(content).expect("task output json");
         assert_eq!(json["retrieval_status"], "success");
-        assert!(json["task"]["output"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("done"));
+        assert!(
+            json["task"]["output"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("done")
+        );
 
         let _ = crate::background_task::stop_background_task(&task.id);
 
@@ -3662,7 +3755,11 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
             &self,
             _request: &CompletionRequest,
         ) -> Pin<
-            Box<dyn std::future::Future<Output = Result<CompletionResponse, ProviderError>> + Send + '_>,
+            Box<
+                dyn std::future::Future<Output = Result<CompletionResponse, ProviderError>>
+                    + Send
+                    + '_,
+            >,
         > {
             Box::pin(async { unreachable!("use stream instead") })
         }
@@ -3740,7 +3837,11 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
             &self,
             _request: &CompletionRequest,
         ) -> Pin<
-            Box<dyn std::future::Future<Output = Result<CompletionResponse, ProviderError>> + Send + '_>,
+            Box<
+                dyn std::future::Future<Output = Result<CompletionResponse, ProviderError>>
+                    + Send
+                    + '_,
+            >,
         > {
             Box::pin(async { unreachable!("use stream instead") })
         }
@@ -3812,24 +3913,22 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
         let mut session_a = runtime.start_session(std::env::temp_dir());
         let mut session_b = runtime.start_session(std::env::temp_dir());
 
-        let run_bg = |session: &mut Session| {
-            match runtime.execute_tool(
-                "bg-path",
-                "shell",
-                serde_json::json!({
-                    "command": "sleep 2",
-                    "run_in_background": true
-                }),
-                session,
-            ) {
-                ContentBlock::ToolResult {
-                    is_error, content, ..
-                } => {
-                    assert!(!is_error, "unexpected tool error: {content}");
-                    serde_json::from_str::<serde_json::Value>(&content).unwrap()
-                }
-                other => panic!("expected tool result, got {other:?}"),
+        let run_bg = |session: &mut Session| match runtime.execute_tool(
+            "bg-path",
+            "shell",
+            serde_json::json!({
+                "command": "sleep 2",
+                "run_in_background": true
+            }),
+            session,
+        ) {
+            ContentBlock::ToolResult {
+                is_error, content, ..
+            } => {
+                assert!(!is_error, "unexpected tool error: {content}");
+                serde_json::from_str::<serde_json::Value>(&content).unwrap()
             }
+            other => panic!("expected tool result, got {other:?}"),
         };
 
         let a = run_bg(&mut session_a);
@@ -3856,27 +3955,28 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
         let mut session_a = runtime.start_session(std::env::temp_dir());
         let mut session_b = runtime.start_session(std::env::temp_dir());
 
-        let run_bg = |session: &mut Session, value: serde_json::Value| {
-            match runtime.execute_tool(
-                "bg-compat",
-                "shell",
-                serde_json::json!({
-                    "command": "sleep 5",
-                    "run_in_background": value
-                }),
-                session,
-            ) {
-                ContentBlock::ToolResult {
-                    is_error, content, ..
-                } => {
-                    assert!(!is_error, "unexpected tool error: {content}");
-                    serde_json::from_str::<serde_json::Value>(&content).unwrap()
-                }
-                other => panic!("expected tool result, got {other:?}"),
+        let run_bg = |session: &mut Session, value: serde_json::Value| match runtime.execute_tool(
+            "bg-compat",
+            "shell",
+            serde_json::json!({
+                "command": "sleep 5",
+                "run_in_background": value
+            }),
+            session,
+        ) {
+            ContentBlock::ToolResult {
+                is_error, content, ..
+            } => {
+                assert!(!is_error, "unexpected tool error: {content}");
+                serde_json::from_str::<serde_json::Value>(&content).unwrap()
             }
+            other => panic!("expected tool result, got {other:?}"),
         };
 
-        let string_value = run_bg(&mut session_a, serde_json::Value::String("true".to_string()));
+        let string_value = run_bg(
+            &mut session_a,
+            serde_json::Value::String("true".to_string()),
+        );
         let numeric_value = run_bg(&mut session_b, serde_json::Value::Number(1.into()));
 
         assert_eq!(string_value["status"], "running");
@@ -3884,9 +3984,8 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
         assert!(string_value["task_id"].as_str().is_some());
         assert!(numeric_value["task_id"].as_str().is_some());
 
-        let _ = crate::background_task::stop_background_task(
-            string_value["task_id"].as_str().unwrap(),
-        );
+        let _ =
+            crate::background_task::stop_background_task(string_value["task_id"].as_str().unwrap());
         let _ = crate::background_task::stop_background_task(
             numeric_value["task_id"].as_str().unwrap(),
         );
@@ -3901,28 +4000,39 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
         fn complete(
             &self,
             _request: &CompletionRequest,
-        ) -> Pin<Box<dyn std::future::Future<Output = Result<CompletionResponse, ProviderError>> + Send + '_>>
-        {
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<Output = Result<CompletionResponse, ProviderError>>
+                    + Send
+                    + '_,
+            >,
+        > {
             Box::pin(async { unreachable!("complete should not be called for streaming test") })
         }
 
         fn stream(&self, request: &CompletionRequest) -> clawedcode_api::EventStream {
             let has_tool_result = request.messages.iter().any(|m| {
-                m.content.iter().any(|b| {
-                    matches!(b, clawedcode_api::ProviderContentBlock::ToolResult { .. })
-                })
+                m.content
+                    .iter()
+                    .any(|b| matches!(b, clawedcode_api::ProviderContentBlock::ToolResult { .. }))
             });
 
             if has_tool_result {
                 let events = vec![
-                    ApiEvent::MessageDelta { text: "Done.".to_string() },
+                    ApiEvent::MessageDelta {
+                        text: "Done.".to_string(),
+                    },
                     ApiEvent::Completed,
                 ];
                 Box::pin(stream::iter(events.into_iter().map(Ok)))
             } else {
                 let events: Vec<Result<ApiEvent, ProviderError>> = vec![
-                    Ok(ApiEvent::ThinkingDelta { text: "Thinking...".to_string() }),
-                    Ok(ApiEvent::MessageDelta { text: "Hello ".to_string() }),
+                    Ok(ApiEvent::ThinkingDelta {
+                        text: "Thinking...".to_string(),
+                    }),
+                    Ok(ApiEvent::MessageDelta {
+                        text: "Hello ".to_string(),
+                    }),
                     Err(ProviderError::Other {
                         message: "simulated stream failure".to_string(),
                     }),
@@ -3995,21 +4105,28 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
         fn complete(
             &self,
             _request: &CompletionRequest,
-        ) -> Pin<Box<dyn std::future::Future<Output = Result<CompletionResponse, ProviderError>> + Send + '_>>
-        {
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<Output = Result<CompletionResponse, ProviderError>>
+                    + Send
+                    + '_,
+            >,
+        > {
             Box::pin(async { unreachable!("use stream instead") })
         }
 
         fn stream(&self, request: &CompletionRequest) -> clawedcode_api::EventStream {
             let has_tool_result = request.messages.iter().any(|m| {
-                m.content.iter().any(|b| {
-                    matches!(b, clawedcode_api::ProviderContentBlock::ToolResult { .. })
-                })
+                m.content
+                    .iter()
+                    .any(|b| matches!(b, clawedcode_api::ProviderContentBlock::ToolResult { .. }))
             });
 
             if has_tool_result {
                 let events = vec![
-                    ApiEvent::MessageDelta { text: "Task completed.".to_string() },
+                    ApiEvent::MessageDelta {
+                        text: "Task completed.".to_string(),
+                    },
                     ApiEvent::Completed,
                 ];
                 Box::pin(stream::iter(events.into_iter().map(Ok)))
@@ -4065,14 +4182,12 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
                 .submit_stream_with_approval(
                     &mut session,
                     "read the file",
-                    |event| {
-                        match event {
-                            ApiEvent::ToolUse { .. } => tool_use_seen = true,
-                            ApiEvent::MessageDelta { text } if text.contains("completed") => {
-                                response_seen = true
-                            }
-                            _ => {}
+                    |event| match event {
+                        ApiEvent::ToolUse { .. } => tool_use_seen = true,
+                        ApiEvent::MessageDelta { text } if text.contains("completed") => {
+                            response_seen = true
                         }
+                        _ => {}
                     },
                     &|_id, name, _input| {
                         assert_eq!(name, "shell");
@@ -4092,7 +4207,10 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
                     matches!(b, ContentBlock::ToolResult { is_error: false, content, .. } if content.contains("approved"))
                 })
         });
-        assert!(has_tool_result, "Tool result should be persisted in session");
+        assert!(
+            has_tool_result,
+            "Tool result should be persisted in session"
+        );
     }
 
     #[test]
@@ -4143,7 +4261,10 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
                 .await
         });
 
-        assert!(response_seen, "Final response delta should still be emitted");
+        assert!(
+            response_seen,
+            "Final response delta should still be emitted"
+        );
 
         let has_denied_error = session.messages.iter().any(|m| {
             m.role == Role::Tool
@@ -4155,7 +4276,10 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
                     )
                 })
         });
-        assert!(has_denied_error, "Denied error should be persisted in session");
+        assert!(
+            has_denied_error,
+            "Denied error should be persisted in session"
+        );
         assert!(session.messages.iter().any(|m| m.role == Role::User));
     }
 
@@ -4199,9 +4323,18 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
 
         let role_sequence: Vec<_> = session.messages.iter().map(|m| m.role).collect();
 
-        assert!(role_sequence.contains(&Role::User), "Should have user message");
-        assert!(role_sequence.contains(&Role::Assistant), "Should have assistant message");
-        assert!(role_sequence.contains(&Role::Tool), "Should have tool result message");
+        assert!(
+            role_sequence.contains(&Role::User),
+            "Should have user message"
+        );
+        assert!(
+            role_sequence.contains(&Role::Assistant),
+            "Should have assistant message"
+        );
+        assert!(
+            role_sequence.contains(&Role::Tool),
+            "Should have tool result message"
+        );
 
         let session_json = serde_json::to_string(&session).unwrap();
         let reparsed: Session = serde_json::from_str(&session_json).unwrap();

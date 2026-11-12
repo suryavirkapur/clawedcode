@@ -10,11 +10,7 @@ use crate::{
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::Mutex,
-};
+use std::{collections::HashMap, path::PathBuf, sync::Mutex};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -301,10 +297,11 @@ pub fn drain_completed_subagent_tasks_for_parent(
             task.surfaced = true;
             drained.push(CompletedSubAgentTask {
                 child_session_id: task.child_session_id,
-                summary: task
-                    .summary
-                    .clone()
-                    .unwrap_or_else(|| task.error.clone().unwrap_or_else(|| "Sub-agent finished".to_string())),
+                summary: task.summary.clone().unwrap_or_else(|| {
+                    task.error
+                        .clone()
+                        .unwrap_or_else(|| "Sub-agent finished".to_string())
+                }),
                 tools_executed: task.tools_executed,
                 status: task.status.clone(),
             });
@@ -355,7 +352,13 @@ mod tests {
         fs::create_dir_all(&sessions_dir).unwrap();
         let cwd = PathBuf::from("/tmp");
         (
-            SubAgentRuntime::new(config, system_prompt, compatibility, sessions_dir.clone(), cwd),
+            SubAgentRuntime::new(
+                config,
+                system_prompt,
+                compatibility,
+                sessions_dir.clone(),
+                cwd,
+            ),
             sessions_dir,
         )
     }
@@ -411,7 +414,11 @@ mod tests {
             )
             .unwrap();
 
-        assert!(parent_session.child_sessions.contains(&result.child_session_id));
+        assert!(
+            parent_session
+                .child_sessions
+                .contains(&result.child_session_id)
+        );
         assert!(parent_session.messages.iter().any(|message| {
             message
                 .content_blocks
@@ -465,14 +472,18 @@ mod tests {
 
         let child_session = Session::load(&sessions_dir, result.child_session_id).unwrap();
         assert!(child_session.parent_session_id == Some(parent_session.id));
-        assert!(child_session
-            .messages
-            .iter()
-            .any(|message| message.primary_text() == Some("Parent context")));
-        assert!(child_session
-            .messages
-            .iter()
-            .any(|message| message.primary_text() == Some("Parent reply")));
+        assert!(
+            child_session
+                .messages
+                .iter()
+                .any(|message| message.primary_text() == Some("Parent context"))
+        );
+        assert!(
+            child_session
+                .messages
+                .iter()
+                .any(|message| message.primary_text() == Some("Parent reply"))
+        );
         assert_eq!(
             child_session.last_user_text(),
             Some("Continue from the inherited context")
@@ -498,7 +509,11 @@ mod tests {
             )
             .unwrap();
 
-        assert!(parent_session.child_sessions.contains(&result.child_session_id));
+        assert!(
+            parent_session
+                .child_sessions
+                .contains(&result.child_session_id)
+        );
         assert!(!parent_session.messages.iter().any(|message| {
             message
                 .content_blocks
@@ -542,8 +557,16 @@ mod tests {
             .unwrap();
 
         let tasks = list_subagent_tasks_for_parent(parent_session.id);
-        assert!(tasks.iter().any(|item| item.child_session_id == task.child_session_id));
-        assert!(parent_session.child_sessions.contains(&task.child_session_id));
+        assert!(
+            tasks
+                .iter()
+                .any(|item| item.child_session_id == task.child_session_id)
+        );
+        assert!(
+            parent_session
+                .child_sessions
+                .contains(&task.child_session_id)
+        );
 
         fs::remove_dir_all(&sessions_dir).ok();
     }
@@ -573,7 +596,10 @@ mod tests {
             }) {
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "background task timed out");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background task timed out"
+            );
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
 

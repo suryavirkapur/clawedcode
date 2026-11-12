@@ -478,9 +478,10 @@ mod tests {
         assert_eq!(task.session_id, "session-a");
         assert_eq!(task.status, TaskStatus::Running);
         assert!(task.is_backgrounded);
-        assert!(task
-            .output_file_path
-            .starts_with(task_output_dir_for_session(&dir, "session-a")));
+        assert!(
+            task.output_file_path
+                .starts_with(task_output_dir_for_session(&dir, "session-a"))
+        );
 
         let retrieved = registry.get_task(&task.id).unwrap();
         assert_eq!(retrieved.id, task.id);

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clawedcode_mcp::{discover_mcp_servers as parse_settings_mcp_servers, McpServerConfig};
+use clawedcode_mcp::{McpServerConfig, discover_mcp_servers as parse_settings_mcp_servers};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{
@@ -894,10 +894,12 @@ Some more content here.
             let snapshot = discover(&project).unwrap();
             unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
 
-            assert!(snapshot
-                .settings_files
-                .iter()
-                .any(|p| p.ends_with("settings.json")));
+            assert!(
+                snapshot
+                    .settings_files
+                    .iter()
+                    .any(|p| p.ends_with("settings.json"))
+            );
             assert!(snapshot.mcp_servers.contains_key("settings-server"));
             assert!(snapshot.mcp_servers.contains_key("project-server"));
             assert!(snapshot.skills.iter().any(|s| s.name == "Test Skill"));

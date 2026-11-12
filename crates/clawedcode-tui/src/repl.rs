@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clawedcode_api::ApiEvent;
-use clawedcode_core::background_task::{list_background_tasks, TaskStatus as ShellTaskStatus};
+use clawedcode_core::background_task::{TaskStatus as ShellTaskStatus, list_background_tasks};
 use clawedcode_core::compat::SkillDescriptor;
 use clawedcode_core::content::ContentBlock;
 use clawedcode_core::interactive::{ApprovalRequest, TuiContext, TuiEvent, TuiHandler};
@@ -13,7 +13,7 @@ use clawedcode_core::session::{
     transport_session_id_marker,
 };
 use clawedcode_core::subagent::{
-    list_subagent_tasks_for_parent, SubAgentTaskState, SubAgentTaskStatus,
+    SubAgentTaskState, SubAgentTaskStatus, list_subagent_tasks_for_parent,
 };
 use clawedcode_core::tool_input::decode_tool_input;
 use clawedcode_core::update::InstallMethod;
@@ -21,31 +21,69 @@ use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{
-        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
+        EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
     },
 };
 use ratatui::{
+    DefaultTerminal,
     prelude::*,
     widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
-    DefaultTerminal,
 };
 use std::{
     cmp::Reverse,
-    env,
-    fs,
+    env, fs,
     io::{self, stdout},
     path::{Path, PathBuf},
     process::Command,
-    sync::{mpsc, Arc, Mutex},
+    sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-const ACCENT: Color = Color::Rgb(224, 122, 95);
+const ACCENT: Color = Color::Rgb(215, 119, 87);
 const MUTED: Color = Color::Rgb(150, 150, 150);
-const DASHBOARD_HEIGHT: u16 = 13;
-const TOOL_LINE_INDENT: &str = "  ";
+const DIM: Color = Color::Rgb(110, 110, 110);
+const SUBTLE: Color = Color::Rgb(75, 75, 75);
+const ERR_FG: Color = Color::Rgb(220, 80, 80);
+const WARN_FG: Color = Color::Rgb(210, 170, 60);
+const OK_FG: Color = Color::Rgb(120, 180, 90);
+const DASHBOARD_HEIGHT: u16 = 16;
+const BULLET: &str = "⏺";
+const HOOK_PREFIX: &str = "  ⎿  ";
+const HOOK_CONTINUATION: &str = "     ";
 const MAX_VISIBLE_QUEUED_PROMPTS: usize = 3;
+const SPINNER_FRAME_MS: u128 = 120;
+const SPINNER_VERB_MS: u128 = 2_500;
+
+const SPINNER_FRAMES: &[char] = &['✶', '✻', '✽', '✳', '✢', '✷'];
+const SPINNER_VERBS: &[&str] = &[
+    "Thinking",
+    "Pondering",
+    "Cogitating",
+    "Computing",
+    "Deliberating",
+    "Reasoning",
+    "Percolating",
+    "Musing",
+    "Noodling",
+    "Ruminating",
+    "Simmering",
+    "Brewing",
+    "Crafting",
+    "Forming",
+    "Hatching",
+    "Marinating",
+    "Scheming",
+    "Synthesizing",
+    "Vibing",
+    "Whisking",
+    "Booping",
+    "Beaming",
+    "Accomplishing",
+    "Manifesting",
+];
+
+const CLAUDE_LOGO: &[&str] = &[" ▐▛███▜▌ ", "▝▜█████▛▘", "  ▘▘ ▝▝  "];
 
 const BUILTIN_COMMANDS: &[&str] = &[
     "/help",
@@ -162,32 +200,6 @@ struct InfoPanel {
 }
 
 #[derive(Debug, Clone)]
-struct BottomChromeState {
-    left: String,
-    right: Option<String>,
-    hint: String,
-    prompt_prefix: String,
-}
-
-impl BottomChromeState {
-    fn status_left(&self) -> &str {
-        &self.left
-    }
-
-    fn status_right(&self) -> Option<&str> {
-        self.right.as_deref()
-    }
-
-    fn hint(&self) -> &str {
-        &self.hint
-    }
-
-    fn prompt_prefix(&self) -> &str {
-        &self.prompt_prefix
-    }
-}
-
-#[derive(Debug, Clone)]
 enum RenderRow {
     User(String),
     Assistant(String),
@@ -244,14 +256,8 @@ impl ReplHandler {
         }
     }
 
-    fn toggle_tool_result(&mut self, tool_use_id: &str) {
-        if !self.expanded_tool_results.remove(tool_use_id) {
-            self.expanded_tool_results.insert(tool_use_id.to_string());
-        }
-    }
-
     fn expand_all_tool_results(&mut self) {
-        for row in &self.transcript_rows {
+        for row in self.visible_rows() {
             if let RenderRow::ToolResult { tool_use_id, .. } = row {
                 self.expanded_tool_results.insert(tool_use_id.clone());
             }
@@ -327,8 +333,9 @@ impl ReplHandler {
 
     fn live_rows(&self) -> Vec<RenderRow> {
         let mut rows = Vec::new();
-        let turn_is_open =
-            self.live_user_prompt.is_some() || !self.live_assistant_text.trim().is_empty() || !self.live_tools.is_empty();
+        let turn_is_open = self.live_user_prompt.is_some()
+            || !self.live_assistant_text.trim().is_empty()
+            || !self.live_tools.is_empty();
 
         if let Some(prompt) = &self.live_user_prompt {
             rows.push(RenderRow::User(prompt.clone()));
@@ -344,9 +351,7 @@ impl ReplHandler {
 
         if turn_is_open {
             let assistant = self.live_assistant_text.trim();
-            if assistant.is_empty() {
-                rows.push(RenderRow::Assistant(String::new()));
-            } else {
+            if !assistant.is_empty() {
                 rows.push(RenderRow::Assistant(assistant.to_string()));
             }
         }
@@ -383,19 +388,16 @@ impl ReplHandler {
     }
 
     fn record_live_tool_approval_decision(&mut self, tool_use_id: &str, approved: bool) {
-        self.live_tool_entry_mut(tool_use_id).events.push(if approved {
-            LiveToolEventState::Approved
-        } else {
-            LiveToolEventState::Denied
-        });
+        self.live_tool_entry_mut(tool_use_id)
+            .events
+            .push(if approved {
+                LiveToolEventState::Approved
+            } else {
+                LiveToolEventState::Denied
+            });
     }
 
-    fn record_live_tool_result(
-        &mut self,
-        tool_use_id: &str,
-        content: String,
-        is_error: bool,
-    ) {
+    fn record_live_tool_result(&mut self, tool_use_id: &str, content: String, is_error: bool) {
         self.live_tool_entry_mut(tool_use_id)
             .events
             .push(LiveToolEventState::Result { content, is_error });
@@ -433,22 +435,13 @@ fn render_live_tool_entry(entry: &LiveToolEntry) -> Vec<RenderRow> {
                 });
             }
             LiveToolEventState::PendingApproval => {
-                rows.push(RenderRow::ToolStatus(format!(
-                    "{TOOL_LINE_INDENT}[tool_pending] {} awaiting approval",
-                    entry.tool_use_id
-                )));
+                rows.push(RenderRow::ToolStatus("Awaiting approval…".to_string()));
             }
             LiveToolEventState::Approved => {
-                rows.push(RenderRow::ToolStatus(format!(
-                    "{TOOL_LINE_INDENT}[tool_approved] {} approved",
-                    entry.tool_use_id
-                )));
+                rows.push(RenderRow::ToolStatus("Approved".to_string()));
             }
             LiveToolEventState::Denied => {
-                rows.push(RenderRow::ToolStatus(format!(
-                    "{TOOL_LINE_INDENT}[tool_denied] {} denied",
-                    entry.tool_use_id
-                )));
+                rows.push(RenderRow::ToolStatus("Denied by user".to_string()));
             }
             LiveToolEventState::Result { content, is_error } => {
                 rows.push(RenderRow::ToolResult {
@@ -553,21 +546,55 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     let mut transcript_mode = TranscriptModeState::default();
     let mut queued_prompts: Vec<String> = Vec::new();
     let mut awaiting_approval: Option<ApprovalRequest> = None;
+    let mut approval_selection: usize = 0;
     let mut active_turn: Option<ActiveTurn> = None;
     let mut info_panel_scroll: usize = 0;
     let mut last_area = Rect::default();
+    let mut last_body_height: usize = 0;
     let mut onboarding_seen_recorded = false;
     let mut last_visible_line_count = handler.visible_lines().len();
+    let mut turn_started_at: Option<std::time::Instant> = None;
+    let mut palette_index: usize = 0;
+    let mut palette_touched = false;
+    let mut history: Vec<String> = Vec::new();
+    let mut history_index: Option<usize> = None;
+    let mut history_stash = String::new();
+    let mut last_approval_id: Option<String> = None;
+    let always_allowed: Arc<Mutex<std::collections::HashSet<String>>> =
+        Arc::new(Mutex::new(std::collections::HashSet::new()));
 
     if let Some(prompt) = ctx.take_startup_prompt() {
         handler.begin_live_turn(prompt.clone());
-        active_turn = Some(spawn_turn_worker(ctx, prompt, None));
+        turn_started_at = Some(std::time::Instant::now());
+        active_turn = Some(spawn_turn_worker(ctx, prompt, None, always_allowed.clone()));
     }
 
     loop {
         integrate_completed_subagents(ctx, &mut handler);
         drain_turn_events(ctx, &mut handler, &mut active_turn, &mut awaiting_approval);
-        maybe_submit_queued_prompt(ctx, &mut handler, &mut active_turn, &mut queued_prompts)?;
+        maybe_submit_queued_prompt(
+            ctx,
+            &mut handler,
+            &mut active_turn,
+            &mut queued_prompts,
+            &always_allowed,
+        )?;
+
+        // Track spinner timing and reset the approval cursor on each new request.
+        match active_turn.is_some() {
+            true if turn_started_at.is_none() => {
+                turn_started_at = Some(std::time::Instant::now());
+            }
+            false => turn_started_at = None,
+            _ => {}
+        }
+        let pending_approval_id = awaiting_approval
+            .as_ref()
+            .map(|request| request.tool_use_id.clone());
+        if pending_approval_id != last_approval_id {
+            last_approval_id = pending_approval_id;
+            approval_selection = 0;
+        }
 
         if ctx.session().messages.is_empty() && !onboarding_seen_recorded {
             if should_show_project_onboarding(&ctx.session().cwd) {
@@ -589,110 +616,93 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
         terminal.draw(|frame| {
             let area = frame.area();
             last_area = area;
-            let chrome = footer_chrome(
-                ctx,
-                &input_buffer,
-                active_turn.is_some(),
-                awaiting_approval.as_ref(),
-                queued_prompts.len(),
-                handler.info_panel.as_ref(),
-                &viewport,
-            );
 
             if screen == ReplScreen::Transcript {
                 render_transcript_screen(frame, area, &transcript_mode);
                 return;
             }
 
-            let queued_preview_lines = queued_prompt_preview_lines(&queued_prompts);
-            let queued_height = if queued_preview_lines.is_empty() {
+            let command_entries = filtered_command_entries(ctx, &input_buffer);
+            let palette_height = command_palette_height(&command_entries);
+            let approval_height =
+                approval_selector_height(awaiting_approval.as_ref(), approval_selection);
+            let spinner_height = if active_turn.is_some() && awaiting_approval.is_none() {
+                1
+            } else {
+                0
+            };
+            let queued_height = if queued_prompts.is_empty() {
                 0
             } else {
-                queued_preview_lines.len() as u16 + 2
+                (queued_prompts.len().min(MAX_VISIBLE_QUEUED_PROMPTS) + 1) as u16
             };
+            let input_height = input_box_height(&input_buffer, area.width);
 
             let chunks = Layout::vertical([
-                Constraint::Length(1),
                 Constraint::Min(1),
+                Constraint::Length(palette_height),
+                Constraint::Length(approval_height),
                 Constraint::Length(queued_height),
-                Constraint::Length(1),
-                Constraint::Length(1),
+                Constraint::Length(spinner_height),
+                Constraint::Length(input_height),
                 Constraint::Length(1),
             ])
             .split(area);
 
-            let command_entries = filtered_command_entries(ctx, &input_buffer);
-
             if viewport.pinned_to_bottom {
-                viewport.scroll_offset =
-                    max_transcript_scroll(&handler, chunks[1].height as usize);
+                viewport.scroll_offset = max_transcript_scroll(&handler, chunks[0].height as usize);
                 viewport.unseen_count = 0;
             }
-
-            frame.render_widget(
-                Paragraph::new(launch_banner(ctx)).style(Style::default().fg(MUTED)),
-                chunks[0],
-            );
+            last_body_height = chunks[0].height as usize;
 
             render_body(
                 frame,
-                chunks[1],
+                chunks[0],
                 ctx,
                 &handler,
                 &input_buffer,
-                &command_entries,
+                &[],
                 viewport.scroll_offset,
                 viewport.unseen_count,
             );
 
-            if !queued_preview_lines.is_empty() {
-                frame.render_widget(
-                    Paragraph::new(queued_preview_lines)
-                        .block(
-                            Block::default()
-                                .borders(Borders::TOP)
-                                .border_style(Style::default().fg(MUTED)),
-                        )
-                        .wrap(Wrap { trim: false }),
-                    chunks[2],
+            if palette_height > 0 {
+                render_command_palette(
+                    frame,
+                    chunks[1],
+                    &input_buffer,
+                    &command_entries,
+                    palette_index,
                 );
             }
 
-            render_footer_bar(frame, chunks[3], chrome.status_left(), chrome.status_right());
-            frame.render_widget(
-                Paragraph::new(chrome.hint()).style(Style::default().fg(MUTED)),
-                chunks[4],
-            );
-            frame.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(
-                        chrome.prompt_prefix(),
-                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(input_buffer.clone()),
-                ])),
-                chunks[5],
-            );
-
-            if let Some(req) = &awaiting_approval {
-                let modal_text = format!(
-                    "Tool '{}' requires approval.\nInput: {}\n\nPress y to approve, n to deny.",
-                    req.tool_name,
-                    serde_json::to_string_pretty(&req.input).unwrap_or_default()
+            if approval_height > 0 {
+                render_approval_selector(
+                    frame,
+                    chunks[2],
+                    awaiting_approval.as_ref().unwrap(),
+                    approval_selection,
+                    &always_allowed,
                 );
-                let modal_area = centered_rect(60, 40, area);
-                let modal = Paragraph::new(modal_text)
-                    .block(
-                        Block::default()
-                            .title("Tool Approval")
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(ACCENT)),
-                    )
-                    .wrap(Wrap { trim: true })
-                    .alignment(Alignment::Center);
-                frame.render_widget(Clear, modal_area);
-                frame.render_widget(modal, modal_area);
-            } else if let Some(panel) = &handler.info_panel {
+            }
+
+            if queued_height > 0 {
+                frame.render_widget(
+                    Paragraph::new(queued_prompt_preview_lines(&queued_prompts)),
+                    chunks[3],
+                );
+            }
+
+            if spinner_height > 0 {
+                frame.render_widget(Paragraph::new(spinner_line(turn_started_at)), chunks[4]);
+            }
+
+            let cursor = render_input_box(frame, chunks[5], &input_buffer, cursor_pos);
+            frame.set_cursor_position(cursor);
+
+            render_hint_line(frame, chunks[6], ctx, awaiting_approval.is_some());
+
+            if let Some(panel) = &handler.info_panel {
                 let modal_area = centered_rect(72, 72, area);
                 let mut panel_lines = Vec::new();
                 if let Some(status) = &panel.status {
@@ -705,9 +715,10 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 let modal = Paragraph::new(panel_lines.join("\n"))
                     .block(
                         Block::default()
-                            .title(panel.title.as_str())
+                            .title(format!(" {} ", panel.title.as_str()))
                             .borders(Borders::ALL)
-                            .border_style(Style::default().fg(ACCENT)),
+                            .border_type(BorderType::Rounded)
+                            .border_style(Style::default().fg(MUTED)),
                     )
                     .wrap(Wrap { trim: false })
                     .scroll((info_panel_scroll as u16, 0));
@@ -716,19 +727,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
             }
         })?;
 
-        let chunks = Layout::vertical([
-            Constraint::Length(if handler.has_content() { 0 } else { 1 }),
-            Constraint::Min(1),
-            Constraint::Length(if active_turn.is_some() && awaiting_approval.is_none() { 1 } else { 0 }),
-            Constraint::Length(if queued_prompts.is_empty() {
-                0
-            } else {
-                queued_prompt_preview_lines(&queued_prompts).len() as u16 + 1
-            }),
-            Constraint::Length(1),
-            Constraint::Length(2),
-        ])
-        .split(last_area);
+        let transcript_height = last_body_height;
 
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
@@ -737,11 +736,10 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 }
 
                 if screen == ReplScreen::Transcript {
-                    let transcript_height = last_area.height.saturating_sub(if transcript_mode.dump_mode {
-                        0
-                    } else {
-                        2
-                    }) as usize;
+                    let transcript_height = last_area
+                        .height
+                        .saturating_sub(if transcript_mode.dump_mode { 0 } else { 2 })
+                        as usize;
                     let max_scroll = max_scroll_for_lines(
                         transcript_mode.frozen_rows.len(),
                         transcript_height.max(1),
@@ -751,8 +749,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         match key.code {
                             KeyCode::Esc => {
                                 transcript_mode.search_open = false;
-                                transcript_mode.search_input =
-                                    transcript_mode.search_query.clone();
+                                transcript_mode.search_input = transcript_mode.search_query.clone();
                                 continue;
                             }
                             KeyCode::Enter => {
@@ -828,10 +825,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         }
                         KeyCode::PageUp => {
                             let step = transcript_height.saturating_sub(2).max(1);
-                            transcript_mode.viewport.scroll_offset = transcript_mode
-                                .viewport
-                                .scroll_offset
-                                .saturating_sub(step);
+                            transcript_mode.viewport.scroll_offset =
+                                transcript_mode.viewport.scroll_offset.saturating_sub(step);
                             continue;
                         }
                         KeyCode::PageDown => {
@@ -858,23 +853,77 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 }
 
                 if awaiting_approval.is_some() {
+                    const APPROVAL_OPTIONS: usize = 3;
+                    let choose = |choice: usize,
+                                  awaiting_approval: &mut Option<ApprovalRequest>,
+                                  handler: &mut ReplHandler,
+                                  active_turn: &Option<ActiveTurn>,
+                                  always_allowed: &Arc<
+                        Mutex<std::collections::HashSet<String>>,
+                    >| {
+                        if let Some(req) = awaiting_approval.take() {
+                            let approved = choice != 2;
+                            if choice == 1 {
+                                if let Ok(mut set) = always_allowed.lock() {
+                                    set.insert(req.tool_name.clone());
+                                }
+                            }
+                            handler.record_live_tool_approval_decision(&req.tool_use_id, approved);
+                            if let Some(turn) = active_turn {
+                                let _ = turn.approvals.send(approved);
+                            }
+                        }
+                    };
+
                     match key.code {
-                        KeyCode::Char('y') | KeyCode::Char('Y') => {
-                            let req = awaiting_approval.take().expect("approval request");
-                            handler.push_overlay(format!("[info] Approved '{}'", req.tool_name));
-                            handler.record_live_tool_approval_decision(&req.tool_use_id, true);
-                            if let Some(turn) = &active_turn {
-                                let _ = turn.approvals.send(true);
-                            }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            approval_selection = approval_selection.saturating_sub(1);
                         }
-                        KeyCode::Char('n') | KeyCode::Char('N') => {
-                            let req = awaiting_approval.take().expect("approval request");
-                            handler.push_overlay(format!("[info] Denied '{}'", req.tool_name));
-                            handler.record_live_tool_approval_decision(&req.tool_use_id, false);
-                            if let Some(turn) = &active_turn {
-                                let _ = turn.approvals.send(false);
-                            }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            approval_selection = (approval_selection + 1).min(APPROVAL_OPTIONS - 1);
                         }
+                        KeyCode::Char('1') => choose(
+                            0,
+                            &mut awaiting_approval,
+                            &mut handler,
+                            &active_turn,
+                            &always_allowed,
+                        ),
+                        KeyCode::Char('2') => choose(
+                            1,
+                            &mut awaiting_approval,
+                            &mut handler,
+                            &active_turn,
+                            &always_allowed,
+                        ),
+                        KeyCode::Char('3') | KeyCode::Char('n') | KeyCode::Char('N') => choose(
+                            2,
+                            &mut awaiting_approval,
+                            &mut handler,
+                            &active_turn,
+                            &always_allowed,
+                        ),
+                        KeyCode::Char('y') | KeyCode::Char('Y') => choose(
+                            0,
+                            &mut awaiting_approval,
+                            &mut handler,
+                            &active_turn,
+                            &always_allowed,
+                        ),
+                        KeyCode::Enter => choose(
+                            approval_selection,
+                            &mut awaiting_approval,
+                            &mut handler,
+                            &active_turn,
+                            &always_allowed,
+                        ),
+                        KeyCode::Esc => choose(
+                            2,
+                            &mut awaiting_approval,
+                            &mut handler,
+                            &active_turn,
+                            &always_allowed,
+                        ),
                         _ => {}
                     }
                     viewport.pinned_to_bottom = true;
@@ -914,69 +963,148 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                     }
                 }
 
+                let palette_open = !filtered_command_entries(ctx, &input_buffer).is_empty();
+
                 match key.code {
                     KeyCode::Char('o')
                         if key.modifiers.contains(KeyModifiers::CONTROL)
                             && handler.has_content() =>
                     {
                         screen = ReplScreen::Transcript;
-                        transcript_mode =
-                            enter_transcript_mode(&handler, chunks[1].height as usize);
+                        transcript_mode = enter_transcript_mode(&handler, transcript_height);
                         transcript_mode.viewport.scroll_offset = viewport.scroll_offset;
                         transcript_mode.viewport.pinned_to_bottom = false;
                     }
-                    KeyCode::Up if handler.has_content() && input_buffer.is_empty() => {
-                        viewport.scroll_offset = viewport.scroll_offset.saturating_sub(1);
-                        viewport.pinned_to_bottom = viewport.scroll_offset
-                            >= max_transcript_scroll(&handler, chunks[1].height as usize);
+                    KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if handler.expanded_tool_results.is_empty() {
+                            handler.expand_all_tool_results();
+                        } else {
+                            handler.collapse_all_tool_results();
+                        }
                     }
-                    KeyCode::Down if handler.has_content() && input_buffer.is_empty() => {
-                        let max_scroll = max_transcript_scroll(&handler, chunks[1].height as usize);
+                    KeyCode::BackTab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        ctx.cycle_permission_mode();
+                        handler.push_overlay(format!(
+                            "[info] {} (shift+tab to cycle)",
+                            permission_mode_label(ctx.permission_mode())
+                        ));
+                        handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
+                    }
+                    KeyCode::Up if palette_open => {
+                        palette_touched = true;
+                        palette_index = palette_index.saturating_sub(1);
+                    }
+                    KeyCode::Down if palette_open => {
+                        palette_touched = true;
+                        let len = filtered_command_entries(ctx, &input_buffer).len().min(8);
+                        palette_index = (palette_index + 1).min(len.saturating_sub(1));
+                    }
+                    KeyCode::Tab if palette_open => {
+                        let entries = filtered_command_entries(ctx, &input_buffer);
+                        if let Some(entry) = entries.get(palette_index.min(entries.len() - 1)) {
+                            input_buffer = format!("{} ", entry.name);
+                            cursor_pos = input_buffer.len();
+                            palette_index = 0;
+                            palette_touched = false;
+                        }
+                    }
+                    KeyCode::Up if history_index.is_some() || !history.is_empty() => {
+                        if history_index.is_none() {
+                            history_stash = input_buffer.clone();
+                            history_index = Some(history.len() - 1);
+                        } else if let Some(index) = history_index {
+                            if index > 0 {
+                                history_index = Some(index - 1);
+                            }
+                        }
+                        if let Some(index) = history_index {
+                            if let Some(entry) = history.get(index) {
+                                input_buffer = entry.clone();
+                                cursor_pos = input_buffer.len();
+                            }
+                        }
+                    }
+                    KeyCode::Down if history_index.is_some() => {
+                        let index = history_index.unwrap();
+                        if index + 1 < history.len() {
+                            history_index = Some(index + 1);
+                            input_buffer = history[index + 1].clone();
+                        } else {
+                            history_index = None;
+                            input_buffer = history_stash.clone();
+                        }
+                        cursor_pos = input_buffer.len();
+                    }
+                    KeyCode::PageUp if handler.has_content() => {
+                        let step = transcript_height.saturating_sub(2).max(1);
+                        viewport.scroll_offset = viewport.scroll_offset.saturating_sub(step);
+                        viewport.pinned_to_bottom = false;
+                    }
+                    KeyCode::PageDown if handler.has_content() => {
+                        let max_scroll = max_transcript_scroll(&handler, transcript_height);
+                        let step = transcript_height.saturating_sub(2).max(1);
                         viewport.scroll_offset =
-                            viewport.scroll_offset.saturating_add(1).min(max_scroll);
+                            viewport.scroll_offset.saturating_add(step).min(max_scroll);
                         viewport.pinned_to_bottom = viewport.scroll_offset >= max_scroll;
                         if viewport.pinned_to_bottom {
                             viewport.unseen_count = 0;
                         }
                     }
-                    KeyCode::PageUp if handler.has_content() && input_buffer.is_empty() => {
-                        let step = chunks[1].height.saturating_sub(2) as usize;
-                        viewport.scroll_offset = viewport.scroll_offset.saturating_sub(step.max(1));
-                        viewport.pinned_to_bottom = false;
-                    }
-                    KeyCode::PageDown if handler.has_content() && input_buffer.is_empty() => {
-                        let max_scroll = max_transcript_scroll(&handler, chunks[1].height as usize);
-                        let step = chunks[1].height.saturating_sub(2) as usize;
-                        viewport.scroll_offset = viewport
-                            .scroll_offset
-                            .saturating_add(step.max(1))
-                            .min(max_scroll);
-                        viewport.pinned_to_bottom = viewport.scroll_offset >= max_scroll;
-                        if viewport.pinned_to_bottom {
-                            viewport.unseen_count = 0;
+                    KeyCode::Esc => {
+                        if active_turn.is_some() {
+                            interrupt_active_turn(
+                                ctx,
+                                &mut handler,
+                                &mut active_turn,
+                                &mut awaiting_approval,
+                                &mut queued_prompts,
+                            );
+                            turn_started_at = None;
+                        } else if !input_buffer.is_empty() {
+                            input_buffer.clear();
+                            cursor_pos = 0;
+                            history_index = None;
                         }
-                    }
-                    KeyCode::Home if handler.has_content() && input_buffer.is_empty() => {
-                        viewport.scroll_offset = 0;
-                        viewport.pinned_to_bottom = false;
-                    }
-                    KeyCode::End if handler.has_content() && input_buffer.is_empty() => {
-                        viewport.scroll_offset =
-                            max_transcript_scroll(&handler, chunks[1].height as usize);
-                        viewport.pinned_to_bottom = true;
-                        viewport.unseen_count = 0;
-                    }
-                    KeyCode::Char('e') if input_buffer.is_empty() => {
-                        handler.expand_all_tool_results();
-                    }
-                    KeyCode::Char('c') if input_buffer.is_empty() => {
-                        handler.collapse_all_tool_results();
                     }
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         break;
                     }
-                    KeyCode::Char('q') => {
+                    KeyCode::Char('d')
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && input_buffer.is_empty() =>
+                    {
                         break;
+                    }
+                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        input_buffer.drain(..cursor_pos);
+                        cursor_pos = 0;
+                    }
+                    KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        let before = input_buffer[..cursor_pos].trim_end();
+                        let new_len = before
+                            .rfind(char::is_whitespace)
+                            .map(|i| i + 1)
+                            .unwrap_or(0);
+                        input_buffer.drain(new_len..cursor_pos);
+                        cursor_pos = new_len;
+                    }
+                    KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        cursor_pos = input_buffer
+                            .find('\n')
+                            .filter(|line_start| *line_start >= cursor_pos)
+                            .map(|line_start| {
+                                input_buffer[..line_start]
+                                    .rfind('\n')
+                                    .map(|prev| prev + 1)
+                                    .unwrap_or(0)
+                            })
+                            .unwrap_or(0);
+                    }
+                    KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        cursor_pos = input_buffer[cursor_pos..]
+                            .find('\n')
+                            .map(|offset| cursor_pos + offset)
+                            .unwrap_or(input_buffer.len());
                     }
                     KeyCode::Char('?') if input_buffer.is_empty() => {
                         let panel = help_panel(ctx);
@@ -984,32 +1112,79 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         info_panel_scroll = 0;
                     }
                     KeyCode::Enter => {
-                        if !input_buffer.trim().is_empty() {
+                        let ends_with_backslash =
+                            input_buffer.trim_end_matches('\n').ends_with('\\');
+                        if key.modifiers.contains(KeyModifiers::ALT) || ends_with_backslash {
+                            if ends_with_backslash {
+                                let trim_at = input_buffer
+                                    .rfind('\\')
+                                    .expect("checked ends_with_backslash");
+                                input_buffer.remove(trim_at);
+                                if cursor_pos > trim_at {
+                                    cursor_pos = trim_at;
+                                }
+                            }
+                            input_buffer.insert(cursor_pos, '\n');
+                            cursor_pos += 1;
+                        } else if palette_open && palette_touched {
+                            let entries = filtered_command_entries(ctx, &input_buffer);
+                            if let Some(entry) =
+                                entries.get(palette_index.min(entries.len().saturating_sub(1)))
+                            {
+                                input_buffer = entry.name.clone();
+                                cursor_pos = input_buffer.len();
+                            }
+                            let prompt = input_buffer.trim().to_string();
+                            if !prompt.is_empty() {
+                                input_buffer.clear();
+                                cursor_pos = 0;
+                                if handle_slash_command(
+                                    ctx,
+                                    &mut handler,
+                                    &prompt,
+                                    &mut active_turn,
+                                    &always_allowed,
+                                )? {
+                                    handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
+                                }
+                            }
+                        } else if !input_buffer.trim().is_empty() {
                             let prompt = input_buffer.trim().to_string();
                             input_buffer.clear();
                             cursor_pos = 0;
+                            palette_index = 0;
+                            palette_touched = false;
+                            history_index = None;
+
+                            if history.last().map(|h| h.as_str()) != Some(prompt.as_str()) {
+                                history.push(prompt.clone());
+                            }
 
                             if active_turn.is_some() {
                                 queued_prompts.push(prompt);
-                            } else if handle_slash_command(ctx, &mut handler, &prompt, &mut active_turn)? {
+                            } else if handle_slash_command(
+                                ctx,
+                                &mut handler,
+                                &prompt,
+                                &mut active_turn,
+                                &always_allowed,
+                            )? {
                                 handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
                             } else {
                                 handler.begin_live_turn(prompt.clone());
-                                active_turn = Some(spawn_turn_worker(ctx, prompt, None));
-                            }
-                        } else {
-                            // Toggle the most recent tool result
-                            let visible = handler.visible_rows();
-                            if let Some(last_tool) = visible.iter().rev().find_map(|row| {
-                                if let RenderRow::ToolResult { tool_use_id, .. } = row {
-                                    Some(tool_use_id.clone())
-                                } else {
-                                    None
-                                }
-                            }) {
-                                handler.toggle_tool_result(&last_tool);
+                                turn_started_at = Some(std::time::Instant::now());
+                                active_turn = Some(spawn_turn_worker(
+                                    ctx,
+                                    prompt,
+                                    None,
+                                    always_allowed.clone(),
+                                ));
                             }
                         }
+                    }
+                    KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        input_buffer.insert(cursor_pos, '\n');
+                        cursor_pos += 1;
                     }
                     KeyCode::Backspace => {
                         if cursor_pos > 0 {
@@ -1024,21 +1199,56 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                     }
                     KeyCode::Left => {
                         if cursor_pos > 0 {
-                            cursor_pos -= 1;
+                            cursor_pos = input_buffer[..cursor_pos]
+                                .char_indices()
+                                .last()
+                                .map(|(i, _)| i)
+                                .unwrap_or(0);
                         }
                     }
                     KeyCode::Right => {
                         if cursor_pos < input_buffer.len() {
-                            cursor_pos += 1;
+                            cursor_pos += input_buffer[cursor_pos..]
+                                .chars()
+                                .next()
+                                .map(|c| c.len_utf8())
+                                .unwrap_or(0);
                         }
                     }
-                    KeyCode::Home => cursor_pos = 0,
-                    KeyCode::End => cursor_pos = input_buffer.len(),
+                    KeyCode::Home => {
+                        if input_buffer.is_empty() && handler.has_content() {
+                            viewport.scroll_offset = 0;
+                            viewport.pinned_to_bottom = false;
+                        } else {
+                            cursor_pos = 0;
+                        }
+                    }
+                    KeyCode::End => {
+                        if input_buffer.is_empty() && handler.has_content() {
+                            viewport.scroll_offset =
+                                max_transcript_scroll(&handler, transcript_height);
+                            viewport.pinned_to_bottom = true;
+                            viewport.unseen_count = 0;
+                        } else {
+                            cursor_pos = input_buffer.len();
+                        }
+                    }
                     KeyCode::Char(c) => {
                         input_buffer.insert(cursor_pos, c);
-                        cursor_pos += 1;
+                        cursor_pos += c.len_utf8();
+                        history_index = None;
                     }
                     _ => {}
+                }
+
+                if !input_buffer.trim_start().starts_with('/') {
+                    palette_index = 0;
+                    palette_touched = false;
+                } else {
+                    let len = filtered_command_entries(ctx, &input_buffer).len().min(8);
+                    if palette_index >= len {
+                        palette_index = len.saturating_sub(1);
+                    }
                 }
             }
         }
@@ -1057,8 +1267,9 @@ fn render_body(
     scroll_offset: usize,
     unseen_count: usize,
 ) {
+    let _ = command_entries;
     if handler.has_content() {
-        render_conversation(frame, area, handler, command_entries, scroll_offset, unseen_count);
+        render_conversation(frame, area, handler, scroll_offset, unseen_count);
     } else {
         render_dashboard(frame, area, ctx, input_buffer, command_entries);
     }
@@ -1068,50 +1279,14 @@ fn render_conversation(
     frame: &mut Frame,
     area: Rect,
     handler: &ReplHandler,
-    command_entries: &[CommandEntry],
     scroll_offset: usize,
     unseen_count: usize,
 ) {
     let has_unseen = unseen_count > 0;
     let divider_height = if has_unseen { 1 } else { 0 };
 
-    if command_entries.is_empty() {
-        let chunks = Layout::vertical([
-            Constraint::Min(1),
-            Constraint::Length(divider_height),
-        ])
-        .split(area);
-
-        let transcript = Paragraph::new(render_rows(
-            &handler.visible_rows(),
-            None,
-            &[],
-            &handler.expanded_tool_results,
-        ))
-        .wrap(Wrap { trim: false })
-        .scroll((scroll_offset as u16, 0));
-        frame.render_widget(transcript, chunks[0]);
-
-        if has_unseen {
-            let divider = format!("─── {} new message{} ───", unseen_count, if unseen_count == 1 { "" } else { "s" });
-            let remaining_width = chunks[1].width.saturating_sub(divider.chars().count() as u16);
-            let left = remaining_width / 2;
-            let right = remaining_width.saturating_sub(left);
-            let line = format!("{} {} {}", "─".repeat(left as usize), divider, "─".repeat(right as usize));
-            frame.render_widget(
-                Paragraph::new(line).style(Style::default().fg(MUTED)),
-                chunks[1],
-            );
-        }
-        return;
-    }
-
-    let chunks = Layout::vertical([
-        Constraint::Min(1),
-        Constraint::Length(divider_height),
-        Constraint::Length(command_palette_height(command_entries)),
-    ])
-    .split(area);
+    let chunks =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(divider_height)]).split(area);
 
     let transcript = Paragraph::new(render_rows(
         &handler.visible_rows(),
@@ -1121,22 +1296,30 @@ fn render_conversation(
     ))
     .wrap(Wrap { trim: false })
     .scroll((scroll_offset as u16, 0));
-
     frame.render_widget(transcript, chunks[0]);
 
     if has_unseen {
-        let divider = format!("─── {} new message{} ───", unseen_count, if unseen_count == 1 { "" } else { "s" });
-        let remaining_width = chunks[1].width.saturating_sub(divider.chars().count() as u16);
+        let divider = format!(
+            "─── {} new message{} ───",
+            unseen_count,
+            if unseen_count == 1 { "" } else { "s" }
+        );
+        let remaining_width = chunks[1]
+            .width
+            .saturating_sub(divider.chars().count() as u16);
         let left = remaining_width / 2;
         let right = remaining_width.saturating_sub(left);
-        let line = format!("{} {} {}", "─".repeat(left as usize), divider, "─".repeat(right as usize));
+        let line = format!(
+            "{} {} {}",
+            "─".repeat(left as usize),
+            divider,
+            "─".repeat(right as usize)
+        );
         frame.render_widget(
             Paragraph::new(line).style(Style::default().fg(MUTED)),
             chunks[1],
         );
     }
-
-    render_command_palette(frame, chunks[if has_unseen { 2 } else { 1 }], "", command_entries);
 }
 
 fn render_dashboard(
@@ -1157,41 +1340,48 @@ fn render_dashboard(
         .split(area)
     };
 
-    let panel = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(ACCENT))
-        .title(Line::from(vec![
-            Span::styled(
-                " ClawedCode ",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("v{} ", env!("CARGO_PKG_VERSION")),
-                Style::default().fg(MUTED),
-            ),
+    frame.render_widget(
+        Paragraph::new(welcome_lines(ctx)).wrap(Wrap { trim: false }),
+        chunks[0],
+    );
+
+    let _ = (input_buffer, command_entries);
+}
+
+/// Claude Code-style welcome block: logo on the left, product metadata
+/// on the right, then tips/onboarding and recent activity.
+fn welcome_lines(ctx: &TuiContext) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let logo_width = CLAUDE_LOGO
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0);
+
+    let meta = [
+        format!("ClawedCode v{}", env!("CARGO_PKG_VERSION")),
+        format!("{} · {}", ctx.model_name(), provider_label()),
+        display_path(&ctx.session().cwd),
+    ];
+
+    for (index, logo) in CLAUDE_LOGO.iter().enumerate() {
+        let padding = " ".repeat(logo_width - logo.chars().count() + 3);
+        let meta_text = meta.get(index).cloned().unwrap_or_default();
+        let meta_style = if index == 0 {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(MUTED)
+        };
+        lines.push(Line::from(vec![
+            Span::styled((*logo).to_string(), Style::default().fg(ACCENT)),
+            Span::raw(padding),
+            Span::styled(meta_text, meta_style),
         ]));
-    let inner = panel.inner(chunks[0]);
-    frame.render_widget(panel, chunks[0]);
-
-    let body_chunks =
-        Layout::horizontal([Constraint::Length(32), Constraint::Min(24)]).split(inner);
-
-    let left = Paragraph::new(welcome_left_lines(ctx))
-        .alignment(Alignment::Center)
-        .block(
-            Block::default()
-                .borders(Borders::RIGHT)
-                .border_style(Style::default().fg(ACCENT)),
-        );
-    let right = Paragraph::new(welcome_right_lines(ctx)).wrap(Wrap { trim: false });
-
-    frame.render_widget(left, body_chunks[0]);
-    frame.render_widget(right, body_chunks[1]);
-
-    if !command_entries.is_empty() && chunks.len() > 1 {
-        render_command_palette(frame, chunks[1], input_buffer, command_entries);
     }
+
+    lines.push(Line::from(""));
+    lines.extend(welcome_right_lines(ctx));
+    lines
 }
 
 fn render_transcript_screen(frame: &mut Frame, area: Rect, state: &TranscriptModeState) {
@@ -1211,12 +1401,11 @@ fn render_transcript_screen(frame: &mut Frame, area: Rect, state: &TranscriptMod
     ])
     .split(area);
 
-    let transcript = transcript
-        .block(
-            Block::default()
-                .borders(Borders::BOTTOM)
-                .border_style(Style::default().fg(MUTED)),
-        );
+    let transcript = transcript.block(
+        Block::default()
+            .borders(Borders::BOTTOM)
+            .border_style(Style::default().fg(MUTED)),
+    );
     frame.render_widget(transcript, chunks[0]);
 
     render_transcript_footer(frame, chunks[1], state);
@@ -1237,54 +1426,317 @@ fn render_command_palette(
     area: Rect,
     input_buffer: &str,
     entries: &[CommandEntry],
+    selected: usize,
 ) {
-    let title = if input_buffer.trim() == "/" {
-        " Commands "
-    } else {
-        " Command matches "
-    };
+    let _ = input_buffer;
+    let mut lines = vec![Line::from("")];
 
-    let mut lines = vec![Line::from(vec![
-        Span::styled(title, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-        Span::styled(
-            format!(" · {}", entries.len().min(6)),
-            Style::default().fg(MUTED),
-        ),
-    ])];
-
-    lines.extend(entries.iter().take(6).map(|entry| {
+    lines.extend(entries.iter().take(8).enumerate().map(|(index, entry)| {
+        let is_selected = index == selected;
+        let (marker, name_style) = if is_selected {
+            (
+                "❯ ",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            ("  ", Style::default().add_modifier(Modifier::BOLD))
+        };
         let (badge, badge_color) = command_source_badge(entry.source);
         Line::from(vec![
-            Span::styled(
-                format!("{:<11}", badge),
-                Style::default().fg(badge_color).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                format!("{:<16}", entry.name),
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(entry.description.clone(), Style::default().fg(MUTED)),
+            Span::styled(marker, name_style),
+            Span::styled(format!("{:<14}", entry.name), name_style),
+            Span::styled(entry.description.clone(), Style::default().fg(DIM)),
+            Span::styled(format!("  {badge}"), Style::default().fg(badge_color)),
         ])
     }));
 
-    let palette = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::TOP)
-            .border_style(Style::default().fg(MUTED)),
-    );
-    frame.render_widget(palette, area);
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn command_palette_height(entries: &[CommandEntry]) -> u16 {
-    entries.len().min(6) as u16 + 3
+    if entries.is_empty() {
+        0
+    } else {
+        entries.len().min(8) as u16 + 1
+    }
+}
+
+/// Height of the inline approval selector (0 when not awaiting approval).
+fn approval_selector_height(request: Option<&ApprovalRequest>, _selected: usize) -> u16 {
+    if request.is_none() {
+        return 0;
+    }
+    // blank + tool summary + question + 3 options + input detail
+    7
+}
+
+/// Claude Code-style permission prompt rendered inline above the input box.
+fn render_approval_selector(
+    frame: &mut Frame,
+    area: Rect,
+    request: &ApprovalRequest,
+    selected: usize,
+    _always_allowed: &Arc<Mutex<std::collections::HashSet<String>>>,
+) {
+    let display_name = tool_display_name(&request.tool_name);
+    let input_json = serde_json::to_string(&request.input).unwrap_or_default();
+    let arg = tool_display_arg(&request.tool_name, &input_json);
+
+    let options = [
+        "Yes".to_string(),
+        format!(
+            "Yes, and don't ask again for {} commands this session",
+            display_name
+        ),
+        "No, and tell ClawedCode what to do differently (esc)".to_string(),
+    ];
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                format!("{BULLET} "),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                display_name.to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("({arg})"), Style::default().fg(DIM)),
+        ]),
+        Line::from(Span::styled("Do you want to proceed?", Style::default())),
+    ];
+
+    for (index, option) in options.iter().enumerate() {
+        let is_selected = index == selected;
+        let marker = if is_selected { "❯ " } else { "  " };
+        let style = if is_selected {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(DIM)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(marker, style),
+            Span::styled(format!("{}. {}", index + 1, option), style),
+        ]));
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Animated "working" line above the input box: `✻ Verb… (esc to interrupt · Ns)`.
+fn spinner_line(turn_started_at: Option<std::time::Instant>) -> Line<'static> {
+    let elapsed = turn_started_at
+        .map(|start| start.elapsed().as_millis())
+        .unwrap_or(0);
+    let frame_index = (elapsed / SPINNER_FRAME_MS) as usize % SPINNER_FRAMES.len();
+    let verb_index = (elapsed / SPINNER_VERB_MS) as usize % SPINNER_VERBS.len();
+    let seconds = elapsed / 1000;
+
+    Line::from(vec![
+        Span::styled(
+            format!("{} ", SPINNER_FRAMES[frame_index]),
+            Style::default().fg(ACCENT),
+        ),
+        Span::styled(
+            format!("{}… ", SPINNER_VERBS[verb_index]),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("(esc to interrupt · {}s)", seconds),
+            Style::default().fg(DIM),
+        ),
+    ])
+}
+
+/// Rows needed for the bordered input box (input lines + 2 border rows).
+fn input_box_height(input: &str, width: u16) -> u16 {
+    let inner = input_inner_width(width);
+    (wrap_input(input, inner).len().min(8) as u16) + 2
+}
+
+fn input_inner_width(width: u16) -> usize {
+    // box borders (2) + left padding (1) + "> " prefix (2)
+    (width as usize).saturating_sub(5).max(10)
+}
+
+/// Wrap `> {input}` into display lines fitting `width` characters.
+fn wrap_input(input: &str, width: usize) -> Vec<String> {
+    let text = format!("> {input}");
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut col = 0usize;
+
+    for ch in text.chars() {
+        if ch == '\n' {
+            lines.push(std::mem::take(&mut current));
+            col = 0;
+            continue;
+        }
+        if col >= width {
+            lines.push(std::mem::take(&mut current));
+            col = 0;
+        }
+        current.push(ch);
+        col += 1;
+    }
+    lines.push(current);
+    lines
+}
+
+/// Draw the Claude Code input box (rounded border, `>` prompt inside) and
+/// return the terminal cursor position for the editing caret.
+fn render_input_box(
+    frame: &mut Frame,
+    area: Rect,
+    input: &str,
+    cursor_pos: usize,
+) -> ratatui::layout::Position {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(SUBTLE));
+    frame.render_widget(block, area);
+
+    let inner = Rect::new(
+        area.x + 1,
+        area.y + 1,
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    );
+    let wrap_width = input_inner_width(area.width);
+    let all_lines = wrap_input(input, wrap_width);
+    let visible: Vec<String> = all_lines.iter().take(8).cloned().collect();
+    frame.render_widget(
+        Paragraph::new(
+            visible
+                .into_iter()
+                .map(Line::from)
+                .collect::<Vec<Line<'static>>>(),
+        ),
+        inner,
+    );
+
+    // Locate the caret in wrapped coordinates: prefix "> " + input[..cursor].
+    let prefix_chars = 2usize; // "> "
+    let cursor_chars = prefix_chars + input[..cursor_pos].chars().count();
+    let text = format!("> {input}");
+    let mut col = 0usize;
+    let mut row = 0usize;
+    for (index, ch) in text.chars().enumerate() {
+        if index == cursor_chars {
+            break;
+        }
+        if ch == '\n' {
+            row += 1;
+            col = 0;
+        } else if col + 1 >= wrap_width {
+            row += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+    let row = row.min(7);
+    ratatui::layout::Position::new(
+        inner.x + col.min(wrap_width.saturating_sub(1)) as u16,
+        inner.y + row as u16,
+    )
+}
+
+/// Bottom hint line: approval hints, permission-mode banner, or `? for shortcuts`.
+fn render_hint_line(frame: &mut Frame, area: Rect, ctx: &TuiContext, awaiting: bool) {
+    let mode = ctx.permission_mode();
+    let mode_text = permission_mode_label(mode);
+
+    let left = if awaiting {
+        "↑/↓ select · enter confirm · esc deny".to_string()
+    } else if mode != clawedcode_core::permissions::PermissionMode::Default {
+        format!("⏵⏵ {mode_text} · ? for shortcuts")
+    } else {
+        "? for shortcuts".to_string()
+    };
+
+    let left_style = if mode != clawedcode_core::permissions::PermissionMode::Default {
+        Style::default().fg(ACCENT)
+    } else {
+        Style::default().fg(SUBTLE)
+    };
+
+    let right = format!(
+        "{} · {}",
+        ctx.model_name(),
+        display_path(&ctx.session().cwd)
+    );
+    let right_width = right
+        .chars()
+        .count()
+        .min(area.width.saturating_sub(2) as usize) as u16;
+
+    let chunks =
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(right_width)]).split(area);
+    frame.render_widget(
+        Paragraph::new(format!("  {left}")).style(left_style),
+        chunks[0],
+    );
+    frame.render_widget(
+        Paragraph::new(right)
+            .style(Style::default().fg(SUBTLE))
+            .alignment(Alignment::Right),
+        chunks[1],
+    );
+}
+
+fn permission_mode_label(mode: clawedcode_core::permissions::PermissionMode) -> &'static str {
+    match mode {
+        clawedcode_core::permissions::PermissionMode::Default => "default",
+        clawedcode_core::permissions::PermissionMode::AcceptEdits => {
+            "accept edits on (shift+tab to cycle)"
+        }
+        clawedcode_core::permissions::PermissionMode::Plan => "plan mode on (shift+tab to cycle)",
+        clawedcode_core::permissions::PermissionMode::Bypass => {
+            "bypass permissions on (shift+tab to cycle)"
+        }
+    }
+}
+
+/// Esc during a running turn: keep the user's prompt + an interrupted marker
+/// in the session and drop the worker's event channel.
+fn interrupt_active_turn(
+    ctx: &mut TuiContext,
+    handler: &mut ReplHandler,
+    active_turn: &mut Option<ActiveTurn>,
+    awaiting_approval: &mut Option<ApprovalRequest>,
+    queued_prompts: &mut Vec<String>,
+) {
+    *awaiting_approval = None;
+    queued_prompts.clear();
+
+    if let Some(prompt) = handler.live_user_prompt.take() {
+        ctx.session_mut().push(Role::User, prompt);
+        let mut blocks = Vec::new();
+        let partial = handler.live_assistant_text.trim();
+        if !partial.is_empty() {
+            blocks.push(ContentBlock::text(partial));
+        }
+        blocks.push(ContentBlock::text("[Interrupted by user]"));
+        ctx.session_mut().push_blocks(Role::Assistant, blocks);
+    }
+
+    handler.clear_live_turn();
+    *active_turn = None;
+    handler.push_overlay("[warn] Interrupted by user");
+    handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
 }
 
 fn render_footer_bar(frame: &mut Frame, area: Rect, left: &str, right: Option<&str>) {
     if let Some(right) = right.filter(|value| !value.is_empty()) {
-        let right_width = right.chars().count().min(area.width.saturating_sub(1) as usize) as u16;
-        let chunks = Layout::horizontal([Constraint::Min(1), Constraint::Length(right_width)])
-            .split(area);
+        let right_width = right
+            .chars()
+            .count()
+            .min(area.width.saturating_sub(1) as usize) as u16;
+        let chunks =
+            Layout::horizontal([Constraint::Min(1), Constraint::Length(right_width)]).split(area);
         frame.render_widget(
             Paragraph::new(left.to_string()).style(Style::default().fg(MUTED)),
             chunks[0],
@@ -1333,8 +1785,7 @@ fn transcript_footer_parts(state: &TranscriptModeState) -> (String, Option<Strin
     } else if state.search_matches.is_empty() {
         "/ search · v export · [ dump · ↑/↓/PgUp/PgDn/Home/End scroll".to_string()
     } else {
-        "/ search · n/N navigate · v export · [ dump · ↑/↓/PgUp/PgDn/Home/End scroll"
-            .to_string()
+        "/ search · n/N navigate · v export · [ dump · ↑/↓/PgUp/PgDn/Home/End scroll".to_string()
     };
 
     (status_left, status_right, hint)
@@ -1368,41 +1819,23 @@ fn transcript_search_current(state: &TranscriptModeState) -> Option<usize> {
 
 fn row_text(row: &RenderRow) -> String {
     match row {
-        RenderRow::User(text) => {
-            if text.is_empty() {
-                "You:".to_string()
-            } else {
-                format!("You: {text}")
-            }
+        RenderRow::User(text) => format!("> {text}"),
+        RenderRow::Assistant(text) => format!("{BULLET} {text}"),
+        RenderRow::Thinking(text) => format!("{BULLET} {text}"),
+        RenderRow::ToolUse { id: _, name, input } => {
+            let arg = tool_display_arg(name, input);
+            format!("{BULLET} {}({arg})", tool_display_name(name))
         }
-        RenderRow::Assistant(text) => {
-            if text.is_empty() {
-                "ClawedCode:".to_string()
-            } else {
-                format!("ClawedCode: {text}")
-            }
-        }
-        RenderRow::Thinking(text) => format!("{TOOL_LINE_INDENT}[thinking] {text}"),
-        RenderRow::ToolUse { id, name, input } => {
-            format!("{TOOL_LINE_INDENT}[tool] {name} (id={id}) {input}")
-        }
-        RenderRow::ToolStatus(text) => text.clone(),
+        RenderRow::ToolStatus(text) => format!("{HOOK_PREFIX}{text}"),
         RenderRow::ToolResult {
-            tool_use_id,
+            tool_use_id: _,
             content,
-            is_error,
-        } => {
-            let prefix = if *is_error {
-                "[tool_error]"
-            } else {
-                "[tool_result]"
-            };
-            format!("{TOOL_LINE_INDENT}{prefix} {tool_use_id}: {content}")
-        }
+            is_error: _,
+        } => format!("{HOOK_PREFIX}{}", content.lines().next().unwrap_or("")),
         RenderRow::SubagentSummary {
             child_session_id,
             summary,
-        } => format!("{TOOL_LINE_INDENT}[sub-agent: {child_session_id}] {summary}"),
+        } => format!("{BULLET} Task({child_session_id})\n{HOOK_PREFIX}{summary}"),
         RenderRow::Info(text) => text.clone(),
         RenderRow::Spacer => String::new(),
     }
@@ -1422,146 +1855,95 @@ fn render_rows(
 
             let mut lines = match row {
                 RenderRow::Spacer => vec![Line::from(String::new())],
-                RenderRow::User(text) => {
-                    if text.is_empty() {
-                        vec![Line::from(Span::styled(
-                            "You:",
-                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                        ))]
-                    } else {
-                        let mut result = vec![Line::from(Span::styled(
-                            "You:",
-                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                        ))];
-                        let parsed = crate::markdown::parse_markdown(text);
-                        for line in parsed {
-                            result.push(line);
-                        }
-                        result
-                    }
-                }
+                RenderRow::User(text) => render_user_message(text),
                 RenderRow::Assistant(text) => {
+                    let mut result = Vec::new();
                     if text.is_empty() {
-                        vec![Line::from(Span::styled(
-                            "ClawedCode:",
-                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                        ))]
+                        result.push(Line::from(Span::styled(
+                            BULLET,
+                            Style::default().add_modifier(Modifier::BOLD),
+                        )));
                     } else {
-                        let mut result = vec![Line::from(Span::styled(
-                            "ClawedCode:",
-                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                        ))];
                         let parsed = crate::markdown::parse_markdown(text);
-                        for line in parsed {
-                            result.push(line);
+                        for (index, line) in parsed.into_iter().enumerate() {
+                            let mut spans = Vec::with_capacity(line.spans.len() + 1);
+                            if index == 0 {
+                                spans.push(Span::styled(
+                                    format!("{BULLET} "),
+                                    Style::default().add_modifier(Modifier::BOLD),
+                                ));
+                            }
+                            spans.extend(line.spans);
+                            result.push(Line::from(spans));
                         }
-                        result
                     }
+                    result
                 }
-                RenderRow::Thinking(text) => vec![Line::from(Span::styled(
-                    format!("{TOOL_LINE_INDENT}[thinking] {text}"),
-                    Style::default().fg(Color::Rgb(120, 120, 120)).add_modifier(Modifier::ITALIC),
-                ))],
-                RenderRow::ToolUse { id: _, name, input } => {
-                    let mut lines = vec![Line::from(Span::styled(
-                        format!("{TOOL_LINE_INDENT}[tool] {name}"),
-                        Style::default().fg(Color::Rgb(100, 180, 100)).add_modifier(Modifier::BOLD),
-                    ))];
-                    // Compact single-line JSON preview
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(input) {
-                        let compact = serde_json::to_string(&json).unwrap_or_else(|_| input.clone());
-                        let preview = if compact.len() > 120 {
-                            format!("{}...", &compact[..120])
+                RenderRow::Thinking(text) => {
+                    let mut result = Vec::new();
+                    for (index, line) in text.lines().enumerate() {
+                        let prefix = if index == 0 {
+                            format!("{BULLET} ")
                         } else {
-                            compact
+                            "  ".to_string()
                         };
-                        lines.push(Line::from(Span::styled(
-                            format!("{TOOL_LINE_INDENT}  {preview}"),
-                            Style::default().fg(Color::Rgb(140, 140, 140)),
-                        )));
-                    } else {
-                        let preview = if input.len() > 120 {
-                            format!("{}...", &input[..120])
-                        } else {
-                            input.clone()
-                        };
-                        lines.push(Line::from(Span::styled(
-                            format!("{TOOL_LINE_INDENT}  {preview}"),
-                            Style::default().fg(Color::Rgb(140, 140, 140)),
-                        )));
+                        result.push(Line::from(vec![
+                            Span::styled(prefix, Style::default().fg(DIM)),
+                            Span::styled(
+                                line.to_string(),
+                                Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
+                            ),
+                        ]));
                     }
-                    lines
+                    result
+                }
+                RenderRow::ToolUse { id: _, name, input } => {
+                    let arg = tool_display_arg(name, input);
+                    vec![Line::from(vec![
+                        Span::styled(
+                            format!("{BULLET} "),
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            tool_display_name(name).to_string(),
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(format!("({arg})"), Style::default().fg(DIM)),
+                    ])]
                 }
                 RenderRow::ToolStatus(text) => vec![Line::from(Span::styled(
-                    text.clone(),
-                    Style::default().fg(Color::Rgb(180, 180, 100)),
+                    format!("{HOOK_PREFIX}{text}"),
+                    Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
                 ))],
                 RenderRow::ToolResult {
                     tool_use_id,
                     content,
                     is_error,
-                } => {
-                    let is_expanded = expanded_tools.contains(tool_use_id);
-                    let status_color = if *is_error {
-                        Color::Rgb(220, 80, 80)
-                    } else {
-                        Color::Rgb(100, 180, 100)
-                    };
-
-                    if is_expanded {
-                        let mut lines = vec![Line::from(vec![
-                            Span::styled(
-                                format!("{TOOL_LINE_INDENT}[▼ result] "),
-                                Style::default().fg(status_color).add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(
-                                tool_use_id.clone(),
-                                Style::default().fg(Color::Rgb(140, 140, 140)),
-                            ),
-                        ])];
-                        let formatted = crate::markdown::format_plain_text(content, &format!("{TOOL_LINE_INDENT}  "));
-                        for line in formatted {
-                            lines.push(line);
-                        }
-                        lines
-                    } else {
-                        let line_count = content.lines().count();
-                        let first_line = content.lines().next().unwrap_or("").trim();
-                        let preview = if first_line.len() > 80 {
-                            format!("{}...", &first_line[..80])
-                        } else {
-                            first_line.to_string()
-                        };
-                        vec![Line::from(vec![
-                            Span::styled(
-                                format!("{TOOL_LINE_INDENT}[▶ result] "),
-                                Style::default().fg(status_color).add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(
-                                format!("{tool_use_id} · {line_count} lines · {preview}"),
-                                Style::default().fg(Color::Rgb(140, 140, 140)),
-                            ),
-                        ])]
-                    }
-                }
+                } => render_tool_result(tool_use_id, content, *is_error, expanded_tools),
                 RenderRow::SubagentSummary {
                     child_session_id,
                     summary,
                 } => {
-                    let mut result = vec![Line::from(Span::styled(
-                        format!("{TOOL_LINE_INDENT}[sub-agent] {child_session_id}"),
-                        Style::default().fg(Color::Rgb(180, 140, 80)),
-                    ))];
-                    let parsed = crate::markdown::parse_markdown(summary);
-                    for line in parsed {
-                        result.push(line);
+                    let mut result = vec![Line::from(vec![
+                        Span::styled(
+                            format!("{BULLET} "),
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            "Task".to_string(),
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(format!("({child_session_id})"), Style::default().fg(DIM)),
+                    ])];
+                    for line in summary.lines() {
+                        result.push(Line::from(vec![
+                            Span::styled(HOOK_PREFIX, Style::default().fg(DIM)),
+                            Span::styled(line.to_string(), Style::default().fg(DIM)),
+                        ]));
                     }
                     result
                 }
-                RenderRow::Info(text) => vec![Line::from(Span::styled(
-                    text.clone(),
-                    Style::default().fg(Color::Rgb(180, 180, 180)),
-                ))],
+                RenderRow::Info(text) => vec![info_line(text)],
             };
 
             // Apply selection/match highlighting
@@ -1579,163 +1961,209 @@ fn render_rows(
         .collect()
 }
 
-fn launch_banner(ctx: &TuiContext) -> String {
-    let session_id = ctx.session().id.to_string();
-    let session_short = short_session_id(&session_id);
-    let cwd = display_path(&ctx.session().cwd);
-    let transport = ctx
-        .transport_label()
-        .map(|label| format!(" via {label}"))
-        .unwrap_or_default();
-    if ctx.session().messages.is_empty() {
-        format!(
-            "Launching ClawedCode with {}{} · session {} in {}",
-            ctx.model_name(),
-            transport,
-            session_short,
-            cwd
-        )
+/// Render a submitted user prompt the way Claude Code echoes it:
+/// a dim `>` followed by the raw text, continuation lines indented.
+fn render_user_message(text: &str) -> Vec<Line<'static>> {
+    let mut result = Vec::new();
+    if text.is_empty() {
+        result.push(Line::from(Span::styled(
+            ">",
+            Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+        )));
+        return result;
+    }
+
+    for (index, raw) in text.lines().enumerate() {
+        let mut spans = Vec::new();
+        if index == 0 {
+            spans.push(Span::styled(
+                "> ",
+                Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(raw.to_string(), Style::default().fg(MUTED)));
+        result.push(Line::from(spans));
+    }
+    result
+}
+
+/// Render a tool result as Claude Code does: collapsed results show the
+/// first line plus an expand hint, expanded results list every line under
+/// the `⎿` hook. Diff-looking lines get +/- coloring.
+fn render_tool_result(
+    tool_use_id: &str,
+    content: &str,
+    is_error: bool,
+    expanded_tools: &std::collections::HashSet<String>,
+) -> Vec<Line<'static>> {
+    let is_expanded = expanded_tools.contains(tool_use_id);
+    let body_color = if is_error { ERR_FG } else { DIM };
+    let hook_color = if is_error { ERR_FG } else { MUTED };
+
+    if content.trim().is_empty() {
+        return vec![Line::from(vec![
+            Span::styled(HOOK_PREFIX, Style::default().fg(hook_color)),
+            Span::styled(
+                if is_error {
+                    "Error: (no content)"
+                } else {
+                    "(No content)"
+                },
+                Style::default()
+                    .fg(body_color)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+        ])];
+    }
+
+    let content_lines: Vec<&str> = content.lines().collect();
+
+    if !is_expanded {
+        let mut result = Vec::new();
+        let first = content_lines[0];
+        result.push(Line::from(vec![
+            Span::styled(HOOK_PREFIX, Style::default().fg(hook_color)),
+            Span::styled(
+                truncate_for_display(first.trim(), 100),
+                Style::default().fg(body_color),
+            ),
+        ]));
+        if content_lines.len() > 1 {
+            result.push(Line::from(vec![
+                Span::styled(HOOK_CONTINUATION, Style::default().fg(hook_color)),
+                Span::styled(
+                    format!("… +{} lines (ctrl+r to expand)", content_lines.len() - 1),
+                    Style::default().fg(SUBTLE).add_modifier(Modifier::ITALIC),
+                ),
+            ]));
+        }
+        return result;
+    }
+
+    content_lines
+        .iter()
+        .enumerate()
+        .map(|(index, raw)| {
+            let trimmed = raw.trim_start();
+            let line_style = if is_error {
+                Style::default().fg(ERR_FG)
+            } else if trimmed.starts_with('+') {
+                Style::default().fg(OK_FG)
+            } else if trimmed.starts_with('-') {
+                Style::default().fg(ERR_FG)
+            } else {
+                Style::default().fg(DIM)
+            };
+            let prefix = if index == 0 {
+                HOOK_PREFIX
+            } else {
+                HOOK_CONTINUATION
+            };
+            Line::from(vec![
+                Span::styled(prefix, Style::default().fg(hook_color)),
+                Span::styled(raw.to_string(), line_style),
+            ])
+        })
+        .collect()
+}
+
+/// Style overlay/status rows by tag: [error]/[warn] get their colors,
+/// everything else renders dim.
+fn info_line(text: &str) -> Line<'static> {
+    let (color, rest) = if let Some(rest) = text.strip_prefix("[error] ") {
+        (ERR_FG, rest)
+    } else if let Some(rest) = text.strip_prefix("[warn] ") {
+        (WARN_FG, rest)
+    } else if let Some(rest) = text.strip_prefix("[info] ") {
+        (DIM, rest)
     } else {
-        format!(
-            "ClawedCode session {} in {} · {}{}",
-            session_short,
-            cwd,
-            ctx.model_name(),
-            transport
-        )
+        (DIM, text)
+    };
+    Line::from(Span::styled(rest.to_string(), Style::default().fg(color)))
+}
+
+/// Map internal tool names to Claude Code display names.
+fn tool_display_name(name: &str) -> &str {
+    match name {
+        "shell" => "Bash",
+        "read_file" => "Read",
+        "apply_patch" => "Edit",
+        other => other,
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-fn footer_status_line(
-    ctx: &TuiContext,
-    active_turn: bool,
-    awaiting_approval: Option<&ApprovalRequest>,
-    queued_count: usize,
-    info_panel: Option<&InfoPanel>,
-    viewport: &TranscriptViewport,
-) -> String {
-    let state = if let Some(panel) = info_panel {
-        format!("viewing {}", panel.title.to_ascii_lowercase())
-    } else if !viewport.pinned_to_bottom {
-        if viewport.unseen_count == 0 {
-            "scrolled transcript".to_string()
-        } else {
-            format!("scrolled transcript · {} unseen", viewport.unseen_count)
+/// Produce the short argument shown inside `ToolName(...)` parens.
+fn tool_display_arg(name: &str, raw_input: &str) -> String {
+    let input: serde_json::Value =
+        serde_json::from_str(raw_input).unwrap_or(serde_json::Value::Null);
+    let get_str = |keys: &[&str]| -> Option<String> {
+        for key in keys {
+            if let Some(value) = input.get(*key).and_then(|v| v.as_str()) {
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
         }
-    } else if let Some(req) = awaiting_approval {
-        format!("waiting for approval: {}", req.tool_name)
-    } else if active_turn {
-        if queued_count == 0 {
-            "busy: assistant responding".to_string()
-        } else {
-            format!("busy: assistant responding · {queued_count} queued")
-        }
-    } else if let Some(background) = background_activity_summary(ctx) {
-        background
-    } else {
-        "idle".to_string()
+        None
+    };
+    let first_line = |s: String| s.lines().next().unwrap_or("").to_string();
+
+    let arg = match name {
+        "shell" => get_str(&["command"]).map(first_line),
+        "read_file" => get_str(&["path", "file_path"]),
+        "apply_patch" => patch_display_target(raw_input),
+        "Agent" | "Task" => get_str(&["description", "prompt"]).map(first_line),
+        "TaskCreate" => get_str(&["subject"]).map(first_line),
+        "TaskUpdate" => get_str(&["taskId", "task_id"]).map(|id| {
+            let subject = get_str(&["subject"]);
+            match subject {
+                Some(subject) => format!("{id}: {}", first_line(subject)),
+                None => id,
+            }
+        }),
+        "TaskGet" | "TaskOutput" | "TaskStop" => get_str(&["task_id", "taskId", "shell_id"]),
+        "ListMcpResourcesTool" | "TaskList" => None,
+        "ReadMcpResourceTool" => get_str(&["uri"]),
+        _ => None,
     };
 
-    format!("{state} · {}", session_compact_status(ctx))
+    if let Some(arg) = arg {
+        return truncate_for_display(&arg, 64);
+    }
+
+    // Fallback: compact JSON of the first string/number field.
+    if let Some(map) = input.as_object() {
+        if map.is_empty() {
+            return String::new();
+        }
+        if let Some((key, value)) = map.iter().next() {
+            let text = match value {
+                serde_json::Value::String(s) => first_line(s.clone()),
+                other => serde_json::to_string(other).unwrap_or_default(),
+            };
+            return truncate_for_display(&format!("{key}: {text}"), 64);
+        }
+    }
+
+    truncate_for_display(raw_input, 64)
 }
 
-fn footer_hint_line(
-    ctx: &TuiContext,
-    input_buffer: &str,
-    active_turn: bool,
-    awaiting_approval: Option<&ApprovalRequest>,
-    queued_count: usize,
-    info_panel: Option<&InfoPanel>,
-    viewport: &TranscriptViewport,
-) -> String {
-    if awaiting_approval.is_some() {
-        return "Press y to approve, n to deny. Ctrl+C or q exits.".to_string();
-    }
-
-    if info_panel.is_some() {
-        return "Esc/q/? closes this panel. Use ↑/↓ or j/k to scroll. Ctrl+C exits.".to_string();
-    }
-
-    if !viewport.pinned_to_bottom {
-        return "Use ↑/↓/PgUp/PgDn/Home/End to browse transcript. End jumps back to live output."
-            .to_string();
-    }
-
-    if active_turn {
-        return if queued_count == 0 {
-            "Assistant is working. Keep typing and press Enter to queue the next prompt.".to_string()
-        } else {
-            format!(
-                "Assistant is working. {queued_count} queued prompt{} will run next.",
-                if queued_count == 1 { "" } else { "s" }
-            )
-        };
-    }
-
-    if input_buffer.trim_start().starts_with('/') {
-        let visible = filtered_command_entries(ctx, input_buffer);
-        if visible.is_empty() {
-            return "Enter to run the slash command. /help lists available commands.".to_string();
+/// Extract the file path an apply_patch input touches for display.
+fn patch_display_target(raw_input: &str) -> Option<String> {
+    let input: serde_json::Value = serde_json::from_str(raw_input).ok()?;
+    let patch = input.get("patch")?.as_str()?;
+    for line in patch.lines() {
+        if let Some(rest) = line
+            .strip_prefix("*** Update File: ")
+            .or_else(|| line.strip_prefix("*** Add File: "))
+            .or_else(|| line.strip_prefix("*** Delete File: "))
+        {
+            return Some(rest.trim().to_string());
         }
-
-        let preview = visible
-            .into_iter()
-            .take(4)
-            .map(|entry| entry.name)
-            .collect::<Vec<_>>()
-            .join(", ");
-        return format!("Enter to run the slash command. Matches: {preview}");
     }
-
-    "Enter to send · ? for shortcuts · / for commands · /sessions for recent sessions · /tools for tools".to_string()
-}
-
-fn footer_chrome(
-    ctx: &TuiContext,
-    input_buffer: &str,
-    active_turn: bool,
-    awaiting_approval: Option<&ApprovalRequest>,
-    queued_count: usize,
-    info_panel: Option<&InfoPanel>,
-    viewport: &TranscriptViewport,
-) -> BottomChromeState {
-    let left = if let Some(panel) = info_panel {
-        format!("Viewing {}", panel.title)
-    } else if !viewport.pinned_to_bottom {
-        if viewport.unseen_count == 0 {
-            "Scrolled transcript".to_string()
-        } else {
-            format!("Scrolled transcript · {} unseen", viewport.unseen_count)
-        }
-    } else if let Some(req) = awaiting_approval {
-        format!("Waiting for approval: {}", req.tool_name)
-    } else if active_turn {
-        if queued_count == 0 {
-            "Assistant is working".to_string()
-        } else {
-            format!("Assistant is working · {queued_count} queued")
-        }
-    } else if let Some(background) = background_activity_summary(ctx) {
-        background
-    } else {
-        "Idle".to_string()
-    };
-
-    BottomChromeState {
-        left,
-        right: Some(session_compact_status(ctx)),
-        hint: footer_hint_line(
-            ctx,
-            input_buffer,
-            active_turn,
-            awaiting_approval,
-            queued_count,
-            info_panel,
-            viewport,
-        ),
-        prompt_prefix: prompt_prefix_for_state(input_buffer, active_turn, awaiting_approval),
-    }
+    None
 }
 
 fn max_transcript_scroll(handler: &ReplHandler, viewport_height: usize) -> usize {
@@ -1847,52 +2275,20 @@ fn transcript_render_lines(state: &TranscriptModeState) -> Vec<Line<'static>> {
     )
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-fn prompt_prefix_for_state(
-    input_buffer: &str,
-    active_turn: bool,
-    awaiting_approval: Option<&ApprovalRequest>,
-) -> String {
-    if let Some(req) = awaiting_approval {
-        return format!("Approve {}? (y/n): ", req.tool_name);
-    }
-
-    if active_turn {
-        if !input_buffer.trim().is_empty() {
-            return "Queue> ".to_string();
-        }
-        return "Working: ".to_string();
-    }
-
-    if input_buffer.trim_start().starts_with('/') {
-        return "cmd> ".to_string();
-    }
-
-    "> ".to_string()
-}
-
 fn queued_prompt_preview_lines(queued_prompts: &[String]) -> Vec<Line<'static>> {
-    if queued_prompts.is_empty() {
-        return Vec::new();
-    }
-
-    let mut lines = vec![Line::from(Span::styled(
-        "Queued prompts",
-        Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
-    ))];
-
     let visible_count = queued_prompts.len().min(MAX_VISIBLE_QUEUED_PROMPTS);
+    let mut lines = Vec::new();
     for prompt in queued_prompts.iter().take(visible_count) {
         lines.push(Line::from(vec![
-            Span::styled("queued> ", Style::default().fg(ACCENT)),
-            Span::styled(truncate_for_display(prompt, 96), Style::default().fg(MUTED)),
+            Span::styled("> ", Style::default().fg(DIM).add_modifier(Modifier::BOLD)),
+            Span::styled(truncate_for_display(prompt, 96), Style::default().fg(DIM)),
         ]));
     }
 
     if queued_prompts.len() > visible_count {
         lines.push(Line::from(Span::styled(
-            format!("+{} more queued prompt(s)", queued_prompts.len() - visible_count),
-            Style::default().fg(MUTED),
+            format!("  … +{} more", queued_prompts.len() - visible_count),
+            Style::default().fg(SUBTLE),
         )));
     }
 
@@ -1904,75 +2300,21 @@ fn maybe_submit_queued_prompt(
     handler: &mut ReplHandler,
     active_turn: &mut Option<ActiveTurn>,
     queued_prompts: &mut Vec<String>,
+    always_allowed: &Arc<Mutex<std::collections::HashSet<String>>>,
 ) -> Result<()> {
     if active_turn.is_some() || queued_prompts.is_empty() {
         return Ok(());
     }
 
     let prompt = queued_prompts.remove(0);
-    if handle_slash_command(ctx, handler, &prompt, active_turn)? {
+    if handle_slash_command(ctx, handler, &prompt, active_turn, always_allowed)? {
         handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
     } else {
         handler.begin_live_turn(prompt.clone());
-        *active_turn = Some(spawn_turn_worker(ctx, prompt, None));
+        *active_turn = Some(spawn_turn_worker(ctx, prompt, None, always_allowed.clone()));
     }
 
     Ok(())
-}
-
-fn background_activity_summary(ctx: &TuiContext) -> Option<String> {
-    let session_id = ctx.session().id.to_string();
-
-    let shell_running = list_background_tasks()
-        .into_iter()
-        .filter(|task| task.session_id == session_id)
-        .filter(|task| matches!(task.status, ShellTaskStatus::Pending | ShellTaskStatus::Running))
-        .count();
-
-    let agent_running = list_subagent_tasks_for_parent(ctx.session().id)
-        .into_iter()
-        .filter(|task| matches!(task.status, SubAgentTaskStatus::Running))
-        .count();
-
-    let total = shell_running + agent_running;
-    if total == 0 {
-        None
-    } else if shell_running > 0 && agent_running > 0 {
-        Some(format!("background: {shell_running} shell, {agent_running} agent tasks"))
-    } else if shell_running > 0 {
-        Some(format!("background: {shell_running} shell task{}", if shell_running == 1 { "" } else { "s" }))
-    } else {
-        Some(format!("background: {agent_running} agent task{}", if agent_running == 1 { "" } else { "s" }))
-    }
-}
-
-fn welcome_left_lines(ctx: &TuiContext) -> Vec<Line<'static>> {
-    vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            "Welcome back!",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from("       .-.-.       "),
-        Line::from("      ( o o )      "),
-        Line::from("     /|  V  |\\     "),
-        Line::from("      | === |      "),
-        Line::from("       -----       "),
-        Line::from(""),
-        Line::from(Span::styled(
-            ctx.model_name().to_string(),
-            Style::default().fg(MUTED),
-        )),
-        Line::from(Span::styled(
-            provider_label().to_string(),
-            Style::default().fg(MUTED),
-        )),
-        Line::from(Span::styled(
-            display_path(&ctx.session().cwd),
-            Style::default().fg(MUTED),
-        )),
-    ]
 }
 
 fn welcome_right_lines(ctx: &TuiContext) -> Vec<Line<'static>> {
@@ -1980,38 +2322,49 @@ fn welcome_right_lines(ctx: &TuiContext) -> Vec<Line<'static>> {
 
     if let Some(label) = ctx.transport_label() {
         lines.push(section_title("Connection"));
-        lines.push(Line::from(format!("Interactive transport: {label}")));
-        lines.push(Line::from(
-            "This shell is attached through a transport bridge. Prompts, sessions, and approvals still persist locally.",
-        ));
+        lines.push(Line::from(Span::styled(
+            format!("Interactive transport: {label}"),
+            Style::default().fg(DIM),
+        )));
         lines.push(Line::from(""));
     }
 
-    lines.extend(if should_show_project_onboarding(&ctx.session().cwd) {
-        let mut lines = vec![section_title("Getting started")];
+    if should_show_project_onboarding(&ctx.session().cwd) {
+        lines.push(section_title("Get started"));
         for step in onboarding_steps(&ctx.session().cwd)
             .into_iter()
             .filter(|step| step.is_enabled)
         {
-            let prefix = if step.is_complete { "[x]" } else { "[ ]" };
-            lines.push(Line::from(format!("{prefix} {}", step.text)));
+            let (mark, style) = if step.is_complete {
+                ("☑", Style::default().fg(DIM))
+            } else {
+                ("☐", Style::default())
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{mark} "), style),
+                Span::styled(step.text.to_string(), style),
+            ]));
         }
-        lines
     } else {
-        vec![
-            section_title("Tips for getting started"),
-            Line::from("Run /init to create a CLAUDE.md file with instructions for ClawedCode."),
-        ]
-    });
+        lines.push(section_title("Tips for getting started"));
+        let tips = [
+            "Run /init to create a CLAUDE.md file with instructions for ClawedCode",
+            "Ask ClawedCode to make changes, fix bugs, or add features",
+            "Use /help to see all available commands",
+        ];
+        for (index, tip) in tips.iter().enumerate() {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{}. ", index + 1), Style::default().fg(DIM)),
+                Span::styled((*tip).to_string(), Style::default().fg(MUTED)),
+            ]));
+        }
+    }
 
     if launched_in_home(&ctx.session().cwd) {
-        lines.push(Line::from(
-            "Note: You have launched clawedcode in your home directory. For the best experience, launch it in a project directory instead.",
-        ));
-    } else if !should_show_project_onboarding(&ctx.session().cwd) {
-        lines.push(Line::from(
-            "Type /help to inspect built-in commands and discovered skills.",
-        ));
+        lines.push(Line::from(Span::styled(
+            "⚠ You launched clawedcode in your home directory — run it inside a project directory instead.",
+            Style::default().fg(WARN_FG),
+        )));
     }
 
     lines.push(Line::from(""));
@@ -2034,8 +2387,8 @@ fn welcome_right_lines(ctx: &TuiContext) -> Vec<Line<'static>> {
 
 fn section_title(title: &'static str) -> Line<'static> {
     Line::from(Span::styled(
-        title,
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        format!("{title}:"),
+        Style::default().add_modifier(Modifier::BOLD),
     ))
 }
 
@@ -2061,13 +2414,13 @@ fn append_message_to_turn(turn: &mut TranscriptTurn, msg: &Message, show_thinkin
             append_message_blocks(turn, "You", &msg.content_blocks, show_thinking, true);
         }
         Role::Assistant => {
-            let has_text = msg.content_blocks.iter().any(|block| {
-                matches!(block, ContentBlock::Text { text } if !text.trim().is_empty())
-            });
-            if !has_text && !msg.content_blocks.is_empty() {
-                turn.rows.push(RenderRow::Assistant(String::new()));
-            }
-            append_message_blocks(turn, "ClawedCode", &msg.content_blocks, show_thinking, false);
+            append_message_blocks(
+                turn,
+                "ClawedCode",
+                &msg.content_blocks,
+                show_thinking,
+                false,
+            );
         }
         Role::Tool => {
             append_message_blocks(turn, "Tool", &msg.content_blocks, show_thinking, false);
@@ -2106,9 +2459,7 @@ fn append_message_blocks(
                 }
             }
             ContentBlock::Thinking { thinking } => {
-                if show_thinking
-                    && !thinking.starts_with(TRANSPORT_SESSION_ID_MARKER_PREFIX)
-                {
+                if show_thinking && !thinking.starts_with(TRANSPORT_SESSION_ID_MARKER_PREFIX) {
                     let thinking = thinking.trim();
                     if !thinking.is_empty() {
                         turn.rows.push(RenderRow::Thinking(thinking.to_string()));
@@ -2160,6 +2511,7 @@ fn spawn_turn_worker(
     ctx: &TuiContext,
     visible_prompt: String,
     execution_prompt: Option<String>,
+    always_allowed: Arc<Mutex<std::collections::HashSet<String>>>,
 ) -> ActiveTurn {
     let runtime = ctx.replacement_runtime();
     let external_turn_executor = ctx.external_turn_executor();
@@ -2235,6 +2587,14 @@ fn spawn_turn_worker(
             let approval_fn =
                 move |tool_use_id: &str, tool_name: &str, input: &serde_json::Value| {
                     if !is_write_like(tool_name) {
+                        return true;
+                    }
+
+                    if always_allowed
+                        .lock()
+                        .map(|set| set.contains(tool_name))
+                        .unwrap_or(false)
+                    {
                         return true;
                     }
 
@@ -2363,6 +2723,7 @@ fn handle_slash_command(
     handler: &mut ReplHandler,
     prompt: &str,
     active_turn: &mut Option<ActiveTurn>,
+    always_allowed: &Arc<Mutex<std::collections::HashSet<String>>>,
 ) -> Result<bool> {
     if !prompt.starts_with('/') && prompt.trim() != "?" {
         return Ok(false);
@@ -2423,7 +2784,8 @@ fn handle_slash_command(
                         .unwrap_or_default();
                     if task_prompt.is_empty() {
                         handler.push_overlay(
-                            "[info] Usage: /task <prompt>. Provide a prompt for the sub-agent.".to_string(),
+                            "[info] Usage: /task <prompt>. Provide a prompt for the sub-agent."
+                                .to_string(),
                         );
                     } else {
                         handler.push_overlay(format!(
@@ -2469,7 +2831,8 @@ fn handle_slash_command(
                         .map(str::trim)
                         .unwrap_or_default();
                     if prefix.is_empty() {
-                        handler.push_overlay("[info] Usage: /fork <session-id-or-prefix>".to_string());
+                        handler
+                            .push_overlay("[info] Usage: /fork <session-id-or-prefix>".to_string());
                         let _ = ctx.save_session();
                         return Ok(true);
                     }
@@ -2486,7 +2849,9 @@ fn handle_slash_command(
                             let _ = ctx.save_session();
                             handler.overlay_rows.clear();
                             handler.clear_panel();
-                            handler.push_overlay(format!("[info] Forked {source_short} -> {forked_short}"));
+                            handler.push_overlay(format!(
+                                "[info] Forked {source_short} -> {forked_short}"
+                            ));
                         }
                         Err(err) => {
                             handler.push_overlay(format!(
@@ -2498,19 +2863,16 @@ fn handle_slash_command(
                     return Ok(true);
                 }
                 _ => {
-                    handler.push_overlay(format!(
-                        "[info] Unknown command `{command}`. Use `/help`."
-                    ));
+                    handler
+                        .push_overlay(format!("[info] Unknown command `{command}`. Use `/help`."));
                 }
             },
             CommandSource::Skill => {
                 if let Some(skill) = find_skill_command(ctx, command) {
-                    execute_skill_command(ctx, handler, prompt, skill, active_turn);
+                    execute_skill_command(ctx, handler, prompt, skill, active_turn, always_allowed);
                     return Ok(true);
                 }
-                handler.push_overlay(format!(
-                    "[info] Unknown command `{command}`. Use `/help`."
-                ));
+                handler.push_overlay(format!("[info] Unknown command `{command}`. Use `/help`."));
             }
         },
         None => {
@@ -2528,6 +2890,7 @@ fn execute_skill_command(
     visible_prompt: &str,
     skill: SkillDescriptor,
     active_turn: &mut Option<ActiveTurn>,
+    always_allowed: &Arc<Mutex<std::collections::HashSet<String>>>,
 ) {
     let args = visible_prompt
         .strip_prefix(&skill.slash_command)
@@ -2540,6 +2903,7 @@ fn execute_skill_command(
         ctx,
         visible_prompt.to_string(),
         Some(execution_prompt),
+        always_allowed.clone(),
     ));
 }
 
@@ -2666,7 +3030,11 @@ fn curated_command_entries(entries: Vec<CommandEntry>) -> Vec<CommandEntry> {
     ranked
 }
 
-fn compare_command_entries(query: &str, left: &CommandEntry, right: &CommandEntry) -> std::cmp::Ordering {
+fn compare_command_entries(
+    query: &str,
+    left: &CommandEntry,
+    right: &CommandEntry,
+) -> std::cmp::Ordering {
     use std::cmp::Ordering;
 
     let exact_left = left.name == query;
@@ -2969,9 +3337,8 @@ fn help_panel(ctx: &TuiContext) -> InfoPanel {
 fn sessions_panel(ctx: &TuiContext) -> InfoPanel {
     let sessions = list_saved_sessions(ctx, 8);
     let session_count = sessions.len();
-    let mut lines = vec![
-        "Use /fork <session-id-or-prefix> to branch from a saved session.".to_string(),
-    ];
+    let mut lines =
+        vec!["Use /fork <session-id-or-prefix> to branch from a saved session.".to_string()];
     append_panel_section(
         &mut lines,
         "Recent sessions",
@@ -3060,7 +3427,12 @@ fn help_overlay_lines(ctx: &TuiContext) -> Vec<String> {
             "Enter busy   queue the next prompt while the assistant works".to_string(),
             "?            show this shortcut overlay".to_string(),
             "/            start slash command input".to_string(),
-            "y / n        approve or deny the focused tool request".to_string(),
+            "↑ / ↓        navigate options or prompt history".to_string(),
+            "1 / 2 / 3    approve, always allow, or deny a tool request".to_string(),
+            "Esc          interrupt the turn or dismiss panels".to_string(),
+            "Ctrl+R       expand or collapse tool output".to_string(),
+            "Shift+Tab    cycle permission mode".to_string(),
+            "Ctrl+O       open the scrollable transcript".to_string(),
             "q / Ctrl+C   exit the REPL".to_string(),
         ],
     );
@@ -3113,7 +3485,11 @@ fn format_saved_session_line(
     _current_session_id: &uuid::Uuid,
 ) -> String {
     let current_marker = if session.is_current { "*" } else { " " };
-    let action = if session.is_current { "current" } else { "forkable" };
+    let action = if session.is_current {
+        "current"
+    } else {
+        "forkable"
+    };
     format!(
         "{} {} {:<14} {:<8} {:<18} {}",
         current_marker,
@@ -3196,10 +3572,7 @@ fn built_in_tool_lines(ctx: &TuiContext) -> Vec<String> {
     if builtins.is_empty() {
         vec!["No built-in tools discovered".to_string()]
     } else {
-        builtins
-            .into_iter()
-            .map(|name| format!("{name}"))
-            .collect()
+        builtins.into_iter().map(|name| format!("{name}")).collect()
     }
 }
 
@@ -3302,7 +3675,7 @@ mod command_policy_tests {
     use std::{
         fs,
         path::{Path, PathBuf},
-        sync::{Mutex, MutexGuard, OnceLock},
+        sync::{Arc, Mutex, MutexGuard, OnceLock},
     };
 
     fn env_lock() -> MutexGuard<'static, ()> {
@@ -3525,7 +3898,11 @@ mod command_policy_tests {
 
         let ctx = make_context_at(project, sessions_dir);
         let entries = filtered_command_entries(&ctx, "/");
-        let names: Vec<_> = entries.iter().take(6).map(|entry| entry.name.as_str()).collect();
+        let names: Vec<_> = entries
+            .iter()
+            .take(6)
+            .map(|entry| entry.name.as_str())
+            .collect();
 
         assert_eq!(
             names,
@@ -3582,7 +3959,14 @@ mod command_policy_tests {
         let mut handler = ReplHandler::new(false);
         let mut active_turn = None;
 
-        handle_slash_command(&mut ctx, &mut handler, "/update", &mut active_turn).unwrap();
+        handle_slash_command(
+            &mut ctx,
+            &mut handler,
+            "/update",
+            &mut active_turn,
+            &Arc::new(Mutex::new(std::collections::HashSet::new())),
+        )
+        .unwrap();
 
         assert!(active_turn.is_none());
         assert!(
@@ -3621,6 +4005,7 @@ mod command_policy_tests {
             &mut handler,
             "/hidden-skill",
             &mut active_turn,
+            &Arc::new(Mutex::new(std::collections::HashSet::new())),
         )
         .unwrap();
 
@@ -3645,14 +4030,26 @@ mod command_policy_tests {
         let sessions_dir = root.join("sessions");
         fs::create_dir_all(&project).expect("create project dir");
         fs::create_dir_all(&sessions_dir).expect("create sessions dir");
-        write_skill(&project, "VisibleSkill.md", "Visible Skill", "Use this skill.");
+        write_skill(
+            &project,
+            "VisibleSkill.md",
+            "Visible Skill",
+            "Use this skill.",
+        );
         write_skill(&project, "HiddenSkill.md", "Hidden Skill", "   ");
 
         let mut ctx = make_context_at(project, sessions_dir);
         let mut handler = ReplHandler::new(false);
         let mut active_turn = None;
 
-        handle_slash_command(&mut ctx, &mut handler, "/help", &mut active_turn).unwrap();
+        handle_slash_command(
+            &mut ctx,
+            &mut handler,
+            "/help",
+            &mut active_turn,
+            &Arc::new(Mutex::new(std::collections::HashSet::new())),
+        )
+        .unwrap();
 
         let rendered = handler
             .info_panel
@@ -3687,86 +4084,58 @@ mod command_policy_tests {
     }
 
     #[test]
-    fn footer_status_line_and_hint_reflect_idle_and_slash_states() {
-        let root = temp_dir("footer_status");
-        let project = root.join("project");
-        let sessions_dir = root.join("sessions");
-        fs::create_dir_all(&project).expect("create project dir");
-        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
-
-        let ctx = make_context_at(project, sessions_dir);
-        let viewport = TranscriptViewport {
-            pinned_to_bottom: true,
-            ..TranscriptViewport::default()
-        };
-        let footer = footer_status_line(&ctx, false, None, 0, None, &viewport);
-        let hint = footer_hint_line(&ctx, "hello", false, None, 0, None, &viewport);
-        let slash_hint = footer_hint_line(&ctx, "/hel", false, None, 0, None, &viewport);
-        let slash_prefix = prompt_prefix_for_state("/hel", false, None);
-
-        assert!(footer.contains("idle"));
-        assert!(footer.contains("model "));
-        assert!(footer.contains("session"));
-        assert!(footer.contains("mode interactive"));
-        assert!(hint.contains("Enter to send"));
-        assert!(hint.contains("? for shortcuts"));
-        assert!(hint.contains("/sessions"));
-        assert!(slash_hint.contains("slash command"));
-        assert!(slash_hint.contains("Matches:"));
-        assert_eq!(slash_prefix, "cmd> ");
-
-        fs::remove_dir_all(root).ok();
+    fn tool_display_names_match_claude_code() {
+        assert_eq!(tool_display_name("shell"), "Bash");
+        assert_eq!(tool_display_name("read_file"), "Read");
+        assert_eq!(tool_display_name("apply_patch"), "Edit");
+        assert_eq!(tool_display_name("TaskCreate"), "TaskCreate");
+        assert_eq!(
+            tool_display_name("mcp__github__search"),
+            "mcp__github__search"
+        );
     }
 
     #[test]
-    fn footer_status_line_reflects_busy_and_approval_states() {
-        let root = temp_dir("footer_status_busy");
-        let project = root.join("project");
-        let sessions_dir = root.join("sessions");
-        fs::create_dir_all(&project).expect("create project dir");
-        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
-
-        let ctx = make_context_at(project, sessions_dir);
-        let request = ApprovalRequest {
-            tool_use_id: "tool-1".to_string(),
-            tool_name: "shell".to_string(),
-            input: serde_json::json!({"command": "ls -la"}),
-        };
-        let viewport = TranscriptViewport {
-            pinned_to_bottom: true,
-            ..TranscriptViewport::default()
-        };
-
-        let busy_footer = footer_status_line(&ctx, true, None, 0, None, &viewport);
-        let approval_footer = footer_status_line(&ctx, true, Some(&request), 0, None, &viewport);
-        let approval_hint =
-            footer_hint_line(&ctx, "hello", true, Some(&request), 0, None, &viewport);
-        let approval_prefix = prompt_prefix_for_state("hello", true, Some(&request));
-
-        assert!(busy_footer.contains("busy: assistant responding"));
-        assert!(approval_footer.contains("waiting for approval: shell"));
-        assert!(approval_hint.contains("Press y to approve, n to deny"));
-        assert!(approval_prefix.contains("Approve shell? (y/n): "));
-
-        fs::remove_dir_all(root).ok();
+    fn tool_display_arg_summarizes_known_tools() {
+        assert_eq!(
+            tool_display_arg("shell", r#"{"command":"ls -la"}"#),
+            "ls -la"
+        );
+        assert_eq!(
+            tool_display_arg("read_file", r#"{"path":"src/main.rs"}"#),
+            "src/main.rs"
+        );
+        assert_eq!(
+            tool_display_arg(
+                "apply_patch",
+                r#"{"patch":"*** Begin Patch\n*** Update File: src/app.rs\n@@ x\n*** End Patch"}"#
+            ),
+            "src/app.rs"
+        );
+        assert_eq!(
+            tool_display_arg("TaskCreate", r#"{"subject":"Fix bug"}"#),
+            "Fix bug"
+        );
     }
 
     #[test]
-    fn busy_footer_and_prompt_reflect_queued_prompts() {
-        let root = temp_dir("footer_status_queued");
-        let project = root.join("project");
-        let sessions_dir = root.join("sessions");
-        fs::create_dir_all(&project).expect("create project dir");
-        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+    fn permission_mode_label_covers_modes() {
+        assert_eq!(
+            permission_mode_label(clawedcode_core::permissions::PermissionMode::Default),
+            "default"
+        );
+        assert!(
+            permission_mode_label(clawedcode_core::permissions::PermissionMode::AcceptEdits)
+                .contains("accept edits")
+        );
+        assert!(
+            permission_mode_label(clawedcode_core::permissions::PermissionMode::Plan)
+                .contains("plan mode")
+        );
+    }
 
-        let ctx = make_context_at(project, sessions_dir);
-        let viewport = TranscriptViewport {
-            pinned_to_bottom: true,
-            ..TranscriptViewport::default()
-        };
-        let busy_footer = footer_status_line(&ctx, true, None, 2, None, &viewport);
-        let busy_hint = footer_hint_line(&ctx, "next prompt", true, None, 2, None, &viewport);
-        let busy_prefix = prompt_prefix_for_state("next prompt", true, None);
+    #[test]
+    fn queued_prompts_render_as_dim_prompt_echoes() {
         let queued_lines = queued_prompt_preview_lines(&[
             "first queued prompt".to_string(),
             "second queued prompt".to_string(),
@@ -3777,13 +4146,31 @@ mod command_policy_tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(busy_footer.contains("2 queued"));
-        assert!(busy_hint.contains("2 queued prompts will run next"));
-        assert_eq!(busy_prefix, "Queue> ");
-        assert!(rendered_queue.contains("Queued prompts"));
-        assert!(rendered_queue.contains("queued> first queued prompt"));
+        assert!(rendered_queue.contains("> first queued prompt"));
+        assert!(rendered_queue.contains("> second queued prompt"));
+    }
 
-        fs::remove_dir_all(root).ok();
+    #[test]
+    fn wrap_input_prefixes_and_wraps() {
+        let lines = wrap_input("hello", 10);
+        assert_eq!(lines, vec!["> hello".to_string()]);
+
+        let wrapped = wrap_input("abcdefghijklmnop", 8);
+        assert_eq!(wrapped.len(), 3);
+
+        let multiline = wrap_input("a\nb", 10);
+        assert_eq!(multiline, vec!["> a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn approval_selector_height_only_when_pending() {
+        let request = ApprovalRequest {
+            tool_use_id: "tool-1".to_string(),
+            tool_name: "shell".to_string(),
+            input: serde_json::json!({"command": "ls -la"}),
+        };
+        assert_eq!(approval_selector_height(None, 0), 0);
+        assert!(approval_selector_height(Some(&request), 0) >= 5);
     }
 
     #[test]
@@ -3806,13 +4193,22 @@ mod command_policy_tests {
         let tasks = tasks_panel(&ctx);
 
         assert_eq!(help.title, "Shortcuts and Commands");
-        assert!(help.lines.iter().any(|line| line.contains("Built-in commands:")));
+        assert!(
+            help.lines
+                .iter()
+                .any(|line| line.contains("Built-in commands:"))
+        );
         assert_eq!(sessions.title, "Recent Sessions");
         assert!(sessions.lines.iter().any(|line| line.contains("Use /fork")));
         assert_eq!(tools.title, "Active Tools");
         assert!(tools.lines[0].contains("built-in="));
         assert_eq!(tasks.title, "Background Tasks");
-        assert!(tasks.lines.iter().any(|line| line.contains("No background tasks")));
+        assert!(
+            tasks
+                .lines
+                .iter()
+                .any(|line| line.contains("No background tasks"))
+        );
 
         fs::remove_dir_all(root).ok();
     }
@@ -3827,16 +4223,16 @@ mod command_policy_tests {
 
         let ctx = make_context_at(project, sessions_dir);
         let panel = help_panel(&ctx);
-        let viewport = TranscriptViewport {
-            pinned_to_bottom: true,
-            ..TranscriptViewport::default()
-        };
-        let status = footer_status_line(&ctx, false, None, 0, Some(&panel), &viewport);
-        let hint = footer_hint_line(&ctx, "", false, None, 0, Some(&panel), &viewport);
+        let body = panel
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
 
-        assert!(status.contains("viewing shortcuts and commands"));
-        assert!(hint.contains("Esc/q/?"));
-        assert!(hint.contains("scroll"));
+        assert_eq!(panel.title, "Shortcuts and Commands");
+        assert!(body.contains("Esc"));
+        assert!(body.contains("Shift+Tab"));
 
         fs::remove_dir_all(root).ok();
     }
@@ -3849,19 +4245,21 @@ mod command_policy_tests {
         fs::create_dir_all(&project).expect("create project dir");
         fs::create_dir_all(&sessions_dir).expect("create sessions dir");
 
-        let ctx = make_context_at(project, sessions_dir);
-        let viewport = TranscriptViewport {
-            scroll_offset: 4,
-            pinned_to_bottom: false,
-            unseen_count: 3,
+        let _ctx = make_context_at(project, sessions_dir);
+        let state = TranscriptModeState {
+            viewport: TranscriptViewport {
+                scroll_offset: 4,
+                pinned_to_bottom: false,
+                unseen_count: 3,
+            },
+            ..TranscriptModeState::default()
         };
-        let status = footer_status_line(&ctx, false, None, 0, None, &viewport);
-        let hint = footer_hint_line(&ctx, "", false, None, 0, None, &viewport);
+        let status = transcript_footer_status_line(&state);
+        let hint = transcript_footer_hint_line(&state);
 
-        assert!(status.contains("scrolled transcript"));
-        assert!(status.contains("3 unseen"));
-        assert!(hint.contains("PgUp"));
-        assert!(hint.contains("End jumps back"));
+        assert!(status.contains("Showing detailed transcript"));
+        assert!(hint.contains("/ search"));
+        assert!(hint.contains("scroll"));
 
         fs::remove_dir_all(root).ok();
     }
@@ -3891,14 +4289,14 @@ mod command_policy_tests {
 
     #[test]
     fn render_row_text_formats_rows_consistently() {
-        assert_eq!(row_text(&RenderRow::User("hello".into())), "You: hello");
+        assert_eq!(row_text(&RenderRow::User("hello".into())), "> hello");
         assert_eq!(
             row_text(&RenderRow::ToolResult {
                 tool_use_id: "abc".into(),
                 content: "ok".into(),
                 is_error: false,
             }),
-            "  [tool_result] abc: ok"
+            "  ⎿  ok"
         );
         assert_eq!(row_text(&RenderRow::Spacer), "");
     }
@@ -3917,12 +4315,12 @@ mod command_policy_tests {
             RenderRow::User("one".to_string()),
             RenderRow::Assistant("two".to_string()),
         ])
-            .expect("export succeeds");
+        .expect("export succeeds");
         assert!(status.starts_with("wrote "));
 
         let path = status.trim_start_matches("wrote ");
         let exported = fs::read_to_string(path).expect("read exported transcript");
-        assert_eq!(exported, "You: one\nClawedCode: two");
+        assert_eq!(exported, "> one\n⏺ two");
         fs::remove_file(path).ok();
     }
 
@@ -3937,7 +4335,11 @@ mod command_policy_tests {
         let mut ctx = make_context_at(project, sessions_dir);
         ctx.set_transport_label(Some("ssh devbox".to_string()));
 
-        let banner = launch_banner(&ctx);
+        let banner = welcome_lines(&ctx)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
         let help = help_overlay_lines(&ctx).join("\n");
         let dashboard = welcome_right_lines(&ctx)
             .into_iter()
@@ -3946,7 +4348,7 @@ mod command_policy_tests {
             .join("\n");
         let compact = session_compact_status(&ctx);
 
-        assert!(banner.contains("via ssh devbox"));
+        assert!(banner.contains("ssh devbox"));
         assert!(help.contains("Transport: ssh devbox"));
         assert!(dashboard.contains("Connection"));
         assert!(dashboard.contains("Interactive transport: ssh devbox"));
@@ -3969,9 +4371,14 @@ mod command_policy_tests {
         );
 
         append_message_to_turn(&mut turn, &message, true);
-        let rendered = turn.rows.iter().map(row_text).collect::<Vec<_>>().join("\n");
+        let rendered = turn
+            .rows
+            .iter()
+            .map(row_text)
+            .collect::<Vec<_>>()
+            .join("\n");
 
-        assert!(rendered.contains("ClawedCode: Remote hello"));
+        assert!(rendered.contains("⏺ Remote hello"));
         assert!(!rendered.contains("clawedcode-transport-session-id"));
     }
 
@@ -3993,7 +4400,14 @@ mod command_policy_tests {
 
         let mut handler = ReplHandler::new(false);
         let mut active_turn = None;
-        handle_slash_command(&mut ctx, &mut handler, "/sessions", &mut active_turn).unwrap();
+        handle_slash_command(
+            &mut ctx,
+            &mut handler,
+            "/sessions",
+            &mut active_turn,
+            &Arc::new(Mutex::new(std::collections::HashSet::new())),
+        )
+        .unwrap();
 
         let panel = handler
             .info_panel
@@ -4026,7 +4440,7 @@ mod command_policy_tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains("Getting started"));
+        assert!(rendered.contains("Get started"));
         assert!(rendered.contains("Ask ClawedCode to create a new app or clone a repository"));
         assert!(!rendered.contains("Tips for getting started"));
 
@@ -4207,7 +4621,7 @@ mod command_policy_tests {
 
             assert_eq!(
                 render_session(&session, false),
-                "You: What is 2+2?\n\nClawedCode: The answer is 4."
+                "> What is 2+2?\n\n⏺ The answer is 4."
             );
         }
 
@@ -4224,10 +4638,7 @@ mod command_policy_tests {
                 ],
             );
 
-            assert_eq!(
-                render_session(&session, false),
-                "You: Hello\n\nClawedCode: Hi there."
-            );
+            assert_eq!(render_session(&session, false), "> Hello\n\n⏺ Hi there.");
         }
 
         #[test]
@@ -4244,7 +4655,7 @@ mod command_policy_tests {
 
             assert_eq!(
                 render_session(&session, true),
-                "You: Hello\n\n  [thinking] Let me think about this.\nClawedCode: Hi there."
+                "> Hello\n\n⏺ Let me think about this.\n⏺ Hi there."
             );
         }
 
@@ -4268,7 +4679,7 @@ mod command_policy_tests {
 
             assert_eq!(
                 render_session(&session, false),
-                "You: Read the file.\n\nClawedCode:\n  [tool] read_file (id=tool-1) {\"path\":\"test.txt\"}\n  [tool_result] tool-1: file contents here"
+                "> Read the file.\n\n⏺ Read(test.txt)\n  ⎿  file contents here"
             );
         }
 
@@ -4285,7 +4696,7 @@ mod command_policy_tests {
 
             assert_eq!(
                 render_session(&session, false),
-                "ClawedCode:\n  [sub-agent: child-se] Completed the task successfully."
+                "⏺ Task(child-se)\n  ⎿  Completed the task successfully."
             );
         }
 
@@ -4318,7 +4729,7 @@ mod command_policy_tests {
 
             assert_eq!(
                 handler.visible_lines().join("\n"),
-                "You: hello\n\n  [thinking] let me think\nClawedCode: Hi"
+                "> hello\n\n⏺ let me think\n⏺ Hi"
             );
         }
 
@@ -4335,7 +4746,7 @@ mod command_policy_tests {
 
             assert_eq!(
                 handler.visible_lines().join("\n"),
-                "You: please inspect\n\nClawedCode:\n  [tool] shell (id=tool-1) {\"command\":\"ls -la\"}\n  [tool_pending] tool-1 awaiting approval"
+                "> please inspect\n\n⏺ Bash(ls -la)\n  ⎿  Awaiting approval…"
             );
         }
 
@@ -4351,7 +4762,7 @@ mod command_policy_tests {
 
             assert_eq!(
                 handler.visible_lines().join("\n"),
-                "You: please inspect\n\nClawedCode:\n  [tool] shell (id=tool-1) {\"command\":\"ls -la\"}"
+                "> please inspect\n\n⏺ Bash(ls -la)"
             );
         }
 
@@ -4370,7 +4781,7 @@ mod command_policy_tests {
 
             assert_eq!(
                 handler.visible_lines().join("\n"),
-                "You: please inspect\n\nClawedCode:\n  [tool] shell (id=tool-1) {\"command\":\"ls -la\"}\n  [tool_pending] tool-1 awaiting approval\n  [tool_approved] tool-1 approved\n  [tool_result] tool-1: done"
+                "> please inspect\n\n⏺ Bash(ls -la)\n  ⎿  Awaiting approval…\n  ⎿  Approved\n  ⎿  done"
             );
 
             let mut denied_handler = ReplHandler::new(false);
@@ -4385,7 +4796,7 @@ mod command_policy_tests {
 
             assert_eq!(
                 denied_handler.visible_lines().join("\n"),
-                "You: please inspect\n\nClawedCode:\n  [tool] shell (id=tool-2) {\"command\":\"ls -la\"}\n  [tool_pending] tool-2 awaiting approval\n  [tool_denied] tool-2 denied"
+                "> please inspect\n\n⏺ Bash(ls -la)\n  ⎿  Awaiting approval…\n  ⎿  Denied by user"
             );
         }
 
@@ -4452,21 +4863,24 @@ mod command_policy_tests {
             let mut active_turn = None;
 
             let command = format!("/fork {}", &source_id.to_string()[..8]);
-            let handled =
-                handle_slash_command(&mut ctx, &mut handler, &command, &mut active_turn).unwrap();
+            let handled = handle_slash_command(
+                &mut ctx,
+                &mut handler,
+                &command,
+                &mut active_turn,
+                &Arc::new(Mutex::new(std::collections::HashSet::new())),
+            )
+            .unwrap();
 
             assert!(handled);
             assert_ne!(ctx.session().id, old_active);
             assert_ne!(ctx.session().id, source_id);
             assert_eq!(ctx.session().execution_mode, SessionMode::Interactive);
             assert_eq!(ctx.session().messages, source.messages);
-            assert!(handler
-                .overlay_rows
-                .iter()
-                .any(|line| {
-                    let text = row_text(line);
-                    text.contains("Forked ") && text.contains(" -> ")
-                }));
+            assert!(handler.overlay_rows.iter().any(|line| {
+                let text = row_text(line);
+                text.contains("Forked ") && text.contains(" -> ")
+            }));
 
             fs::remove_dir_all(root).ok();
         }

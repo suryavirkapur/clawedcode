@@ -239,7 +239,11 @@ impl TaskStore {
                     merged.insert(key, value);
                 }
             }
-            task.metadata = if merged.is_empty() { None } else { Some(merged) };
+            task.metadata = if merged.is_empty() {
+                None
+            } else {
+                Some(merged)
+            };
             updated_fields.push("metadata".to_string());
         }
 
@@ -400,7 +404,9 @@ pub fn execute_task_tool(
     session: &Session,
 ) -> Result<Option<ToolResult>, String> {
     match tool_name {
-        TASK_CREATE_TOOL_NAME => execute_task_create(TaskStore::for_session(session)?, input).map(Some),
+        TASK_CREATE_TOOL_NAME => {
+            execute_task_create(TaskStore::for_session(session)?, input).map(Some)
+        }
         TASK_LIST_TOOL_NAME => execute_task_list(TaskStore::for_session(session)?).map(Some),
         TASK_GET_TOOL_NAME => execute_task_get(TaskStore::for_session(session)?, input).map(Some),
         TASK_UPDATE_TOOL_NAME => {
@@ -549,7 +555,10 @@ fn execute_task_update(store: TaskStore, input: Value) -> Result<ToolResult, Str
         None => None,
     };
     let patch = TaskPatch {
-        subject: input.get("subject").and_then(Value::as_str).map(str::to_string),
+        subject: input
+            .get("subject")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         description: input
             .get("description")
             .and_then(Value::as_str)
@@ -559,7 +568,10 @@ fn execute_task_update(store: TaskStore, input: Value) -> Result<ToolResult, Str
             .and_then(Value::as_str)
             .map(str::to_string),
         status,
-        owner: input.get("owner").and_then(Value::as_str).map(str::to_string),
+        owner: input
+            .get("owner")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         metadata_merge: input.get("metadata").and_then(Value::as_object).cloned(),
         add_blocks: input
             .get("addBlocks")

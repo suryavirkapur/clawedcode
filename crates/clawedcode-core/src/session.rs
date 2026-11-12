@@ -551,7 +551,9 @@ mod tests {
         session.transport_session_id = None;
         session.push_blocks(
             Role::Assistant,
-            vec![ContentBlock::thinking(transport_session_id_marker("remote-123"))],
+            vec![ContentBlock::thinking(transport_session_id_marker(
+                "remote-123",
+            ))],
         );
 
         session.save(&dir).unwrap();
@@ -568,7 +570,9 @@ mod tests {
 
         session.push_blocks(
             Role::Assistant,
-            vec![ContentBlock::thinking(transport_session_id_marker("remote-456"))],
+            vec![ContentBlock::thinking(transport_session_id_marker(
+                "remote-456",
+            ))],
         );
 
         assert_eq!(session.transport_session_id.as_deref(), Some("remote-456"));
@@ -579,7 +583,9 @@ mod tests {
         let mut session = Session::with_mode(PathBuf::from("/tmp/test"), SessionMode::Ssh);
         session.push_blocks(
             Role::Assistant,
-            vec![ContentBlock::thinking(transport_session_id_marker("remote-789"))],
+            vec![ContentBlock::thinking(transport_session_id_marker(
+                "remote-789",
+            ))],
         );
 
         let forked = session.fork();

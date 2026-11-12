@@ -7,8 +7,8 @@ use crate::{
     runtime::{Runtime, casual_reply_for_prompt},
     session::{Role, Session, SessionMode, transport_session_id_marker},
     subagent::{
-        CompletedSubAgentTask, SubAgentConfig, SubAgentResult, SubAgentRuntime,
-        SubAgentTaskState, drain_completed_subagent_tasks_for_parent,
+        CompletedSubAgentTask, SubAgentConfig, SubAgentResult, SubAgentRuntime, SubAgentTaskState,
+        drain_completed_subagent_tasks_for_parent,
     },
     tool_input::decode_tool_input,
 };
@@ -210,8 +210,9 @@ impl TuiContext {
                     }
                     if let Some(transport_session_id) = result.transport_session_id {
                         self.session.transport_session_id = Some(transport_session_id.clone());
-                        assistant_blocks
-                            .push(ContentBlock::thinking(transport_session_id_marker(&transport_session_id)));
+                        assistant_blocks.push(ContentBlock::thinking(transport_session_id_marker(
+                            &transport_session_id,
+                        )));
                     }
                     if assistant_blocks.is_empty() {
                         assistant_blocks.push(ContentBlock::text(""));
@@ -405,12 +406,32 @@ impl TuiContext {
         self.session.clone()
     }
 
+    pub fn permission_mode(&self) -> PermissionMode {
+        self.runtime.permission_mode()
+    }
+
+    pub fn set_permission_mode(&mut self, mode: PermissionMode) {
+        self.runtime.set_permission_mode(mode);
+    }
+
+    /// Claude Code-style shift+tab cycle: default → accept edits → plan → default.
+    pub fn cycle_permission_mode(&mut self) -> PermissionMode {
+        let next = match self.runtime.permission_mode() {
+            PermissionMode::Default => PermissionMode::AcceptEdits,
+            PermissionMode::AcceptEdits => PermissionMode::Plan,
+            PermissionMode::Plan => PermissionMode::Default,
+            PermissionMode::Bypass => PermissionMode::Default,
+        };
+        self.runtime.set_permission_mode(next);
+        next
+    }
+
     pub fn replacement_runtime(&self) -> Runtime {
         Runtime::with_mode(
             self.config.clone(),
             self.system_prompt.clone(),
             self.runtime.compatibility.clone(),
-            PermissionMode::Default,
+            self.runtime.permission_mode(),
         )
     }
 
@@ -440,7 +461,7 @@ impl TuiContext {
             self.config.clone(),
             self.system_prompt.clone(),
             compatibility,
-            PermissionMode::Default,
+            self.runtime.permission_mode(),
         );
         self.last_compatibility_refresh = Instant::now();
         Ok(())
@@ -745,10 +766,7 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, TuiEvent::AssistantDone))
         );
-        assert_eq!(
-            executor.calls(),
-            vec![("hello".to_string(), None, None)]
-        );
+        assert_eq!(executor.calls(), vec![("hello".to_string(), None, None)]);
     }
 
     #[test]

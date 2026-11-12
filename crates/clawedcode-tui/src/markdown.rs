@@ -149,7 +149,14 @@ pub fn parse_markdown(text: &str) -> Vec<Line<'static>> {
 fn parse_header(line: &str) -> Option<Line<'static>> {
     let trimmed = line.trim_start();
     let level = trimmed.chars().take_while(|&c| c == '#').count();
-    if level == 0 || level > 6 || !trimmed.chars().nth(level).map(|c| c == ' ').unwrap_or(false) {
+    if level == 0
+        || level > 6
+        || !trimmed
+            .chars()
+            .nth(level)
+            .map(|c| c == ' ')
+            .unwrap_or(false)
+    {
         return None;
     }
     let text = trimmed[level..].trim();
@@ -158,12 +165,8 @@ fn parse_header(line: &str) -> Option<Line<'static>> {
             .fg(HEADER_FG)
             .add_modifier(Modifier::BOLD)
             .add_modifier(Modifier::UNDERLINED),
-        2 => Style::default()
-            .fg(HEADER_FG)
-            .add_modifier(Modifier::BOLD),
-        _ => Style::default()
-            .fg(BOLD_FG)
-            .add_modifier(Modifier::BOLD),
+        2 => Style::default().fg(HEADER_FG).add_modifier(Modifier::BOLD),
+        _ => Style::default().fg(BOLD_FG).add_modifier(Modifier::BOLD),
     };
     Some(Line::from(Span::styled(text.to_string(), style)))
 }
@@ -286,9 +289,7 @@ fn style_span(text: &str, style: InlineStyle) -> Span<'static> {
     match style {
         InlineStyle::Bold => Span::styled(
             text.to_string(),
-            Style::default()
-                .fg(BOLD_FG)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(BOLD_FG).add_modifier(Modifier::BOLD),
         ),
         InlineStyle::Italic => Span::styled(
             text.to_string(),
@@ -296,30 +297,11 @@ fn style_span(text: &str, style: InlineStyle) -> Span<'static> {
                 .fg(ITALIC_FG)
                 .add_modifier(Modifier::ITALIC),
         ),
-        InlineStyle::Code => Span::styled(
-            text.to_string(),
-            Style::default().fg(CODE_FG).bg(CODE_BG),
-        ),
-    }
-}
-
-/// Convert a plain text block (like tool results) into wrapped lines.
-pub fn format_plain_text(text: &str, prefix: &str) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    for raw_line in text.lines() {
-        if raw_line.trim().is_empty() {
-            lines.push(Line::from(""));
-        } else {
-            lines.push(Line::from(vec![
-                Span::styled(prefix.to_string(), Style::default().fg(MUTED)),
-                Span::raw(raw_line.to_string()),
-            ]));
+        InlineStyle::Code => {
+            Span::styled(text.to_string(), Style::default().fg(CODE_FG).bg(CODE_BG))
         }
     }
-    lines
 }
-
-const MUTED: Color = Color::Rgb(150, 150, 150);
 
 #[cfg(test)]
 mod tests {
@@ -330,7 +312,11 @@ mod tests {
         let lines = parse_markdown("This is **bold** text");
         assert_eq!(lines.len(), 1);
         let spans = &lines[0].spans;
-        assert!(spans.iter().any(|s| s.content == "bold" && s.style.add_modifier == Modifier::BOLD));
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.content == "bold" && s.style.add_modifier == Modifier::BOLD)
+        );
     }
 
     #[test]
@@ -338,7 +324,11 @@ mod tests {
         let lines = parse_markdown("This is *italic* text");
         assert_eq!(lines.len(), 1);
         let spans = &lines[0].spans;
-        assert!(spans.iter().any(|s| s.content == "italic" && s.style.add_modifier == Modifier::ITALIC));
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.content == "italic" && s.style.add_modifier == Modifier::ITALIC)
+        );
     }
 
     #[test]

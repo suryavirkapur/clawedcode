@@ -207,7 +207,11 @@ mod tests {
     fn render_update_command_joins_program_and_args() {
         let command = render_update_command(
             "cargo",
-            &["install".to_string(), "clawedcode".to_string(), "--force".to_string()],
+            &[
+                "install".to_string(),
+                "clawedcode".to_string(),
+                "--force".to_string(),
+            ],
         );
 
         assert_eq!(command, "cargo install clawedcode --force");
@@ -249,7 +253,10 @@ mod tests {
 
         let err = run_self_update().expect_err("failing update should error");
         let message = err.to_string();
-        assert!(message.contains("update command `cargo install clawedcode --force` exited with status"));
+        assert!(
+            message
+                .contains("update command `cargo install clawedcode --force` exited with status")
+        );
 
         match original_path {
             Some(path) => unsafe { std::env::set_var("PATH", path) },

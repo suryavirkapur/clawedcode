@@ -182,7 +182,11 @@ fn session_guidance_section(ctx: &PromptRenderContext<'_>) -> String {
         );
     }
 
-    if ctx.tool_names.iter().any(|name| name == "ListMcpResourcesTool") {
+    if ctx
+        .tool_names
+        .iter()
+        .any(|name| name == "ListMcpResourcesTool")
+    {
         lines.push(
             "- Use MCP helper tools to discover resources before reading them directly."
                 .to_string(),
@@ -239,7 +243,10 @@ fn environment_section(session: &Session, model: &str) -> String {
         "## Environment".to_string(),
         "You have been invoked in the following environment:".to_string(),
         format!("- Primary working directory: {}", cwd.display()),
-        format!("- Is a git repository: {}", if is_git { "true" } else { "false" }),
+        format!(
+            "- Is a git repository: {}",
+            if is_git { "true" } else { "false" }
+        ),
         format!("- Platform: {}", env::consts::OS),
         format!("- Shell: {shell}"),
         format!("- Date: {date}"),
