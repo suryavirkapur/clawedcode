@@ -1967,7 +1967,7 @@ fn approval_selector_height(request: Option<&ApprovalRequest>, _selected: usize)
         return 0;
     }
     // border + title + blank + input + blank + question + 3 options + blank + footer
-    10
+    11
 }
 
 /// Permission dialog: a top-only rounded border in `permission` blue, the
@@ -4836,6 +4836,82 @@ mod command_policy_tests {
             cwd,
             sessions_dir,
         )
+    }
+
+    fn buffer_lines(terminal: &Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn approval_dialog_has_reference_geometry() {
+        let ctx = make_context_at(temp_dir("approval"), temp_dir("approval_sessions"));
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(60, 12)).expect("terminal");
+        let request = ApprovalRequest {
+            tool_use_id: "t1".to_string(),
+            tool_name: "shell".to_string(),
+            input: serde_json::json!({"command": "ls -la"}),
+        };
+        terminal
+            .draw(|frame| {
+                render_approval_selector(frame, Rect::new(0, 0, 60, 11), &request, 0, &ctx);
+            })
+            .expect("draw");
+        let text = buffer_lines(&terminal).join("\n");
+        assert!(text.contains("╭"), "top border: {text}");
+        assert!(text.contains("Bash command"), "title: {text}");
+        assert!(text.contains("ls -la"), "input: {text}");
+        assert!(text.contains("Do you want to proceed?"), "question: {text}");
+        assert!(text.contains("❯ 1. Yes"), "focused option: {text}");
+        assert!(text.contains("don't ask again"), "option 2: {text}");
+        assert!(text.contains("Esc to cancel"), "footer: {text}");
+    }
+
+    #[test]
+    fn input_box_has_pointer_and_borders() {
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(40, 4)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_input_box(frame, Rect::new(0, 0, 40, 4), "hello", 5, false);
+            })
+            .expect("draw");
+        let lines = buffer_lines(&terminal);
+        assert!(
+            lines[0].starts_with('╭') && lines[0].ends_with('╮'),
+            "top: {}",
+            lines[0]
+        );
+        assert!(
+            lines[3].starts_with('╰') && lines[3].ends_with('╯'),
+            "bottom: {}",
+            lines[3]
+        );
+        assert!(lines[1].starts_with("❯ hello"), "pointer: {}", lines[1]);
+    }
+
+    #[test]
+    fn bash_mode_input_swaps_pointer() {
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(40, 4)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_input_box(frame, Rect::new(0, 0, 40, 4), "!ls -la", 7, false);
+            })
+            .expect("draw");
+        let lines = buffer_lines(&terminal);
+        assert!(
+            lines[1].starts_with("! ls -la"),
+            "bash pointer: {}",
+            lines[1]
+        );
     }
 
     fn write_skill(root: &Path, file_name: &str, name: &str, body: &str) {
