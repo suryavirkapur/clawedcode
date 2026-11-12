@@ -5966,14 +5966,25 @@ PR number: {args}"#
                         );
                         return Ok(true);
                     }
+                    // Reference: /compact accepts optional summarization
+                    // instructions that steer what the summary keeps.
+                    let instructions = prompt
+                        .strip_prefix("/compact")
+                        .map(str::trim)
+                        .unwrap_or_default();
+                    let exec_prompt = if instructions.is_empty() {
+                        "Write a compact summary of the conversation so far: what was accomplished, key decisions, files touched, and what remains to do. Reply with only the summary."
+                            .to_string()
+                    } else {
+                        format!(
+                            "Write a compact summary of the conversation so far: what was accomplished, key decisions, files touched, and what remains to do. Reply with only the summary.\n\nAdditional summarization instructions: {instructions}"
+                        )
+                    };
                     handler.begin_live_turn("/compact");
                     let mut turn = spawn_turn_worker(
                         ctx,
                         "/compact".to_string(),
-                        Some(
-                            "Write a compact summary of the conversation so far: what was accomplished, key decisions, files touched, and what remains to do. Reply with only the summary."
-                                .to_string(),
-                        ),
+                        Some(exec_prompt),
                         always_allowed.clone(),
                     );
                     turn.compacting = true;
