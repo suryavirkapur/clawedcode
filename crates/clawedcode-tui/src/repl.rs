@@ -454,6 +454,9 @@ struct ReplHandler {
     quit_requested: bool,
     model_picker: Option<usize>,
     turn_tokens: u64,
+    total_input_tokens: u64,
+    total_output_tokens: u64,
+    total_cache_read_tokens: u64,
 }
 
 impl ReplHandler {
@@ -472,6 +475,9 @@ impl ReplHandler {
             quit_requested: false,
             model_picker: None,
             turn_tokens: 0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_cache_read_tokens: 0,
         }
     }
 
@@ -686,8 +692,20 @@ impl TuiHandler for ReplHandler {
             } => {
                 self.record_live_tool_result(tool_use_id, content.clone(), *is_error);
             }
-            TuiEvent::Usage { tokens } => {
-                self.turn_tokens = self.turn_tokens.saturating_add(*tokens);
+            TuiEvent::Usage {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+            } => {
+                let turn = input_tokens
+                    .saturating_add(*output_tokens)
+                    .saturating_add(*cache_read_tokens);
+                self.turn_tokens = self.turn_tokens.saturating_add(turn);
+                self.total_input_tokens = self.total_input_tokens.saturating_add(*input_tokens);
+                self.total_output_tokens = self.total_output_tokens.saturating_add(*output_tokens);
+                self.total_cache_read_tokens = self
+                    .total_cache_read_tokens
+                    .saturating_add(*cache_read_tokens);
             }
             TuiEvent::AssistantDone | TuiEvent::TurnComplete => {
                 self.state = AppState::Idle;
@@ -3827,7 +3845,9 @@ fn to_tui_event(event: &ApiEvent) -> Option<TuiEvent> {
             is_error: tool_result.is_error,
         }),
         ApiEvent::Usage { usage } => Some(TuiEvent::Usage {
-            tokens: usage.input_tokens + usage.output_tokens + usage.cache_read_tokens,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
         }),
         ApiEvent::Completed => None,
     }
@@ -3891,6 +3911,108 @@ fn handle_slash_command(
                 }
                 "/exit" | "/quit" => {
                     handler.request_quit();
+                    return Ok(true);
+                }
+                "/version" => {
+                    handler.push_overlay(format!(
+                        "[info] v{} (ClawedCode)",
+                        env!("CARGO_PKG_VERSION")
+                    ));
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/usage" => {
+                    let lines = vec![
+                        format!(
+                            "Session tokens: {}",
+                            handler
+                                .total_input_tokens
+                                .saturating_add(handler.total_output_tokens)
+                                .saturating_add(handler.total_cache_read_tokens)
+                        ),
+                        format!("Input tokens: {}", handler.total_input_tokens),
+                        format!("Output tokens: {}", handler.total_output_tokens),
+                        format!("Cache read tokens: {}", handler.total_cache_read_tokens),
+                        format!("Model: {} · {}", ctx.model_name(), provider_label()),
+                    ];
+                    handler.show_panel("Usage".to_string(), lines);
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/stats" => {
+                    let session = ctx.session();
+                    let tool_calls = session
+                        .messages
+                        .iter()
+                        .flat_map(|m| m.content_blocks.iter())
+                        .filter(|b| matches!(b, ContentBlock::ToolUse { .. }))
+                        .count();
+                    let lines = vec![
+                        format!("Messages: {}", session.messages.len()),
+                        format!(
+                            "User: {} · Assistant: {}",
+                            session
+                                .messages
+                                .iter()
+                                .filter(|m| m.role == Role::User)
+                                .count(),
+                            session
+                                .messages
+                                .iter()
+                                .filter(|m| m.role == Role::Assistant)
+                                .count()
+                        ),
+                        format!("Tool calls: {tool_calls}"),
+                        format!(
+                            "Tokens this session: {}",
+                            handler
+                                .total_input_tokens
+                                .saturating_add(handler.total_output_tokens)
+                                .saturating_add(handler.total_cache_read_tokens)
+                        ),
+                        format!("Session: {}", session.id),
+                        format!(
+                            "Created: {}",
+                            session.created_at.format("%Y-%m-%d %H:%M:%S")
+                        ),
+                        format!(
+                            "Mode: {}",
+                            session_mode_label(session.execution_mode.clone())
+                        ),
+                    ];
+                    handler.show_panel("Stats".to_string(), lines);
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/rename" => {
+                    let title = prompt
+                        .strip_prefix("/rename")
+                        .map(str::trim)
+                        .unwrap_or_default();
+                    if title.is_empty() {
+                        handler.push_overlay("[info] Usage: /rename <title>".to_string());
+                    } else {
+                        ctx.session_mut().title = Some(title.to_string());
+                        handler.push_overlay(format!("[info] Session renamed to `{title}`"));
+                    }
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/config" => {
+                    let path = clawedcode_core::config::default_config_path()
+                        .map(|p| display_path(&p))
+                        .unwrap_or_else(|| "(none)".to_string());
+                    let lines = vec![
+                        format!("Config file: {path}"),
+                        format!("Model: {}", ctx.model_name()),
+                        format!("Provider: {}", provider_label()),
+                        format!("API key env: {}", ctx.provider_api_key_env()),
+                        format!("Mode: {}", permission_mode_label(ctx.permission_mode())),
+                        format!("Sessions dir: {}", display_path(&ctx.sessions_dir)),
+                        format!("Thinking: {}", if ctx.show_thinking { "on" } else { "off" }),
+                    ];
+                    handler.show_panel("Config".to_string(), lines);
+                    let _ = ctx.save_session();
                     return Ok(true);
                 }
                 "/status" => {
@@ -4355,6 +4477,31 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
         CommandEntry {
             name: "/context".to_string(),
             description: "Show session context size and message counts".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/version".to_string(),
+            description: "Show the ClawedCode version".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/usage".to_string(),
+            description: "Show token usage for this session".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/stats".to_string(),
+            description: "Show session statistics".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/rename".to_string(),
+            description: "Rename the current session".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/config".to_string(),
+            description: "Show configuration file and settings".to_string(),
             source: CommandSource::BuiltIn,
         },
         CommandEntry {
@@ -4930,8 +5077,10 @@ fn recent_activity(ctx: &TuiContext, limit: usize) -> Vec<String> {
         .take(limit)
         .map(|session| {
             let summary = session
-                .last_user_text()
-                .map(truncate_summary)
+                .title
+                .clone()
+                .or_else(|| session.last_user_text().map(str::to_string))
+                .map(|text| truncate_summary(&text))
                 .unwrap_or_else(|| "No prompt".to_string());
             format!(
                 "{summary} ({})",

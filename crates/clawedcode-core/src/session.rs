@@ -40,6 +40,8 @@ pub struct Session {
     pub transport_session_id: Option<String>,
     #[serde(default)]
     pub execution_mode: SessionMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -131,6 +133,7 @@ impl Session {
             child_sessions: Vec::new(),
             transport_session_id: None,
             execution_mode: mode,
+            title: None,
         }
         .with_default_task_list_id()
     }
@@ -161,6 +164,7 @@ impl Session {
             child_sessions: Vec::new(),
             transport_session_id: None,
             execution_mode: mode,
+            title: None,
         }
     }
 
@@ -177,6 +181,7 @@ impl Session {
             child_sessions: Vec::new(),
             transport_session_id: None,
             execution_mode: SessionMode::Interactive,
+            title: None,
         }
         .with_default_task_list_id()
     }
@@ -257,6 +262,7 @@ impl Session {
             child_sessions: Vec::new(),
             transport_session_id: None,
             execution_mode: SessionMode::Interactive,
+            title: None,
         }
     }
 }

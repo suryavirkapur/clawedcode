@@ -80,7 +80,9 @@ pub enum TuiEvent {
         is_error: bool,
     },
     Usage {
-        tokens: u64,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
     },
     AssistantDone,
     TurnComplete,
