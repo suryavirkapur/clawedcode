@@ -1567,6 +1567,18 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         palette_index = 0;
                         palette_touched = false;
                     }
+                    KeyCode::Up if !queued_prompts.is_empty() => {
+                        // Like the reference's popAllCommandsFromQueue: Up moves
+                        // queued prompts back into the input for editing.
+                        let mut restored = queued_prompts.join("\n");
+                        if !input_buffer.is_empty() {
+                            restored.push('\n');
+                            restored.push_str(&input_buffer);
+                        }
+                        queued_prompts.clear();
+                        input_buffer = restored;
+                        cursor_pos = input_buffer.len();
+                    }
                     KeyCode::Up if history_index.is_some() || !history.is_empty() => {
                         history_nav(
                             &mut input_buffer,
