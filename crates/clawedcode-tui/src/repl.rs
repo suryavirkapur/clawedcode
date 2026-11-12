@@ -264,6 +264,12 @@ const BUILTIN_COMMANDS: &[&str] = &[
     "/sessions",
     "/fork",
     "/tools",
+    "/status",
+    "/model",
+    "/permissions",
+    "/init",
+    "/exit",
+    "/quit",
 ];
 
 fn is_reserved_command(name: &str) -> bool {
@@ -407,6 +413,7 @@ struct ReplHandler {
     show_thinking: bool,
     state: AppState,
     expanded_tool_results: std::collections::HashSet<String>,
+    quit_requested: bool,
 }
 
 impl ReplHandler {
@@ -422,7 +429,12 @@ impl ReplHandler {
             show_thinking,
             state: AppState::Idle,
             expanded_tool_results: std::collections::HashSet::new(),
+            quit_requested: false,
         }
+    }
+
+    fn request_quit(&mut self) {
+        self.quit_requested = true;
     }
 
     fn rebuild_from_session(&mut self, session: &Session, show_thinking: bool) {
@@ -1525,6 +1537,9 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                                     handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
                                 }
                             }
+                            if handler.quit_requested {
+                                break;
+                            }
                         } else if !input_buffer.trim().is_empty() {
                             let prompt = input_buffer.trim().to_string();
                             input_buffer.clear();
@@ -1595,6 +1610,9 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                                     expand_at_mentions(&prompt, &ctx.session().cwd),
                                     always_allowed.clone(),
                                 ));
+                            }
+                            if handler.quit_requested {
+                                break;
                             }
                         }
                     }
@@ -3462,6 +3480,75 @@ fn handle_slash_command(
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
+                "/exit" | "/quit" => {
+                    handler.request_quit();
+                    return Ok(true);
+                }
+                "/status" => {
+                    let panel = status_panel(ctx);
+                    handler.show_panel(panel.title, panel.lines);
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/model" => {
+                    let panel = InfoPanel {
+                        title: "Model".to_string(),
+                        status: None,
+                        lines: vec![
+                            format!("Current model: {}", ctx.model_name()),
+                            format!("Provider: {}", provider_label()),
+                            "Restart with --model <name> to switch.".to_string(),
+                        ],
+                    };
+                    handler.show_panel(panel.title, panel.lines);
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/permissions" => {
+                    let mut lines = vec![format!(
+                        "Mode: {}",
+                        permission_mode_label(ctx.permission_mode())
+                    )];
+                    if let Ok(set) = always_allowed.lock() {
+                        if set.is_empty() {
+                            lines.push("No saved allow rules".to_string());
+                        } else {
+                            let mut rules: Vec<_> = set.iter().cloned().collect();
+                            rules.sort();
+                            lines.push(format!(
+                                "Always allowed: {}",
+                                rules
+                                    .iter()
+                                    .map(|name| tool_display_name(name))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ));
+                        }
+                    }
+                    let panel = InfoPanel {
+                        title: "Permissions".to_string(),
+                        status: None,
+                        lines,
+                    };
+                    handler.show_panel(panel.title, panel.lines);
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/init" => {
+                    if active_turn.is_some() {
+                        handler.push_overlay("[warn] A turn is already running.".to_string());
+                    } else {
+                        let init_prompt = "Analyze this codebase and create a CLAUDE.md file in the project root. It should document the build and test commands, code layout, conventions, and anything an agent should know to work effectively here.";
+                        handler.begin_live_turn("/init".to_string());
+                        *active_turn = Some(spawn_turn_worker(
+                            ctx,
+                            "/init".to_string(),
+                            Some(init_prompt.to_string()),
+                            always_allowed.clone(),
+                        ));
+                    }
+                    return Ok(true);
+                }
                 "/update" => {
                     let install_method = clawedcode_core::update::detect_install_method();
                     if !update_is_supported(install_method) {
@@ -4306,6 +4393,32 @@ fn open_external_editor(initial: &str) -> Option<String> {
             edited.map(|text| text.trim_end_matches('\n').to_string())
         }
         _ => None,
+    }
+}
+
+fn status_panel(ctx: &TuiContext) -> InfoPanel {
+    let session = ctx.session();
+    InfoPanel {
+        title: "Status".to_string(),
+        status: None,
+        lines: vec![
+            format!("ClawedCode v{}", env!("CARGO_PKG_VERSION")),
+            format!("Model: {} · {}", ctx.model_name(), provider_label()),
+            format!("Mode: {}", permission_mode_label(ctx.permission_mode())),
+            format!("Session: {}", session.id),
+            format!("Working directory: {}", display_path(&session.cwd)),
+            format!("Messages: {}", session.messages.len()),
+            format!(
+                "Transport: {}",
+                ctx.transport_label().unwrap_or("local session")
+            ),
+            format!(
+                "Commands: {} · Tools: {} · Skills: {}",
+                all_command_entries(ctx).len(),
+                ctx.tool_specs().len(),
+                ctx.skills().len()
+            ),
+        ],
     }
 }
 
