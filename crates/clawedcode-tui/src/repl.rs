@@ -440,6 +440,14 @@ const BUILTIN_COMMANDS: &[&str] = &[
     "/rename",
     "/config",
     "/vim",
+    "/todos",
+    "/agents",
+    "/hooks",
+    "/env",
+    "/branch",
+    "/cost",
+    "/session",
+    "/output-style",
 ];
 
 fn is_reserved_command(name: &str) -> bool {
@@ -5071,6 +5079,106 @@ fn handle_slash_command(
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
+                "/todos" => {
+                    let panel = todos_panel(ctx);
+                    handler.show_panel(panel.title, panel.lines);
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/agents" => {
+                    let tasks = list_subagent_tasks_for_parent(ctx.session().id);
+                    let lines = if tasks.is_empty() {
+                        vec!["No sub-agent tasks for this session.".to_string()]
+                    } else {
+                        tasks.iter().map(format_subagent_task_line).collect()
+                    };
+                    handler.show_panel("Agents".to_string(), lines);
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/hooks" => {
+                    // Claude Code lists configured lifecycle hooks here; this
+                    // clone has no hooks subsystem yet, so report honestly.
+                    handler.show_panel(
+                        "Hooks".to_string(),
+                        vec!["No hooks configured.".to_string()],
+                    );
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/env" => {
+                    let lines = vec![
+                        format!("Provider: {}", provider_label()),
+                        format!("Model: {}", ctx.model_name()),
+                        format!("API key env: {}", ctx.provider_api_key_env()),
+                        format!("Transport: {}", ctx.transport_label().unwrap_or("local")),
+                        format!("Cwd: {}", display_path(&ctx.session().cwd)),
+                        format!("Session: {}", ctx.session().id),
+                    ];
+                    handler.show_panel("Environment".to_string(), lines);
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/branch" => {
+                    let branch = std::process::Command::new("git")
+                        .args(["branch", "--show-current"])
+                        .current_dir(&ctx.session().cwd)
+                        .output()
+                        .ok()
+                        .and_then(|o| {
+                            if o.status.success() {
+                                String::from_utf8(o.stdout).ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .map(|b| b.trim().to_string())
+                        .filter(|b| !b.is_empty())
+                        .unwrap_or_else(|| "(not a git repository or detached HEAD)".to_string());
+                    handler.show_panel("Branch".to_string(), vec![branch]);
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/cost" => {
+                    // Alias of /usage — the reference tracks cost where billing
+                    // exists; this clone reports token usage instead.
+                    let lines = vec![
+                        format!(
+                            "Session tokens: {}",
+                            handler
+                                .total_input_tokens
+                                .saturating_add(handler.total_output_tokens)
+                                .saturating_add(handler.total_cache_read_tokens)
+                        ),
+                        format!("Model: {}", ctx.model_name()),
+                    ];
+                    handler.show_panel("Cost".to_string(), lines);
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/session" => {
+                    let session = ctx.session();
+                    let lines = vec![
+                        format!("Id: {}", session.id),
+                        format!(
+                            "Title: {}",
+                            session.title.as_deref().unwrap_or("(untitled)")
+                        ),
+                        format!("Messages: {}", session.messages.len()),
+                        format!("Cwd: {}", display_path(&session.cwd)),
+                    ];
+                    handler.show_panel("Session".to_string(), lines);
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/output-style" => {
+                    handler.show_panel(
+                        "Output style".to_string(),
+                        vec!["default — no other output styles installed.".to_string()],
+                    );
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
                 "/stats" => {
                     let session = ctx.session();
                     let tool_calls = session
@@ -5711,6 +5819,46 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
         CommandEntry {
             name: "/vim".to_string(),
             description: "Toggle vim modal editing".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/todos".to_string(),
+            description: "Show session todo list".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/agents".to_string(),
+            description: "List sub-agent tasks".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/hooks".to_string(),
+            description: "Show configured hooks".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/env".to_string(),
+            description: "Show environment info".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/branch".to_string(),
+            description: "Show current git branch".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/cost".to_string(),
+            description: "Show session cost/usage".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/session".to_string(),
+            description: "Show session details".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/output-style".to_string(),
+            description: "Show or pick output style".to_string(),
             source: CommandSource::BuiltIn,
         },
         CommandEntry {
