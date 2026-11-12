@@ -1255,18 +1255,31 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                             .rev()
                             .find(|&index| history[index].contains(query))
                     };
+                    let mut execute_match = false;
                     match key.code {
-                        KeyCode::Esc => {
-                            input_buffer = history_search_stash.clone();
-                            cursor_pos = input_buffer.len();
-                            history_search = None;
-                        }
-                        KeyCode::Enter => {
+                        // esc/tab accept the match into the input for editing.
+                        KeyCode::Esc | KeyCode::Tab => {
                             if let Some(index) = match_index {
                                 input_buffer = history[index].clone();
                                 cursor_pos = input_buffer.len();
                             }
                             history_search = None;
+                        }
+                        // enter runs the matched command immediately.
+                        KeyCode::Enter => {
+                            if let Some(index) = match_index {
+                                input_buffer = history[index].clone();
+                                cursor_pos = input_buffer.len();
+                                execute_match = true;
+                            }
+                            history_search = None;
+                        }
+                        // ctrl+c cancels back to the pre-search input.
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            input_buffer = history_search_stash.clone();
+                            cursor_pos = input_buffer.len();
+                            history_search = None;
+                            continue;
                         }
                         KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             let before = match_index.unwrap_or(history.len());
@@ -1289,7 +1302,9 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                             history_search = None;
                         }
                     }
-                    continue;
+                    if !execute_match {
+                        continue;
+                    }
                 }
 
                 if handler.info_panel.is_some() {
