@@ -79,6 +79,9 @@ pub enum TuiEvent {
         content: String,
         is_error: bool,
     },
+    Usage {
+        tokens: u64,
+    },
     AssistantDone,
     TurnComplete,
 }

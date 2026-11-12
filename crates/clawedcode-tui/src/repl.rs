@@ -453,6 +453,7 @@ struct ReplHandler {
     expanded_tool_results: std::collections::HashSet<String>,
     quit_requested: bool,
     model_picker: Option<usize>,
+    turn_tokens: u64,
 }
 
 impl ReplHandler {
@@ -470,6 +471,7 @@ impl ReplHandler {
             expanded_tool_results: std::collections::HashSet::new(),
             quit_requested: false,
             model_picker: None,
+            turn_tokens: 0,
         }
     }
 
@@ -530,6 +532,7 @@ impl ReplHandler {
 
     fn begin_live_turn(&mut self, prompt: impl Into<String>) {
         self.clear_live_turn();
+        self.turn_tokens = 0;
         self.live_user_prompt = Some(prompt.into());
     }
 
@@ -682,6 +685,9 @@ impl TuiHandler for ReplHandler {
                 is_error,
             } => {
                 self.record_live_tool_result(tool_use_id, content.clone(), *is_error);
+            }
+            TuiEvent::Usage { tokens } => {
+                self.turn_tokens = self.turn_tokens.saturating_add(*tokens);
             }
             TuiEvent::AssistantDone | TuiEvent::TurnComplete => {
                 self.state = AppState::Idle;
@@ -964,7 +970,10 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
             }
 
             if spinner_height > 0 {
-                frame.render_widget(Paragraph::new(spinner_line(turn_started_at)), chunks[4]);
+                frame.render_widget(
+                    Paragraph::new(spinner_line(turn_started_at, handler.turn_tokens)),
+                    chunks[4],
+                );
             }
 
             let cursor = render_input_box(
@@ -2345,13 +2354,18 @@ fn render_approval_selector(
 }
 
 /// Animated "working" line above the input box: `✻ Verb… (esc to interrupt · Ns)`.
-fn spinner_line(turn_started_at: Option<std::time::Instant>) -> Line<'static> {
+fn spinner_line(turn_started_at: Option<std::time::Instant>, tokens: u64) -> Line<'static> {
     let elapsed = turn_started_at
         .map(|start| start.elapsed().as_millis())
         .unwrap_or(0);
     let frame_index = (elapsed / SPINNER_FRAME_MS) as usize % SPINNER_FRAMES.len();
     let verb_index = (elapsed / SPINNER_VERB_MS) as usize % SPINNER_VERBS.len();
     let seconds = elapsed / 1000;
+    let tokens_part = if tokens > 0 {
+        format!(" · {tokens} tokens")
+    } else {
+        String::new()
+    };
 
     Line::from(vec![
         Span::styled(
@@ -2363,7 +2377,7 @@ fn spinner_line(turn_started_at: Option<std::time::Instant>) -> Line<'static> {
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("({}s · esc to interrupt)", seconds),
+            format!("(esc to interrupt · {seconds}s{tokens_part})"),
             Style::default().fg(DIM),
         ),
     ])
@@ -3795,7 +3809,10 @@ fn to_tui_event(event: &ApiEvent) -> Option<TuiEvent> {
             content: tool_result.content.clone(),
             is_error: tool_result.is_error,
         }),
-        ApiEvent::Usage { .. } | ApiEvent::Completed => None,
+        ApiEvent::Usage { usage } => Some(TuiEvent::Usage {
+            tokens: usage.input_tokens + usage.output_tokens + usage.cache_read_tokens,
+        }),
+        ApiEvent::Completed => None,
     }
 }
 
