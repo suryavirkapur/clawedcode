@@ -416,6 +416,7 @@ struct ReplHandler {
     state: AppState,
     expanded_tool_results: std::collections::HashSet<String>,
     quit_requested: bool,
+    model_picker: Option<usize>,
 }
 
 impl ReplHandler {
@@ -432,6 +433,7 @@ impl ReplHandler {
             state: AppState::Idle,
             expanded_tool_results: std::collections::HashSet::new(),
             quit_requested: false,
+            model_picker: None,
         }
     }
 
@@ -837,7 +839,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 awaiting_approval.as_ref(),
                 approval_selection,
                 approval_amend.is_some(),
-            );
+            )
+            .max(model_picker_height(handler.model_picker, ctx));
             let spinner_height = if active_turn.is_some() && awaiting_approval.is_none() {
                 1
             } else {
@@ -890,7 +893,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 render_file_palette(frame, chunks[1], &file_entries, palette_index);
             }
 
-            if approval_height > 0 {
+            if awaiting_approval.is_some() && approval_height > 0 {
                 render_approval_selector(
                     frame,
                     chunks[2],
@@ -899,6 +902,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                     approval_amend.as_deref(),
                     ctx,
                 );
+            } else if let Some(sel) = handler.model_picker {
+                render_model_picker(frame, chunks[2], sel, ctx);
             }
 
             if queued_height > 0 {
@@ -1083,6 +1088,29 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         _ => {}
                     }
 
+                    continue;
+                }
+
+                if let Some(sel) = handler.model_picker {
+                    let count = model_candidates(ctx).len();
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            handler.model_picker = Some(sel.saturating_sub(1));
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            handler.model_picker = Some((sel + 1).min(count.saturating_sub(1)));
+                        }
+                        KeyCode::Enter => {
+                            let model = model_candidates(ctx)[sel].clone();
+                            handler.model_picker = None;
+                            apply_model_choice(ctx, &mut handler, &model);
+                            let _ = ctx.save_session();
+                        }
+                        KeyCode::Esc => {
+                            handler.model_picker = None;
+                        }
+                        _ => {}
+                    }
                     continue;
                 }
 
@@ -1338,6 +1366,14 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                     KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         let panel = todos_panel(ctx);
                         handler.show_panel(panel.title, panel.lines);
+                    }
+                    KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::ALT) => {
+                        let candidates = model_candidates(&ctx);
+                        let current = candidates
+                            .iter()
+                            .position(|m| m == ctx.model_name())
+                            .unwrap_or(0);
+                        handler.model_picker = Some(current);
                     }
                     KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::ALT) => {
                         ctx.show_thinking = !ctx.show_thinking;
@@ -3582,16 +3618,20 @@ fn handle_slash_command(
                     return Ok(true);
                 }
                 "/model" => {
-                    let panel = InfoPanel {
-                        title: "Model".to_string(),
-                        status: None,
-                        lines: vec![
-                            format!("Current model: {}", ctx.model_name()),
-                            format!("Provider: {}", provider_label()),
-                            "Restart with --model <name> to switch.".to_string(),
-                        ],
-                    };
-                    handler.show_panel(panel.title, panel.lines);
+                    let arg = prompt
+                        .strip_prefix("/model")
+                        .map(str::trim)
+                        .unwrap_or_default();
+                    if arg.is_empty() {
+                        let candidates = model_candidates(ctx);
+                        let current = candidates
+                            .iter()
+                            .position(|m| m == ctx.model_name())
+                            .unwrap_or(0);
+                        handler.model_picker = Some(current);
+                    } else {
+                        apply_model_choice(ctx, handler, arg);
+                    }
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
@@ -4287,6 +4327,119 @@ fn provider_label() -> &'static str {
         "mock" => "Mock provider",
         _ => "Local session",
     }
+}
+
+fn model_candidates(ctx: &TuiContext) -> Vec<String> {
+    let current = ctx.model_name().to_string();
+    let provider = std::env::var("CLAWEDCODE_PROVIDER")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mut list: Vec<String> = if provider == "anthropic"
+        || ctx.provider_api_key_env().contains("ANTHROPIC")
+        || current.starts_with("claude")
+    {
+        ["claude-opus-4-1", "claude-sonnet-4-5", "claude-haiku-4-5"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    } else {
+        [
+            "deepseek-v4-pro",
+            "deepseek-v4-flash",
+            "deepseek-chat",
+            "deepseek-reasoner",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect()
+    };
+    if !list.iter().any(|m| *m == current) {
+        list.insert(0, current);
+    }
+    list
+}
+
+fn apply_model_choice(ctx: &mut TuiContext, handler: &mut ReplHandler, model: &str) {
+    ctx.set_model(model);
+    if let Some(path) = clawedcode_core::config::default_config_path() {
+        if let Ok(existing) = fs::read_to_string(&path) {
+            let mut found = false;
+            let updated: String = existing
+                .lines()
+                .map(|line| {
+                    if line.trim_start().starts_with("model") && line.contains('=') {
+                        found = true;
+                        format!("model = \"{model}\"")
+                    } else {
+                        line.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let updated = if found {
+                updated
+            } else {
+                format!("model = \"{model}\"\n{updated}")
+            };
+            let _ = fs::write(&path, updated);
+        }
+    }
+    handler.push_overlay(format!("[info] Model set to {model}"));
+}
+
+fn model_picker_height(picker: Option<usize>, ctx: &TuiContext) -> u16 {
+    if picker.is_none() {
+        return 0;
+    }
+    // border + title + options + footer
+    model_candidates(ctx).len() as u16 + 3
+}
+
+fn render_model_picker(frame: &mut Frame, area: Rect, selected: usize, ctx: &TuiContext) {
+    if area.height == 0 {
+        return;
+    }
+    let border_width = area.width.saturating_sub(2) as usize;
+    frame.render_widget(
+        Paragraph::new(format!("╭{}╮", "─".repeat(border_width)))
+            .style(Style::default().fg(ACCENT)),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    let mut lines = vec![
+        Line::from(Span::styled(" Select model", Style::default().fg(ACCENT))),
+        Line::from(""),
+    ];
+    for (index, model) in model_candidates(ctx).iter().enumerate() {
+        let focused = index == selected;
+        let marker = if focused { "❯" } else { " " };
+        let current = if model == ctx.model_name() {
+            " (current)"
+        } else {
+            ""
+        };
+        let style = if focused {
+            Style::default().fg(ACCENT)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {marker}"), style),
+            Span::styled(format!("{model}{current}"), style),
+        ]));
+    }
+    lines.push(Line::from(Span::styled(
+        " Enter to select · Esc to cancel",
+        Style::default().fg(DIM),
+    )));
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect::new(
+            area.x,
+            area.y + 1,
+            area.width,
+            area.height.saturating_sub(1),
+        ),
+    );
 }
 
 fn launched_in_home(path: &Path) -> bool {

@@ -463,6 +463,14 @@ impl TuiContext {
         &self.runtime.config.model
     }
 
+    pub fn set_model(&mut self, model: &str) {
+        self.runtime.config.model = model.to_string();
+    }
+
+    pub fn provider_api_key_env(&self) -> &str {
+        &self.runtime.config.provider.api_key_env
+    }
+
     pub fn skills(&self) -> &[SkillDescriptor] {
         &self.runtime.compatibility.skills
     }
