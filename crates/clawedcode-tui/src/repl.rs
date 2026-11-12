@@ -715,6 +715,9 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     let mut history_stash = String::new();
     let mut history_search: Option<(String, Option<usize>)> = None;
     let mut history_search_stash = String::new();
+    let mut last_esc: Option<std::time::Instant> = None;
+    let mut last_ctrl_c: Option<std::time::Instant> = None;
+    let mut exit_hint: Option<std::time::Instant> = None;
     let mut last_approval_id: Option<String> = None;
     let always_allowed: Arc<Mutex<std::collections::HashSet<String>>> =
         Arc::new(Mutex::new(std::collections::HashSet::new()));
@@ -881,12 +884,16 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
             );
             frame.set_cursor_position(cursor);
 
+            let exit_hint_active = exit_hint
+                .map(|t| t.elapsed().as_millis() < 1500)
+                .unwrap_or(false);
             render_hint_line(
                 frame,
                 chunks[6],
                 ctx,
                 awaiting_approval.is_some(),
                 history_search.as_ref().map(|(query, _)| query.as_str()),
+                exit_hint_active,
             );
 
             if let Some(panel) = &handler.info_panel {
@@ -1291,13 +1298,31 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                             );
                             turn_started_at = None;
                         } else if !input_buffer.is_empty() {
-                            input_buffer.clear();
-                            cursor_pos = 0;
-                            history_index = None;
+                            // Claude Code clears the input on a double-tap Esc.
+                            let now = std::time::Instant::now();
+                            if last_esc
+                                .map(|t| now.duration_since(t).as_millis() < 1000)
+                                .unwrap_or(false)
+                            {
+                                input_buffer.clear();
+                                cursor_pos = 0;
+                                history_index = None;
+                                last_esc = None;
+                            } else {
+                                last_esc = Some(now);
+                            }
                         }
                     }
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        break;
+                        let now = std::time::Instant::now();
+                        if last_ctrl_c
+                            .map(|t| now.duration_since(t).as_millis() < 1500)
+                            .unwrap_or(false)
+                        {
+                            break;
+                        }
+                        last_ctrl_c = Some(now);
+                        exit_hint = Some(now);
                     }
                     KeyCode::Char('d')
                         if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1958,12 +1983,15 @@ fn render_hint_line(
     ctx: &TuiContext,
     awaiting: bool,
     history_search: Option<&str>,
+    exit_hint: bool,
 ) {
     let mode = ctx.permission_mode();
     let mode_text = permission_mode_label(mode);
 
     let left = if awaiting {
         "↑/↓ select · enter confirm · esc deny".to_string()
+    } else if exit_hint {
+        "Press Ctrl+C again to exit".to_string()
     } else if let Some(query) = history_search {
         format!("(reverse-i-search)`{query}`:")
     } else if mode != clawedcode_core::permissions::PermissionMode::Default {
@@ -1972,7 +2000,7 @@ fn render_hint_line(
         "? for shortcuts".to_string()
     };
 
-    let left_style = if history_search.is_some() {
+    let left_style = if history_search.is_some() || exit_hint {
         Style::default().fg(PERMISSION_FG)
     } else if mode != clawedcode_core::permissions::PermissionMode::Default {
         Style::default().fg(permission_mode_color(mode))
