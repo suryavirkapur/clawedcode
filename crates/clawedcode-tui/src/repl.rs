@@ -2436,6 +2436,18 @@ fn always_allow_key(tool_name: &str, input: &serde_json::Value) -> String {
             return format!("{tool_name}:{dir}");
         }
     }
+    if tool_name == "shell" {
+        // Reference-style prefix rules: "don't ask again for `npm` commands"
+        // stores a first-token key so later `npm ...` commands auto-approve
+        // while other commands still prompt.
+        if let Some(first) = input
+            .get("command")
+            .and_then(|v| v.as_str())
+            .and_then(|cmd| cmd.split_whitespace().next())
+        {
+            return format!("shell:{first}");
+        }
+    }
     tool_name.to_string()
 }
 
