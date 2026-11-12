@@ -709,6 +709,7 @@ struct TranscriptModeState {
     search_query: String,
     search_matches: Vec<usize>,
     search_index: usize,
+    show_all: bool,
 }
 
 fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
@@ -1029,6 +1030,10 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             screen = ReplScreen::Main;
                             transcript_mode = TranscriptModeState::default();
+                            continue;
+                        }
+                        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            transcript_mode.show_all = !transcript_mode.show_all;
                             continue;
                         }
                         KeyCode::Char('q') | KeyCode::Esc => {
@@ -2600,9 +2605,10 @@ fn transcript_footer_parts(state: &TranscriptModeState) -> (String, Option<Strin
     } else if state.search_open {
         "Search transcript · Enter commits · Esc cancels".to_string()
     } else if state.search_matches.is_empty() {
-        "/ search · v export · [ dump · ↑/↓/PgUp/PgDn/Home/End scroll".to_string()
+        "/ search · v export · ctrl+e collapse · [ dump · ↑/↓/PgUp/PgDn/Home/End scroll".to_string()
     } else {
-        "/ search · n/N navigate · v export · [ dump · ↑/↓/PgUp/PgDn/Home/End scroll".to_string()
+        "/ search · n/N navigate · v export · ctrl+e collapse · [ dump · ↑/↓/PgUp/PgDn/Home/End scroll"
+            .to_string()
     };
 
     (status_left, status_right, hint)
@@ -3116,6 +3122,7 @@ fn enter_transcript_mode(handler: &ReplHandler, viewport_height: usize) -> Trans
             pinned_to_bottom: true,
             unseen_count: 0,
         },
+        show_all: true,
         ..TranscriptModeState::default()
     }
 }
@@ -3147,14 +3154,18 @@ fn navigate_transcript_search(state: &mut TranscriptModeState, forward: bool) {
 fn transcript_render_lines(state: &TranscriptModeState, width: usize) -> Vec<Line<'static>> {
     // Transcript mode is the "expanded" view — every tool result renders in
     // full (this is what "ctrl+o to expand" means in the reference).
-    let expanded: std::collections::HashSet<String> = state
-        .frozen_rows
-        .iter()
-        .filter_map(|row| match row {
-            RenderRow::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
-            _ => None,
-        })
-        .collect();
+    let expanded: std::collections::HashSet<String> = if state.show_all {
+        state
+            .frozen_rows
+            .iter()
+            .filter_map(|row| match row {
+                RenderRow::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                _ => None,
+            })
+            .collect()
+    } else {
+        Default::default()
+    };
     render_rows(
         &state.frozen_rows,
         transcript_search_current(state),
