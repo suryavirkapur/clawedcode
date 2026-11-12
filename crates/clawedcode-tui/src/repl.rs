@@ -1248,7 +1248,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                             let approved = choice != 2;
                             if choice == 1 {
                                 if let Ok(mut set) = always_allowed.lock() {
-                                    set.insert(req.tool_name.clone());
+                                    set.insert(always_allow_key(&req.tool_name, &req.input));
                                     save_always_allowed(&session_cwd, &set);
                                 }
                             }
@@ -2280,6 +2280,111 @@ fn command_palette_height(entries: &[CommandEntry]) -> u16 {
 }
 
 /// Height of the inline approval selector (0 when not awaiting approval).
+/// Tools whose approval dialog shows a file diff preview (the reference's
+/// FilePermissionDialog family) instead of just the input summary.
+fn is_file_edit_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "apply_patch" | "write_file" | "edit_file" | "notebook_edit"
+    )
+}
+
+/// First file path referenced by a patch/edit input — used for the
+/// dir-scoped "allow all edits in <dir>/" option.
+fn file_edit_target_dir(input: &serde_json::Value) -> Option<String> {
+    let path = input
+        .get("file_path")
+        .or_else(|| input.get("path"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            input
+                .get("patch")
+                .and_then(|v| v.as_str())
+                .and_then(|patch| {
+                    patch.lines().find_map(|line| {
+                        line.strip_prefix("*** Update File: ")
+                            .or_else(|| line.strip_prefix("*** Add File: "))
+                            .or_else(|| line.strip_prefix("*** Delete File: "))
+                            .map(|p| p.trim().to_string())
+                    })
+                })
+        })?;
+    let parent = std::path::Path::new(&path)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    Some(if parent.is_empty() {
+        ".".to_string()
+    } else {
+        parent
+    })
+}
+
+/// The key written to `.claude/settings.local.json` when the user picks
+/// option 2: dir-scoped for file tools, tool-scoped otherwise — mirrors
+/// the reference's `accept-session` vs tool-level rules.
+fn always_allow_key(tool_name: &str, input: &serde_json::Value) -> String {
+    if is_file_edit_tool(tool_name) {
+        if let Some(dir) = file_edit_target_dir(input) {
+            return format!("{tool_name}:{dir}");
+        }
+    }
+    tool_name.to_string()
+}
+
+/// Styled diff preview lines for file-edit approval requests, capped at
+/// `max_rows` — `-` red, `+` green, context dim, file headers bold.
+fn patch_preview_lines(input: &serde_json::Value, max_rows: usize) -> Vec<Line<'static>> {
+    let patch = input
+        .get("patch")
+        .or_else(|| input.get("content"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if patch.is_empty() {
+        return Vec::new();
+    }
+
+    let add_style = Style::default().fg(Color::Rgb(152, 195, 121));
+    let del_style = Style::default().fg(Color::Rgb(224, 108, 117));
+    let ctx_style = Style::default().fg(DIM);
+    let head_style = Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for raw in patch.lines() {
+        if let Some(path) = raw
+            .strip_prefix("*** Update File: ")
+            .or_else(|| raw.strip_prefix("*** Add File: "))
+            .or_else(|| raw.strip_prefix("*** Delete File: "))
+        {
+            lines.push(Line::from(Span::styled(format!(" {path}"), head_style)));
+            continue;
+        }
+        if raw.starts_with("*** ") || raw.starts_with("@@") {
+            continue;
+        }
+        let (text, style) = match raw.chars().next() {
+            Some('+') => (raw.to_string(), add_style),
+            Some('-') => (raw.to_string(), del_style),
+            Some(' ') => (raw.to_string(), ctx_style),
+            _ => continue,
+        };
+        lines.push(Line::from(Span::styled(format!(" {text}"), style)));
+    }
+
+    if lines.len() > max_rows {
+        let hidden = lines.len() - max_rows;
+        lines.truncate(max_rows);
+        lines.push(Line::from(Span::styled(
+            format!("  … +{hidden} lines"),
+            ctx_style,
+        )));
+    }
+    lines
+}
+
 fn approval_selector_height(
     request: Option<&ApprovalRequest>,
     _selected: usize,
@@ -2287,12 +2392,13 @@ fn approval_selector_height(
     explain: bool,
     debug: bool,
 ) -> u16 {
-    if request.is_none() {
+    let Some(request) = request else {
         return 0;
-    }
+    };
+    let diff_rows = patch_preview_lines(&request.input, MAX_DIFF_PREVIEW_ROWS).len() as u16;
     // border + title + blank + input + blank + question + 3 options + blank
-    // (+ amend input line) (+ explain/debug lines) + footer
-    11 + u16::from(amending) + u16::from(explain) + u16::from(debug)
+    // (+ diff preview) (+ amend input line) (+ explain/debug lines) + footer
+    11 + u16::from(amending) + u16::from(explain) + u16::from(debug) + diff_rows
 }
 
 /// Permission dialog: a top-only rounded border in `permission` blue, the
@@ -2330,9 +2436,19 @@ fn render_approval_selector(
         display_name.to_string()
     };
 
+    let edit_dir = if is_file_edit_tool(&request.tool_name) {
+        file_edit_target_dir(&request.input)
+    } else {
+        None
+    };
+    let session_option = if let Some(dir) = &edit_dir {
+        format!("Yes, allow all edits in {dir}/ during this session (shift+tab)")
+    } else {
+        format!("Yes, and don't ask again for {subject} commands in {cwd}")
+    };
     let options = [
         "Yes".to_string(),
-        format!("Yes, and don't ask again for {subject} commands in {cwd}"),
+        session_option,
         "No, and tell Claude what to do differently (esc)".to_string(),
     ];
 
@@ -2365,6 +2481,18 @@ fn render_approval_selector(
             Style::default().fg(DIM),
         )),
     ];
+
+    if is_file_edit_tool(&request.tool_name) {
+        let diff_lines = patch_preview_lines(&request.input, MAX_DIFF_PREVIEW_ROWS);
+        if !diff_lines.is_empty() {
+            lines.insert(4, Line::from(""));
+            let mut idx = 5;
+            for line in diff_lines {
+                lines.insert(idx, line);
+                idx += 1;
+            }
+        }
+    }
 
     for (index, option) in options.iter().enumerate() {
         let is_selected = index == selected;
@@ -2428,6 +2556,9 @@ fn render_approval_selector(
         ),
     );
 }
+
+/// Max diff rows shown inside the file-edit approval dialog.
+const MAX_DIFF_PREVIEW_ROWS: usize = 9;
 
 /// Animated "working" line above the input box: `✻ Verb… (esc to interrupt · Ns)`.
 fn spinner_line(turn_started_at: Option<std::time::Instant>, tokens: u64) -> Line<'static> {
@@ -3744,9 +3875,10 @@ fn spawn_turn_worker(
                         clawedcode_core::permissions::PermissionDecision::Deny => return false,
                         clawedcode_core::permissions::PermissionDecision::Ask => {}
                     }
+                    let allow_key = always_allow_key(&request.tool_name, &request.input);
                     if always_allowed
                         .lock()
-                        .map(|set| set.contains(&request.tool_name))
+                        .map(|set| set.contains(&request.tool_name) || set.contains(&allow_key))
                         .unwrap_or(false)
                     {
                         return true;
@@ -3811,9 +3943,10 @@ fn spawn_turn_worker(
                         return true.into();
                     }
 
+                    let allow_key = always_allow_key(tool_name, input);
                     if always_allowed
                         .lock()
-                        .map(|set| set.contains(tool_name))
+                        .map(|set| set.contains(tool_name) || set.contains(&allow_key))
                         .unwrap_or(false)
                     {
                         return true.into();
