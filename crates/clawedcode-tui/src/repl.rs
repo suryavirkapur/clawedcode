@@ -258,6 +258,35 @@ const SPINNER_VERBS: &[&str] = &[
 
 const CLAUDE_LOGO: &[&str] = &[" ▐▛███▜▌ ", "▝▜█████▛▘", "  ▘▘ ▝▝  "];
 
+/// Animated Clawd poses from the reference LogoV2 — default face plus
+/// look-left/look-right/arms-up variants cycled on a timer.
+fn clawd_logo(tick: usize) -> [&'static str; 2] {
+    const CYCLE: [&str; 16] = [
+        "default",
+        "default",
+        "default",
+        "default",
+        "look-left",
+        "default",
+        "default",
+        "default",
+        "arms-up",
+        "default",
+        "default",
+        "default",
+        "look-right",
+        "default",
+        "default",
+        "default",
+    ];
+    match CYCLE[tick % CYCLE.len()] {
+        "look-left" => [" ▐▟███▟▌ ", "▝▜█████▛▘"],
+        "look-right" => [" ▐▙███▙▌ ", "▝▜█████▛▘"],
+        "arms-up" => ["▗▟▛███▜▙▖", " ▜█████▛ "],
+        _ => [CLAUDE_LOGO[0], CLAUDE_LOGO[1]],
+    }
+}
+
 const BUILTIN_COMMANDS: &[&str] = &[
     "/help",
     "/clear",
@@ -2016,6 +2045,12 @@ fn render_dashboard(
 /// Left column of the welcome box: bold greeting, Clawd mascot, then
 /// centered dim model and cwd lines — matches the reference LogoV2 layout.
 fn welcome_left_lines(ctx: &TuiContext, width: usize) -> Vec<Line<'static>> {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let tick = (START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis()
+        / 600) as usize;
     let center = |text: String, style: Style| {
         let pad = width.saturating_sub(text.chars().count()) / 2;
         Line::from(vec![Span::raw(" ".repeat(pad)), Span::styled(text, style)])
@@ -2028,8 +2063,8 @@ fn welcome_left_lines(ctx: &TuiContext, width: usize) -> Vec<Line<'static>> {
         ),
         Line::from(""),
     ];
-    for logo in CLAUDE_LOGO.iter().take(2) {
-        lines.push(center((*logo).to_string(), Style::default().fg(ACCENT)));
+    for logo in clawd_logo(tick) {
+        lines.push(center(logo.to_string(), Style::default().fg(ACCENT)));
     }
     lines.push(Line::from(""));
     lines.push(center(
@@ -5559,6 +5594,15 @@ mod command_policy_tests {
             "bash pointer: {}",
             lines[1]
         );
+    }
+
+    #[test]
+    fn clawd_logo_cycles_poses() {
+        assert_eq!(clawd_logo(0)[0], " ▐▛███▜▌ ");
+        assert_eq!(clawd_logo(4)[0], " ▐▟███▟▌ ");
+        assert_eq!(clawd_logo(8)[0], "▗▟▛███▜▙▖");
+        assert_eq!(clawd_logo(12)[0], " ▐▙███▙▌ ");
+        assert_eq!(clawd_logo(16), clawd_logo(0));
     }
 
     fn write_skill(root: &Path, file_name: &str, name: &str, body: &str) {
