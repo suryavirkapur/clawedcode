@@ -1470,6 +1470,14 @@ pub fn create_provider() -> BoxedProvider {
 
     if !provider_name.is_empty() {
         match provider_name.as_str() {
+            "mock" => {
+                tracing::info!("Using mock provider");
+                return Box::new(MockProvider);
+            }
+            "mock_tool" => {
+                tracing::info!("Using mock tool provider");
+                return Box::new(MockToolProvider);
+            }
             #[cfg(feature = "openai")]
             "deepseek" => {
                 if let Some(p) = openai_provider::OpenAiProvider::from_deepseek_env() {
