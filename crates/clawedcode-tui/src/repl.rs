@@ -270,6 +270,7 @@ const BUILTIN_COMMANDS: &[&str] = &[
     "/permissions",
     "/init",
     "/resume",
+    "/compact",
     "/exit",
     "/quit",
 ];
@@ -675,6 +676,7 @@ struct ActiveTurn {
     events: mpsc::Receiver<TurnWorkerEvent>,
     approvals: mpsc::Sender<ApprovalOutcome>,
     _join: thread::JoinHandle<()>,
+    compacting: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3325,6 +3327,7 @@ fn spawn_bash_worker(session: Session, command: String) -> ActiveTurn {
         events: event_rx,
         approvals: approval_tx,
         _join: join,
+        compacting: false,
     }
 }
 
@@ -3509,6 +3512,7 @@ fn spawn_turn_worker(
         events: event_rx,
         approvals: approval_tx,
         _join: join,
+        compacting: false,
     }
 }
 
@@ -3529,7 +3533,10 @@ fn drain_turn_events(
                     *awaiting_approval = Some(request);
                     handler.state = AppState::AwaitingApproval;
                 }
-                TurnWorkerEvent::Finished(session) => {
+                TurnWorkerEvent::Finished(mut session) => {
+                    if turn.compacting {
+                        compact_session(&mut session);
+                    }
                     ctx.replace_session(session);
                     maybe_mark_project_onboarding_complete(&ctx.session().cwd);
                     handler.clear_live_turn();
@@ -3568,6 +3575,26 @@ fn to_tui_event(event: &ApiEvent) -> Option<TuiEvent> {
             is_error: tool_result.is_error,
         }),
         ApiEvent::Usage { .. } | ApiEvent::Completed => None,
+    }
+}
+
+/// Collapse a finished compaction turn's session down to its system messages
+/// plus the model's summary of the conversation — mirrors Claude Code's
+/// `/compact`, where the summary becomes the new starting context.
+fn compact_session(session: &mut Session) {
+    let summary = session
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::Assistant)
+        .and_then(|m| m.primary_text().map(str::to_string));
+
+    session.messages.retain(|m| m.role == Role::System);
+    if let Some(summary) = summary.filter(|s| !s.trim().is_empty()) {
+        session.push(
+            Role::User,
+            format!("Previous conversation summary:\n\n{summary}"),
+        );
     }
 }
 
@@ -3818,6 +3845,27 @@ fn handle_slash_command(
                     }
                     return Ok(true);
                 }
+                "/compact" => {
+                    if active_turn.is_some() {
+                        handler.push_overlay(
+                            "[info] A turn is already running — wait for it to finish.".to_string(),
+                        );
+                        return Ok(true);
+                    }
+                    handler.begin_live_turn("/compact");
+                    let mut turn = spawn_turn_worker(
+                        ctx,
+                        "/compact".to_string(),
+                        Some(
+                            "Write a compact summary of the conversation so far: what was accomplished, key decisions, files touched, and what remains to do. Reply with only the summary."
+                                .to_string(),
+                        ),
+                        always_allowed.clone(),
+                    );
+                    turn.compacting = true;
+                    *active_turn = Some(turn);
+                    return Ok(true);
+                }
                 _ => {
                     handler
                         .push_overlay(format!("[info] Unknown command `{command}`. Use `/help`."));
@@ -3904,6 +3952,46 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
         CommandEntry {
             name: "/tools".to_string(),
             description: "Show active built-in, skill, and MCP tools".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/status".to_string(),
+            description: "Show session, model, and provider status".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/model".to_string(),
+            description: "Pick or set the active model".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/permissions".to_string(),
+            description: "Show permission mode and always-allowed tools".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/init".to_string(),
+            description: "Create or update CLAUDE.md for this project".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/resume".to_string(),
+            description: "Resume a saved session by id or prefix".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/compact".to_string(),
+            description: "Summarize the conversation and continue with less context".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/exit".to_string(),
+            description: "Exit the REPL".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/quit".to_string(),
+            description: "Exit the REPL".to_string(),
             source: CommandSource::BuiltIn,
         },
     ];
