@@ -617,6 +617,7 @@ struct ReplHandler {
     model_picker: Option<usize>,
     theme_picker: Option<usize>,
     resume_picker: Option<usize>,
+    resume_picker_query: String,
     vim_enabled: bool,
     vim_insert: bool,
     /// `/rewind` message selector — index into `rewind_candidates`.
@@ -644,6 +645,7 @@ impl ReplHandler {
             model_picker: None,
             theme_picker: None,
             resume_picker: None,
+            resume_picker_query: String::new(),
             vim_enabled: false,
             vim_insert: true,
             rewind_picker: None,
@@ -1101,7 +1103,11 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
             }
             .max(model_picker_height(handler.model_picker, ctx))
             .max(theme_picker_height(handler.theme_picker))
-            .max(resume_picker_height(handler.resume_picker, ctx))
+            .max(resume_picker_height(
+                handler.resume_picker,
+                ctx,
+                &handler.resume_picker_query,
+            ))
             .max(rewind_picker_height(handler.rewind_picker, ctx));
             let spinner_height = if active_turn.is_some() && awaiting_approval.is_none() {
                 1
@@ -1183,7 +1189,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
             } else if let Some(sel) = handler.theme_picker {
                 render_theme_picker(frame, chunks[2], sel);
             } else if let Some(sel) = handler.resume_picker {
-                render_resume_picker(frame, chunks[2], sel, ctx);
+                render_resume_picker(frame, chunks[2], sel, ctx, &handler.resume_picker_query);
             } else if let Some(sel) = handler.rewind_picker {
                 render_rewind_picker(frame, chunks[2], sel, ctx);
             }
@@ -1442,12 +1448,12 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 }
 
                 if let Some(sel) = handler.resume_picker {
-                    let candidates = list_saved_sessions(ctx, 8);
+                    let candidates = resume_candidates(ctx, &handler.resume_picker_query);
                     match key.code {
-                        KeyCode::Up | KeyCode::Char('k') => {
+                        KeyCode::Up => {
                             handler.resume_picker = Some(sel.saturating_sub(1));
                         }
-                        KeyCode::Down | KeyCode::Char('j') => {
+                        KeyCode::Down => {
                             handler.resume_picker =
                                 Some((sel + 1).min(candidates.len().saturating_sub(1)));
                         }
@@ -1455,13 +1461,24 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                             if let Some(session) = candidates.get(sel) {
                                 let id = session.id.clone();
                                 handler.resume_picker = None;
+                                handler.resume_picker_query.clear();
                                 apply_resume_choice(ctx, &mut handler, &id);
                             } else {
                                 handler.resume_picker = None;
+                                handler.resume_picker_query.clear();
                             }
                         }
                         KeyCode::Esc => {
                             handler.resume_picker = None;
+                            handler.resume_picker_query.clear();
+                        }
+                        KeyCode::Backspace => {
+                            handler.resume_picker_query.pop();
+                            handler.resume_picker = Some(0);
+                        }
+                        KeyCode::Char(c) if key.modifiers.is_empty() => {
+                            handler.resume_picker_query.push(c);
+                            handler.resume_picker = Some(0);
                         }
                         _ => {}
                     }
@@ -7390,15 +7407,37 @@ fn apply_resume_choice(ctx: &mut TuiContext, handler: &mut ReplHandler, prefix: 
     }
 }
 
-fn resume_picker_height(picker: Option<usize>, ctx: &TuiContext) -> u16 {
+/// Resume-picker candidates filtered by the user's typed query.
+fn resume_candidates(ctx: &TuiContext, query: &str) -> Vec<SavedSessionSummary> {
+    let sessions = list_saved_sessions(ctx, 12);
+    if query.is_empty() {
+        return sessions.into_iter().take(8).collect();
+    }
+    let q = query.to_lowercase();
+    sessions
+        .into_iter()
+        .filter(|session| {
+            session.id.to_lowercase().contains(&q) || session.preview.to_lowercase().contains(&q)
+        })
+        .take(8)
+        .collect()
+}
+
+fn resume_picker_height(picker: Option<usize>, ctx: &TuiContext, query: &str) -> u16 {
     if picker.is_none() {
         return 0;
     }
-    // border + title + blank + options + footer
-    list_saved_sessions(ctx, 8).len() as u16 + 4
+    // border + title + filter + blank + options + footer
+    resume_candidates(ctx, query).len() as u16 + 5
 }
 
-fn render_resume_picker(frame: &mut Frame, area: Rect, selected: usize, ctx: &TuiContext) {
+fn render_resume_picker(
+    frame: &mut Frame,
+    area: Rect,
+    selected: usize,
+    ctx: &TuiContext,
+    query: &str,
+) {
     if area.height == 0 {
         return;
     }
@@ -7413,9 +7452,13 @@ fn render_resume_picker(frame: &mut Frame, area: Rect, selected: usize, ctx: &Tu
             " Select a session to resume",
             Style::default().fg(pal().accent),
         )),
+        Line::from(vec![
+            Span::styled("  ❯ ", Style::default().fg(pal().accent)),
+            Span::styled(query.to_string(), Style::default().fg(pal().text)),
+        ]),
         Line::from(""),
     ];
-    for (index, session) in list_saved_sessions(ctx, 8).iter().enumerate() {
+    for (index, session) in resume_candidates(ctx, query).iter().enumerate() {
         let focused = index == selected;
         let marker = if focused { "❯" } else { " " };
         let current = if session.is_current { " (current)" } else { "" };
