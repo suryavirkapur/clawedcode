@@ -242,6 +242,7 @@ struct TurnResult {
 }
 
 const REPEATED_TOOL_LOOP_LIMIT: usize = 4;
+const TOOL_RESULT_MAX_CHARS: usize = 50_000;
 
 pub(crate) fn casual_reply_for_prompt(prompt: &str) -> Option<&'static str> {
     let normalized = prompt
@@ -474,25 +475,28 @@ impl Runtime {
         session
     }
 
-    fn trim_session_messages(messages: &[Message], limit: usize) -> Vec<Message> {
-        let non_system_total = messages.iter().filter(|m| m.role != Role::System).count();
-        let skip_non_system = non_system_total.saturating_sub(limit);
-        let mut skipped = 0usize;
+    fn compact_session_messages(messages: &[Message], limit: usize) -> Vec<Message> {
+        let mut result = Vec::new();
+        let mut non_system = Vec::new();
 
-        messages
-            .iter()
-            .filter(|message| {
-                if message.role == Role::System {
-                    return true;
-                }
-                if skipped < skip_non_system {
-                    skipped += 1;
-                    return false;
-                }
-                true
-            })
-            .cloned()
-            .collect()
+        for msg in messages {
+            if msg.role == Role::System {
+                result.push(msg.clone());
+                continue;
+            }
+            non_system.push(msg.clone());
+        }
+
+        if non_system.len() <= limit {
+            result.extend(non_system);
+            return result;
+        }
+
+        let split = non_system.len().saturating_sub(limit);
+        let summary = compact_message_group(&non_system[..split]);
+        result.push(summary);
+        result.extend(non_system.into_iter().skip(split));
+        result
     }
 
     fn effective_system_prompt_body(&self, session: &Session) -> String {
@@ -518,7 +522,7 @@ impl Runtime {
         prompt_override: Option<&str>,
     ) -> CompletionRequest {
         let limit = self.config.runtime.session_history_limit;
-        let messages = Self::trim_session_messages(&session.messages, limit);
+        let messages = Self::compact_session_messages(&session.messages, limit);
         let mut request = CompletionRequest {
             model: self.config.model.clone(),
             prompt_pack: self.config.prompts.default_prompt_pack.clone(),
@@ -1312,11 +1316,82 @@ fn repeated_tool_call_signature(turn_result: &TurnResult) -> Option<String> {
 }
 
 fn finish_tool_result(tool_use_id: &str, result: ToolResult) -> ContentBlock {
-    if result.is_error {
+    cap_tool_result(if result.is_error {
         ContentBlock::tool_error(tool_use_id, result.content)
     } else {
         ContentBlock::tool_result(tool_use_id, result.content)
+    })
+}
+
+fn cap_tool_result(block: ContentBlock) -> ContentBlock {
+    match block {
+        ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => {
+            if content.len() > TOOL_RESULT_MAX_CHARS {
+                let notice = format!(
+                    "\n\n[{} chars truncated; original size: {} chars]",
+                    content.len() - TOOL_RESULT_MAX_CHARS,
+                    content.len()
+                );
+                let mut truncated = content;
+                truncated.truncate(TOOL_RESULT_MAX_CHARS);
+                truncated.push_str(&notice);
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content: truncated,
+                    is_error,
+                }
+            } else {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                }
+            }
+        }
+        other => other,
     }
+}
+
+fn compact_message_group(messages: &[Message]) -> Message {
+    let mut user_count = 0usize;
+    let mut assistant_count = 0usize;
+    let mut tool_count = 0usize;
+    let mut tool_summary = Vec::new();
+
+    for msg in messages {
+        match msg.role {
+            Role::User => user_count += 1,
+            Role::Assistant => assistant_count += 1,
+            Role::Tool => {
+                tool_count += 1;
+                for block in &msg.content_blocks {
+                    if let ContentBlock::ToolResult {
+                        tool_use_id,
+                        is_error,
+                        ..
+                    } = block
+                    {
+                        let status = if *is_error { "error" } else { "ok" };
+                        tool_summary.push(format!("{tool_use_id}:{status}"));
+                    }
+                }
+            }
+            Role::System => {}
+        }
+    }
+
+    let mut summary = format!(
+        "[Earlier conversation compacted: {user_count} user messages, {assistant_count} assistant responses, {tool_count} tool results]"
+    );
+    if !tool_summary.is_empty() {
+        summary.push_str(&format!(". Tool results: {}.", tool_summary.join(", ")));
+    }
+
+    Message::from_text(Role::User, summary)
 }
 
 fn parse_agent_tool_input(input: &serde_json::Value) -> Result<AgentToolInput, String> {
@@ -2635,7 +2710,12 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
             "expected rendered system prompt to start with a System section"
         );
         assert!(texts[0].contains("You are a test assistant."));
-        assert_eq!(&texts[1..], ["second", "second reply"]);
+        // With compaction, the first 2 non-system messages are summarized
+        assert_eq!(&texts[1..], [
+            "[Earlier conversation compacted: 1 user messages, 1 assistant responses, 0 tool results]",
+            "second",
+            "second reply"
+        ]);
     }
 
     #[test]
@@ -2669,7 +2749,8 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
         session.push(Role::Assistant, "discard me too");
 
         let request = runtime.build_request(&session);
-        assert_eq!(request.messages.len(), 1);
+        // With compaction, all non-system messages are summarized into one message
+        assert_eq!(request.messages.len(), 2);
         let system_text = request.messages[0].content.iter().find_map(|b| match b {
             clawedcode_api::ProviderContentBlock::Text { text } => Some(text.as_str()),
             _ => None,
@@ -2677,6 +2758,13 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
         let system_text = system_text.expect("expected system prompt text");
         assert!(system_text.starts_with("## System"));
         assert!(system_text.contains("You are a test assistant."));
+
+        let summary_text = request.messages[1].content.iter().find_map(|b| match b {
+            clawedcode_api::ProviderContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        });
+        let summary_text = summary_text.expect("expected compaction summary");
+        assert!(summary_text.contains("compacted"));
     }
 
     #[test]
@@ -2725,16 +2813,18 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
         let request = runtime.build_request(&session);
         let kept_roles: Vec<_> = request.messages.iter().map(|m| &m.role).collect();
 
+        // With compaction: system→User, summary→User, assistant(tool_use)→Assistant, tool→User, user→User
         assert_eq!(
             kept_roles,
             vec![
+                &clawedcode_api::ProviderRole::User,
                 &clawedcode_api::ProviderRole::User,
                 &clawedcode_api::ProviderRole::Assistant,
                 &clawedcode_api::ProviderRole::User,
                 &clawedcode_api::ProviderRole::User,
             ]
         );
-        assert_eq!(request.messages.len(), 4);
+        assert_eq!(request.messages.len(), 5);
     }
 
     #[test]
@@ -2879,7 +2969,7 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
         assert!(request.system_prompt_body.contains("## Language"));
         assert!(request.system_prompt_body.contains("## Environment"));
         assert!(request.system_prompt_body.contains("Primary working directory: /tmp"));
-        assert!(request.system_prompt_body.contains("Model: gpt-5"));
+        assert!(request.system_prompt_body.contains("Model: deepseek-v4-pro"));
         assert!(request.system_prompt_body.contains("Current setting: default"));
         assert!(request.system_prompt_body.contains("shell"));
         assert!(request.system_prompt_body.contains("read_file"));

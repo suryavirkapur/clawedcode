@@ -42,10 +42,10 @@ pub struct PromptConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            model: "gpt-5".to_string(),
+            model: "deepseek-v4-pro".to_string(),
             provider: ProviderConfig {
                 endpoint: None,
-                api_key_env: "OPENAI_API_KEY".to_string(),
+                api_key_env: "DEEPSEEK_API_KEY".to_string(),
             },
             ui: UiConfig {
                 theme: "sunrise".to_string(),
@@ -101,8 +101,14 @@ impl AppConfig {
 }
 
 fn apply_env_overrides(config: &mut AppConfig) {
-    if std::env::var("CLAWEDCODE_PROVIDER").unwrap_or_default() == "anthropic" {
+    let provider = std::env::var("CLAWEDCODE_PROVIDER").unwrap_or_default();
+    if provider == "anthropic" {
         if let Ok(model) = std::env::var("ANTHROPIC_MODEL") {
+            config.model = model;
+        }
+    }
+    if provider == "deepseek" {
+        if let Ok(model) = std::env::var("DEEPSEEK_MODEL") {
             config.model = model;
         }
     }
@@ -252,13 +258,14 @@ default_prompt_pack = "review"
     fn default_config_matches_snapshot() {
         let _guard = env_lock();
         unsafe { std::env::remove_var("ANTHROPIC_MODEL") };
+        unsafe { std::env::remove_var("DEEPSEEK_MODEL") };
         unsafe { std::env::remove_var("CLAWEDCODE_PROVIDER") };
 
         let missing_path = temp_dir("default").join("missing-config.toml");
         let config = AppConfig::load(Some(&missing_path)).expect("loads default config");
         assert_eq!(
             config_snapshot(&config),
-            "model=gpt-5\nprovider.endpoint=<none>\nprovider.api_key_env=OPENAI_API_KEY\nui.theme=sunrise\nui.show_thinking=false\nruntime.max_turns=64\nruntime.session_history_limit=2000\nprompts.default_system_prompt=core\nprompts.default_prompt_pack=coding"
+            "model=deepseek-v4-pro\nprovider.endpoint=<none>\nprovider.api_key_env=DEEPSEEK_API_KEY\nui.theme=sunrise\nui.show_thinking=false\nruntime.max_turns=64\nruntime.session_history_limit=2000\nprompts.default_system_prompt=core\nprompts.default_prompt_pack=coding"
         );
     }
 }

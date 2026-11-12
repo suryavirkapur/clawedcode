@@ -982,27 +982,511 @@ pub mod anthropic_provider {
     }
 }
 
+// --- OpenAI provider (behind feature flag + env var) ---
+
+#[cfg(feature = "openai")]
+pub mod openai_provider {
+    use super::*;
+    use reqwest::Client;
+
+    #[derive(Debug, Clone)]
+    pub struct OpenAiProvider {
+        client: Client,
+        api_key: String,
+        endpoint: String,
+        retry: RetryConfig,
+        timeout: TimeoutConfig,
+    }
+
+    pub(crate) fn normalize_openai_endpoint(endpoint: &str) -> String {
+        if endpoint.contains("/v1/chat/completions") {
+            endpoint.to_string()
+        } else {
+            let endpoint = endpoint.trim_end_matches('/');
+            format!("{}/v1/chat/completions", endpoint)
+        }
+    }
+
+    impl OpenAiProvider {
+        pub fn from_env() -> Option<Self> {
+            let api_key = std::env::var("OPENAI_API_KEY").ok()?;
+            let endpoint = std::env::var("CLAWEDCODE_OPENAI_ENDPOINT")
+                .or_else(|_| std::env::var("OPENAI_BASE_URL"))
+                .unwrap_or_else(|_| "https://api.openai.com/v1/chat/completions".to_string());
+            let endpoint = normalize_openai_endpoint(&endpoint);
+            Some(Self {
+                client: Client::new(),
+                api_key,
+                endpoint,
+                retry: RetryConfig::default(),
+                timeout: TimeoutConfig::default(),
+            })
+        }
+
+        /// Construct an OpenAI-compatible provider pointing at DeepSeek.
+        pub fn from_deepseek_env() -> Option<Self> {
+            let api_key = std::env::var("DEEPSEEK_API_KEY").ok()?;
+            let endpoint = std::env::var("CLAWEDCODE_DEEPSEEK_ENDPOINT")
+                .unwrap_or_else(|_| "https://api.deepseek.com".to_string());
+            let endpoint = normalize_openai_endpoint(&endpoint);
+            Some(Self {
+                client: Client::new(),
+                api_key,
+                endpoint,
+                retry: RetryConfig::default(),
+                timeout: TimeoutConfig::default(),
+            })
+        }
+
+        pub fn new(api_key: String, endpoint: String) -> Self {
+            Self {
+                client: Client::new(),
+                api_key,
+                endpoint: normalize_openai_endpoint(&endpoint),
+                retry: RetryConfig::default(),
+                timeout: TimeoutConfig::default(),
+            }
+        }
+    }
+
+    fn build_openai_tools(tools: &[ToolSpec]) -> serde_json::Value {
+        if tools.is_empty() {
+            return serde_json::Value::Null;
+        }
+        serde_json::Value::Array(
+            tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.input_schema,
+                        }
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    fn build_openai_messages(request: &CompletionRequest, is_deepseek: bool) -> Vec<serde_json::Value> {
+        let mut messages = Vec::new();
+        if !request.system_prompt_body.is_empty() {
+            messages.push(serde_json::json!({
+                "role": "system",
+                "content": request.system_prompt_body,
+            }));
+        }
+
+        for msg in &request.messages {
+            let mut text_parts = Vec::new();
+            let mut thinking_parts = Vec::new();
+            let mut tool_uses = Vec::new();
+            let mut tool_results = Vec::new();
+
+            for block in &msg.content {
+                match block {
+                    ProviderContentBlock::Text { text } => text_parts.push(text.clone()),
+                    ProviderContentBlock::Thinking { thinking } => thinking_parts.push(thinking.clone()),
+                    ProviderContentBlock::ToolUse { id, name, input } => {
+                        tool_uses.push(serde_json::json!({
+                            "id": id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string())
+                            }
+                        }));
+                    }
+                    ProviderContentBlock::ToolResult { tool_use_id, content, .. } => {
+                        tool_results.push(serde_json::json!({
+                            "role": "tool",
+                            "tool_call_id": tool_use_id,
+                            "content": content,
+                        }));
+                    }
+                }
+            }
+
+            if !tool_results.is_empty() {
+                messages.extend(tool_results);
+                continue;
+            }
+
+            if !tool_uses.is_empty() || !text_parts.is_empty() || !thinking_parts.is_empty() {
+                let role = match msg.role {
+                    ProviderRole::User => "user",
+                    ProviderRole::Assistant => "assistant",
+                };
+                let mut msg_obj = serde_json::json!({"role": role});
+
+                let content_text = text_parts.join("");
+                if !content_text.is_empty() {
+                    msg_obj["content"] = serde_json::Value::String(content_text);
+                } else if !tool_uses.is_empty() {
+                    // OpenAI requires content to be null (not omitted) for assistant messages with tool_calls
+                    msg_obj["content"] = serde_json::Value::Null;
+                }
+
+                if is_deepseek && !thinking_parts.is_empty() {
+                    msg_obj["reasoning_content"] = serde_json::Value::String(thinking_parts.join(""));
+                }
+
+                if !tool_uses.is_empty() {
+                    msg_obj["tool_calls"] = serde_json::Value::Array(tool_uses);
+                }
+                messages.push(msg_obj);
+            }
+        }
+
+        messages
+    }
+
+    impl Provider for OpenAiProvider {
+        fn complete(
+            &self,
+            request: &CompletionRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<CompletionResponse, ProviderError>> + Send + '_>> {
+            let req = request.clone();
+            let api_key = self.api_key.clone();
+            let client = self.client.clone();
+            let endpoint = self.endpoint.clone();
+            let retry = self.retry.clone();
+            let timeout = self.timeout.clone();
+            let is_deepseek = endpoint.contains("deepseek");
+            Box::pin(async move {
+                let tools = build_openai_tools(&req.tools);
+                let messages = build_openai_messages(&req, is_deepseek);
+                let mut body = serde_json::json!({
+                    "model": req.model,
+                    "messages": messages,
+                });
+                if !tools.is_null() {
+                    body["tools"] = tools;
+                    body["tool_choice"] = "auto".into();
+                }
+
+                let mut last_err: Option<ProviderError> = None;
+
+                for attempt in 1..=retry.max_attempts {
+                    let send_fut = client
+                        .post(&endpoint)
+                        .header("Authorization", format!("Bearer {}", &api_key))
+                        .header("content-type", "application/json")
+                        .json(&body)
+                        .send();
+
+                    let resp = match tokio::time::timeout(timeout.per_request, send_fut).await {
+                        Ok(Ok(r)) => r,
+                        Ok(Err(e)) => {
+                            last_err = Some(ProviderError::Network { message: e.to_string() });
+                            if attempt < retry.max_attempts {
+                                let backoff_ms = (retry.base_delay.as_millis() as u64)
+                                    .saturating_mul(1u64 << (attempt - 1));
+                                tokio::time::sleep(Duration::from_millis(
+                                    backoff_ms.min(retry.max_delay.as_millis() as u64),
+                                )).await;
+                                continue;
+                            }
+                            break;
+                        }
+                        Err(_) => {
+                            last_err = Some(ProviderError::Timeout {
+                                elapsed_ms: timeout.per_request.as_millis() as u64,
+                            });
+                            if attempt < retry.max_attempts {
+                                tokio::time::sleep(retry.base_delay).await;
+                                continue;
+                            }
+                            break;
+                        }
+                    };
+
+                    let status = resp.status().as_u16();
+                    if !resp.status().is_success() {
+                        let text = resp.text().await.unwrap_or_default();
+                        let err = ProviderError::Api { status, message: text };
+                        last_err = Some(err);
+                        let retryable = (500..=599).contains(&status) || status == 429;
+                        if retryable && attempt < retry.max_attempts {
+                            tokio::time::sleep(retry.base_delay).await;
+                            continue;
+                        }
+                        break;
+                    }
+
+                    let json: serde_json::Value = resp.json().await.map_err(|e| ProviderError::Parse {
+                        message: e.to_string(),
+                    })?;
+
+                    let response = json["choices"].get(0)
+                        .and_then(|c| c["message"]["content"].as_str())
+                        .unwrap_or_default()
+                        .to_string();
+
+                    return Ok(CompletionResponse {
+                        system_prompt: req.system_prompt_name.clone(),
+                        response,
+                        tool_count: req.tools.len(),
+                        skill_count: req.skill_count,
+                        mcp_server_count: req.mcp_servers.len(),
+                    });
+                }
+
+                Err(match last_err {
+                    Some(e) => ProviderError::RetryExhausted {
+                        attempts: retry.max_attempts,
+                        last_error: e.to_string(),
+                    },
+                    None => ProviderError::Other {
+                        message: "request failed".to_string(),
+                    },
+                })
+            })
+        }
+
+        fn stream(&self, request: &CompletionRequest) -> EventStream {
+            let req = request.clone();
+            let api_key = self.api_key.clone();
+            let client = self.client.clone();
+            let endpoint = self.endpoint.clone();
+            let timeout = self.timeout.clone();
+
+            let is_deepseek = endpoint.contains("deepseek");
+            let (tx, rx) = mpsc::channel::<Result<ApiEvent, ProviderError>>(64);
+
+            tokio::spawn(async move {
+                let tools = build_openai_tools(&req.tools);
+                let messages = build_openai_messages(&req, is_deepseek);
+                let mut body = serde_json::json!({
+                    "model": req.model,
+                    "messages": messages,
+                    "stream": true,
+                });
+                if !tools.is_null() {
+                    body["tools"] = tools;
+                    body["tool_choice"] = "auto".into();
+                }
+
+                let send_fut = client
+                    .post(&endpoint)
+                    .header("Authorization", format!("Bearer {}", &api_key))
+                    .header("content-type", "application/json")
+                    .json(&body)
+                    .send();
+
+                let resp = match tokio::time::timeout(timeout.per_request, send_fut).await {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(e)) => {
+                        let _ = tx.send(Err(ProviderError::Network { message: e.to_string() })).await;
+                        return;
+                    }
+                    Err(_) => {
+                        let _ = tx.send(Err(ProviderError::Timeout {
+                            elapsed_ms: timeout.per_request.as_millis() as u64,
+                        })).await;
+                        return;
+                    }
+                };
+
+                if !resp.status().is_success() {
+                    let status = resp.status().as_u16();
+                    let text = resp.text().await.unwrap_or_default();
+                    let _ = tx.send(Err(ProviderError::Api { status, message: text })).await;
+                    return;
+                }
+
+                let mut buf = String::new();
+                let mut bytes = resp.bytes_stream();
+                use futures_util::StreamExt;
+
+                let mut current_tool_calls: Vec<(String, String, String)> = Vec::new();
+
+                while let Some(chunk) = bytes.next().await {
+                    let chunk = match chunk {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let _ = tx.send(Err(ProviderError::Network { message: e.to_string() })).await;
+                            return;
+                        }
+                    };
+
+                    buf.push_str(&String::from_utf8_lossy(&chunk));
+
+                    while let Some(idx) = buf.find("\n\n") {
+                        let frame: String = buf.drain(..(idx + 2)).collect();
+                        let mut data_lines = Vec::new();
+                        for line in frame.lines() {
+                            let line = line.trim();
+                            if let Some(rest) = line.strip_prefix("data:") {
+                                let payload = rest.trim();
+                                if !payload.is_empty() {
+                                    data_lines.push(payload.to_string());
+                                }
+                            }
+                        }
+
+                        if data_lines.is_empty() {
+                            continue;
+                        }
+
+                        let data = data_lines.join("\n");
+                        if data == "[DONE]" {
+                            let _ = tx.send(Ok(ApiEvent::Completed)).await;
+                            return;
+                        }
+
+                        let Ok(event) = serde_json::from_str::<serde_json::Value>(&data) else {
+                            continue;
+                        };
+
+                        if let Some(choice) = event["choices"].get(0) {
+                            let delta = &choice["delta"];
+                            
+                            if let Some(text) = delta["content"].as_str() {
+                                if !text.is_empty() {
+                                    let _ = tx.send(Ok(ApiEvent::MessageDelta {
+                                        text: text.to_string(),
+                                    })).await;
+                                }
+                            }
+
+                            if let Some(reasoning) = delta["reasoning_content"].as_str() {
+                                if !reasoning.is_empty() {
+                                    let _ = tx.send(Ok(ApiEvent::ThinkingDelta {
+                                        text: reasoning.to_string(),
+                                    })).await;
+                                }
+                            }
+
+                            if let Some(tool_calls) = delta["tool_calls"].as_array() {
+                                for tc in tool_calls {
+                                    let index = tc["index"].as_u64().unwrap_or(0) as usize;
+                                    let id = tc["id"].as_str().map(|s| s.to_string());
+                                    let name = tc["function"]["name"].as_str().map(|s| s.to_string());
+                                    let arguments = tc["function"]["arguments"].as_str().map(|s| s.to_string());
+
+                                    while current_tool_calls.len() <= index {
+                                        current_tool_calls.push((String::new(), String::new(), String::new()));
+                                    }
+
+                                    if let Some(id) = id {
+                                        current_tool_calls[index].0 = id;
+                                    }
+                                    if let Some(name) = name {
+                                        current_tool_calls[index].1 = name;
+                                    }
+                                    if let Some(args) = arguments {
+                                        current_tool_calls[index].2.push_str(&args);
+                                    }
+                                }
+                            }
+
+                            if choice["finish_reason"].as_str() == Some("tool_calls") {
+                                for (id, name, args) in &current_tool_calls {
+                                    if id.is_empty() || name.is_empty() {
+                                        continue;
+                                    }
+                                    let input = if args.trim().is_empty() {
+                                        "{}".to_string()
+                                    } else {
+                                        args.clone()
+                                    };
+                                    let _ = tx.send(Ok(ApiEvent::ToolUse {
+                                        tool_use: ToolUseEvent {
+                                            id: id.clone(),
+                                            name: name.clone(),
+                                            input,
+                                        }
+                                    })).await;
+                                }
+                                current_tool_calls.clear();
+                            }
+                        }
+                    }
+                }
+
+                let _ = tx.send(Ok(ApiEvent::Completed)).await;
+            });
+
+            Box::pin(futures_util::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|item| (item, rx))
+            }))
+        }
+    }
+}
+
 // --- Provider factory (picks provider from env) ---
 
 pub fn create_provider() -> BoxedProvider {
     let provider_name = std::env::var("CLAWEDCODE_PROVIDER").unwrap_or_default();
 
-    match provider_name.as_str() {
-        #[cfg(feature = "anthropic")]
-        "anthropic" => {
-            if let Some(p) = anthropic_provider::AnthropicProvider::from_env() {
-                tracing::info!("Using Anthropic provider");
-                return Box::new(p);
+    if !provider_name.is_empty() {
+        match provider_name.as_str() {
+            #[cfg(feature = "openai")]
+            "deepseek" => {
+                if let Some(p) = openai_provider::OpenAiProvider::from_deepseek_env() {
+                    tracing::info!("Using DeepSeek provider (OpenAI-compatible)");
+                    return Box::new(p);
+                }
+                tracing::warn!("DEEPSEEK_API_KEY not set, falling back to mock provider");
             }
-            tracing::warn!("ANTHROPIC_API_KEY not set, falling back to mock provider");
+            #[cfg(not(feature = "openai"))]
+            "deepseek" => {
+                tracing::warn!(
+                    "DeepSeek provider requested but 'openai' feature not enabled, falling back to mock"
+                );
+            }
+            #[cfg(feature = "openai")]
+            "openai" => {
+                if let Some(p) = openai_provider::OpenAiProvider::from_env() {
+                    tracing::info!("Using OpenAI provider");
+                    return Box::new(p);
+                }
+                tracing::warn!("OPENAI_API_KEY not set, falling back to mock provider");
+            }
+            #[cfg(not(feature = "openai"))]
+            "openai" => {
+                tracing::warn!(
+                    "OpenAI provider requested but 'openai' feature not enabled, falling back to mock"
+                );
+            }
+            #[cfg(feature = "anthropic")]
+            "anthropic" => {
+                if let Some(p) = anthropic_provider::AnthropicProvider::from_env() {
+                    tracing::info!("Using Anthropic provider");
+                    return Box::new(p);
+                }
+                tracing::warn!("ANTHROPIC_API_KEY not set, falling back to mock provider");
+            }
+            #[cfg(not(feature = "anthropic"))]
+            "anthropic" => {
+                tracing::warn!(
+                    "Anthropic provider requested but 'anthropic' feature not enabled, falling back to mock"
+                );
+            }
+            _ => {
+                tracing::warn!("Unknown provider '{}', falling back to mock", provider_name);
+            }
         }
-        #[cfg(not(feature = "anthropic"))]
-        "anthropic" => {
-            tracing::warn!(
-                "Anthropic provider requested but 'anthropic' feature not enabled, falling back to mock"
-            );
+    } else {
+        // Auto-detect: DeepSeek first (matches default config), then OpenAI, then Anthropic
+        #[cfg(feature = "openai")]
+        if let Some(p) = openai_provider::OpenAiProvider::from_deepseek_env() {
+            tracing::info!("Using DeepSeek provider (auto-detected)");
+            return Box::new(p);
         }
-        _ => {}
+        #[cfg(feature = "openai")]
+        if let Some(p) = openai_provider::OpenAiProvider::from_env() {
+            tracing::info!("Using OpenAI provider (auto-detected)");
+            return Box::new(p);
+        }
+        #[cfg(feature = "anthropic")]
+        if let Some(p) = anthropic_provider::AnthropicProvider::from_env() {
+            tracing::info!("Using Anthropic provider (auto-detected)");
+            return Box::new(p);
+        }
     }
 
     tracing::info!("Using mock provider");

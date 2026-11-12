@@ -18,6 +18,8 @@ From source (this repo):
 cargo install --path crates/clawedcode-cli
 ```
 
+DeepSeek is supported as a provider out of the box — just set your `DEEPSEEK_API_KEY` and configure the model in your settings to start using DeepSeek's models with ClawedCode.
+
 ### npm (prebuilt binaries)
 
 Global install:

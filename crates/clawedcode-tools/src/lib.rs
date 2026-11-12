@@ -471,6 +471,10 @@ fn parse_hunks(lines: &[&str]) -> Result<Vec<PatchHunk>, String> {
                     continue;
                 }
 
+                if l.is_empty() {
+                    return Err("Empty line without prefix in update hunk".into());
+                }
+
                 let (prefix, content) = l.split_at(1);
                 match prefix {
                     " " => {
@@ -785,52 +789,6 @@ pub fn builtin_tools() -> Vec<ToolSpec> {
                     { "required": ["task_id"] },
                     { "required": ["shell_id"] }
                 ]
-            }),
-        },
-        ToolSpec {
-            name: "Agent".to_string(),
-            description: "Launch a specialized agent to handle complex tasks. Use this when you need to perform multi-step operations that require careful planning and execution.".to_string(),
-            needs_approval: false,
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "description": {
-                        "type": "string",
-                        "description": "A short description of what the agent will do"
-                    },
-                    "prompt": {
-                        "type": "string",
-                        "description": "The task for the agent to perform"
-                    },
-                    "subagent_type": {
-                        "type": "string",
-                        "description": "Optional type of specialized agent to use"
-                    }
-                },
-                "required": ["description", "prompt"]
-            }),
-        },
-        ToolSpec {
-            name: "Task".to_string(),
-            description: "Launch a specialized agent to handle complex tasks. Use this when you need to perform multi-step operations that require careful planning and execution.".to_string(),
-            needs_approval: false,
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "description": {
-                        "type": "string",
-                        "description": "A short description of what the agent will do"
-                    },
-                    "prompt": {
-                        "type": "string",
-                        "description": "The task for the agent to perform"
-                    },
-                    "subagent_type": {
-                        "type": "string",
-                        "description": "Optional type of specialized agent to use"
-                    }
-                },
-                "required": ["description", "prompt"]
             }),
         },
     ]

@@ -395,21 +395,38 @@ async fn execute_streaming_submit_with_approval<A>(
 where
     A: Fn(&str, &str, &serde_json::Value) -> bool + Send + Sync,
 {
+    use std::io::Write;
+    let mut turn = 1usize;
+    let mut in_thinking = false;
+
     let output = runtime
         .submit_stream_with_approval(
             session,
             prompt,
             |event| match event {
                 ApiEvent::MessageDelta { text } => {
+                    if in_thinking {
+                        eprintln!();
+                        in_thinking = false;
+                    }
                     print!("{text}");
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    let _ = std::io::stdout().flush();
                 }
                 ApiEvent::ThinkingDelta { text } => {
                     if show_thinking {
-                        eprintln!("[thinking] {text}");
+                        if !in_thinking {
+                            eprint!("\r[thinking] ");
+                            in_thinking = true;
+                        }
+                        eprint!("{text}");
+                        let _ = std::io::stderr().flush();
                     }
                 }
                 ApiEvent::ToolUse { tool_use } => {
+                    if in_thinking {
+                        eprintln!();
+                        in_thinking = false;
+                    }
                     eprintln!("\n[tool] {} {}", tool_use.name, tool_use.id);
                 }
                 ApiEvent::ToolResult { tool_result } => {
@@ -418,19 +435,27 @@ where
                 }
                 ApiEvent::Usage { usage } => {
                     eprintln!(
-                        "[usage] in={} out={} cache_r={} cache_w={}",
+                        "\n[turn {} usage] in={} out={} cache_r={} cache_w={}",
+                        turn,
                         usage.input_tokens,
                         usage.output_tokens,
                         usage.cache_read_tokens,
                         usage.cache_write_tokens
                     );
+                    turn += 1;
                 }
-                ApiEvent::Completed => {}
+                ApiEvent::Completed => {
+                    if in_thinking {
+                        eprintln!();
+                        in_thinking = false;
+                    }
+                }
             },
             approval_fn,
         )
         .await;
 
+    println!();
     Ok(output)
 }
 

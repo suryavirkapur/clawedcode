@@ -1,6 +1,6 @@
 {
   "name": "clawedcode",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A coding agent shell focused on startup speed, terminal UX, and compatibility",
   "files": [
     "bin/",

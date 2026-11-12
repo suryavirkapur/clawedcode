@@ -1,3 +1,4 @@
+mod markdown;
 mod repl;
 mod tui;
 

@@ -225,6 +225,7 @@ struct ReplHandler {
     info_panel: Option<InfoPanel>,
     show_thinking: bool,
     state: AppState,
+    expanded_tool_results: std::collections::HashSet<String>,
 }
 
 impl ReplHandler {
@@ -239,7 +240,26 @@ impl ReplHandler {
             info_panel: None,
             show_thinking,
             state: AppState::Idle,
+            expanded_tool_results: std::collections::HashSet::new(),
         }
+    }
+
+    fn toggle_tool_result(&mut self, tool_use_id: &str) {
+        if !self.expanded_tool_results.remove(tool_use_id) {
+            self.expanded_tool_results.insert(tool_use_id.to_string());
+        }
+    }
+
+    fn expand_all_tool_results(&mut self) {
+        for row in &self.transcript_rows {
+            if let RenderRow::ToolResult { tool_use_id, .. } = row {
+                self.expanded_tool_results.insert(tool_use_id.clone());
+            }
+        }
+    }
+
+    fn collapse_all_tool_results(&mut self) {
+        self.expanded_tool_results.clear();
     }
 
     fn rebuild_from_session(&mut self, session: &Session, show_thinking: bool) {
@@ -622,6 +642,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 &input_buffer,
                 &command_entries,
                 viewport.scroll_offset,
+                viewport.unseen_count,
             );
 
             if !queued_preview_lines.is_empty() {
@@ -696,16 +717,16 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
         })?;
 
         let chunks = Layout::vertical([
-            Constraint::Length(1),
+            Constraint::Length(if handler.has_content() { 0 } else { 1 }),
             Constraint::Min(1),
+            Constraint::Length(if active_turn.is_some() && awaiting_approval.is_none() { 1 } else { 0 }),
             Constraint::Length(if queued_prompts.is_empty() {
                 0
             } else {
-                queued_prompt_preview_lines(&queued_prompts).len() as u16 + 2
+                queued_prompt_preview_lines(&queued_prompts).len() as u16 + 1
             }),
             Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(2),
         ])
         .split(last_area);
 
@@ -945,6 +966,12 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         viewport.pinned_to_bottom = true;
                         viewport.unseen_count = 0;
                     }
+                    KeyCode::Char('e') if input_buffer.is_empty() => {
+                        handler.expand_all_tool_results();
+                    }
+                    KeyCode::Char('c') if input_buffer.is_empty() => {
+                        handler.collapse_all_tool_results();
+                    }
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         break;
                     }
@@ -969,6 +996,18 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                             } else {
                                 handler.begin_live_turn(prompt.clone());
                                 active_turn = Some(spawn_turn_worker(ctx, prompt, None));
+                            }
+                        } else {
+                            // Toggle the most recent tool result
+                            let visible = handler.visible_rows();
+                            if let Some(last_tool) = visible.iter().rev().find_map(|row| {
+                                if let RenderRow::ToolResult { tool_use_id, .. } = row {
+                                    Some(tool_use_id.clone())
+                                } else {
+                                    None
+                                }
+                            }) {
+                                handler.toggle_tool_result(&last_tool);
                             }
                         }
                     }
@@ -1016,9 +1055,10 @@ fn render_body(
     input_buffer: &str,
     command_entries: &[CommandEntry],
     scroll_offset: usize,
+    unseen_count: usize,
 ) {
     if handler.has_content() {
-        render_conversation(frame, area, handler, command_entries, scroll_offset);
+        render_conversation(frame, area, handler, command_entries, scroll_offset, unseen_count);
     } else {
         render_dashboard(frame, area, ctx, input_buffer, command_entries);
     }
@@ -1030,27 +1070,73 @@ fn render_conversation(
     handler: &ReplHandler,
     command_entries: &[CommandEntry],
     scroll_offset: usize,
+    unseen_count: usize,
 ) {
+    let has_unseen = unseen_count > 0;
+    let divider_height = if has_unseen { 1 } else { 0 };
+
     if command_entries.is_empty() {
-        let transcript = Paragraph::new(render_rows(&handler.visible_rows(), None, &[]))
-            .wrap(Wrap { trim: false })
-            .scroll((scroll_offset as u16, 0));
-        frame.render_widget(transcript, area);
+        let chunks = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(divider_height),
+        ])
+        .split(area);
+
+        let transcript = Paragraph::new(render_rows(
+            &handler.visible_rows(),
+            None,
+            &[],
+            &handler.expanded_tool_results,
+        ))
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_offset as u16, 0));
+        frame.render_widget(transcript, chunks[0]);
+
+        if has_unseen {
+            let divider = format!("─── {} new message{} ───", unseen_count, if unseen_count == 1 { "" } else { "s" });
+            let remaining_width = chunks[1].width.saturating_sub(divider.chars().count() as u16);
+            let left = remaining_width / 2;
+            let right = remaining_width.saturating_sub(left);
+            let line = format!("{} {} {}", "─".repeat(left as usize), divider, "─".repeat(right as usize));
+            frame.render_widget(
+                Paragraph::new(line).style(Style::default().fg(MUTED)),
+                chunks[1],
+            );
+        }
         return;
     }
 
     let chunks = Layout::vertical([
         Constraint::Min(1),
+        Constraint::Length(divider_height),
         Constraint::Length(command_palette_height(command_entries)),
     ])
     .split(area);
 
-    let transcript = Paragraph::new(render_rows(&handler.visible_rows(), None, &[]))
-        .wrap(Wrap { trim: false })
-        .scroll((scroll_offset as u16, 0));
+    let transcript = Paragraph::new(render_rows(
+        &handler.visible_rows(),
+        None,
+        &[],
+        &handler.expanded_tool_results,
+    ))
+    .wrap(Wrap { trim: false })
+    .scroll((scroll_offset as u16, 0));
 
     frame.render_widget(transcript, chunks[0]);
-    render_command_palette(frame, chunks[1], "", command_entries);
+
+    if has_unseen {
+        let divider = format!("─── {} new message{} ───", unseen_count, if unseen_count == 1 { "" } else { "s" });
+        let remaining_width = chunks[1].width.saturating_sub(divider.chars().count() as u16);
+        let left = remaining_width / 2;
+        let right = remaining_width.saturating_sub(left);
+        let line = format!("{} {} {}", "─".repeat(left as usize), divider, "─".repeat(right as usize));
+        frame.render_widget(
+            Paragraph::new(line).style(Style::default().fg(MUTED)),
+            chunks[1],
+        );
+    }
+
+    render_command_palette(frame, chunks[if has_unseen { 2 } else { 1 }], "", command_entries);
 }
 
 fn render_dashboard(
@@ -1326,22 +1412,169 @@ fn render_rows(
     rows: &[RenderRow],
     selected_index: Option<usize>,
     search_matches: &[usize],
+    expanded_tools: &std::collections::HashSet<String>,
 ) -> Vec<Line<'static>> {
     rows.iter()
         .enumerate()
         .flat_map(|(index, row)| {
-            let style = if selected_index == Some(index) {
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-            } else if search_matches.contains(&index) {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default()
+            let is_selected = selected_index == Some(index);
+            let is_match = search_matches.contains(&index);
+
+            let mut lines = match row {
+                RenderRow::Spacer => vec![Line::from(String::new())],
+                RenderRow::User(text) => {
+                    if text.is_empty() {
+                        vec![Line::from(Span::styled(
+                            "You:",
+                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                        ))]
+                    } else {
+                        let mut result = vec![Line::from(Span::styled(
+                            "You:",
+                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                        ))];
+                        let parsed = crate::markdown::parse_markdown(text);
+                        for line in parsed {
+                            result.push(line);
+                        }
+                        result
+                    }
+                }
+                RenderRow::Assistant(text) => {
+                    if text.is_empty() {
+                        vec![Line::from(Span::styled(
+                            "ClawedCode:",
+                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                        ))]
+                    } else {
+                        let mut result = vec![Line::from(Span::styled(
+                            "ClawedCode:",
+                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                        ))];
+                        let parsed = crate::markdown::parse_markdown(text);
+                        for line in parsed {
+                            result.push(line);
+                        }
+                        result
+                    }
+                }
+                RenderRow::Thinking(text) => vec![Line::from(Span::styled(
+                    format!("{TOOL_LINE_INDENT}[thinking] {text}"),
+                    Style::default().fg(Color::Rgb(120, 120, 120)).add_modifier(Modifier::ITALIC),
+                ))],
+                RenderRow::ToolUse { id: _, name, input } => {
+                    let mut lines = vec![Line::from(Span::styled(
+                        format!("{TOOL_LINE_INDENT}[tool] {name}"),
+                        Style::default().fg(Color::Rgb(100, 180, 100)).add_modifier(Modifier::BOLD),
+                    ))];
+                    // Compact single-line JSON preview
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(input) {
+                        let compact = serde_json::to_string(&json).unwrap_or_else(|_| input.clone());
+                        let preview = if compact.len() > 120 {
+                            format!("{}...", &compact[..120])
+                        } else {
+                            compact
+                        };
+                        lines.push(Line::from(Span::styled(
+                            format!("{TOOL_LINE_INDENT}  {preview}"),
+                            Style::default().fg(Color::Rgb(140, 140, 140)),
+                        )));
+                    } else {
+                        let preview = if input.len() > 120 {
+                            format!("{}...", &input[..120])
+                        } else {
+                            input.clone()
+                        };
+                        lines.push(Line::from(Span::styled(
+                            format!("{TOOL_LINE_INDENT}  {preview}"),
+                            Style::default().fg(Color::Rgb(140, 140, 140)),
+                        )));
+                    }
+                    lines
+                }
+                RenderRow::ToolStatus(text) => vec![Line::from(Span::styled(
+                    text.clone(),
+                    Style::default().fg(Color::Rgb(180, 180, 100)),
+                ))],
+                RenderRow::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => {
+                    let is_expanded = expanded_tools.contains(tool_use_id);
+                    let status_color = if *is_error {
+                        Color::Rgb(220, 80, 80)
+                    } else {
+                        Color::Rgb(100, 180, 100)
+                    };
+
+                    if is_expanded {
+                        let mut lines = vec![Line::from(vec![
+                            Span::styled(
+                                format!("{TOOL_LINE_INDENT}[▼ result] "),
+                                Style::default().fg(status_color).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                tool_use_id.clone(),
+                                Style::default().fg(Color::Rgb(140, 140, 140)),
+                            ),
+                        ])];
+                        let formatted = crate::markdown::format_plain_text(content, &format!("{TOOL_LINE_INDENT}  "));
+                        for line in formatted {
+                            lines.push(line);
+                        }
+                        lines
+                    } else {
+                        let line_count = content.lines().count();
+                        let first_line = content.lines().next().unwrap_or("").trim();
+                        let preview = if first_line.len() > 80 {
+                            format!("{}...", &first_line[..80])
+                        } else {
+                            first_line.to_string()
+                        };
+                        vec![Line::from(vec![
+                            Span::styled(
+                                format!("{TOOL_LINE_INDENT}[▶ result] "),
+                                Style::default().fg(status_color).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                format!("{tool_use_id} · {line_count} lines · {preview}"),
+                                Style::default().fg(Color::Rgb(140, 140, 140)),
+                            ),
+                        ])]
+                    }
+                }
+                RenderRow::SubagentSummary {
+                    child_session_id,
+                    summary,
+                } => {
+                    let mut result = vec![Line::from(Span::styled(
+                        format!("{TOOL_LINE_INDENT}[sub-agent] {child_session_id}"),
+                        Style::default().fg(Color::Rgb(180, 140, 80)),
+                    ))];
+                    let parsed = crate::markdown::parse_markdown(summary);
+                    for line in parsed {
+                        result.push(line);
+                    }
+                    result
+                }
+                RenderRow::Info(text) => vec![Line::from(Span::styled(
+                    text.clone(),
+                    Style::default().fg(Color::Rgb(180, 180, 180)),
+                ))],
             };
 
-            match row {
-                RenderRow::Spacer => vec![Line::from(String::new())],
-                _ => vec![Line::from(Span::styled(row_text(row), style))],
+            // Apply selection/match highlighting
+            if is_selected || is_match {
+                let fg = if is_selected { ACCENT } else { Color::Yellow };
+                for line in &mut lines {
+                    for span in &mut line.spans {
+                        span.style = span.style.fg(fg);
+                    }
+                }
             }
+
+            lines
         })
         .collect()
 }
@@ -1610,9 +1843,11 @@ fn transcript_render_lines(state: &TranscriptModeState) -> Vec<Line<'static>> {
         &state.frozen_rows,
         transcript_search_current(state),
         &state.search_matches,
+        &std::collections::HashSet::new(),
     )
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn prompt_prefix_for_state(
     input_buffer: &str,
     active_turn: bool,
@@ -2907,6 +3142,7 @@ fn mcp_tool_count(ctx: &TuiContext) -> usize {
         .count()
 }
 
+#[allow(dead_code)]
 fn tool_surface_lines(ctx: &TuiContext) -> Vec<String> {
     let mut lines = Vec::new();
 
