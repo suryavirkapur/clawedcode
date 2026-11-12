@@ -709,6 +709,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     let mut last_visible_line_count = handler.visible_lines().len();
     let mut turn_started_at: Option<std::time::Instant> = None;
     let mut palette_index: usize = 0;
+    let mut file_index: Option<Vec<String>> = None;
     let mut palette_touched = false;
     let mut history: Vec<String> = Vec::new();
     let mut history_index: Option<usize> = None;
@@ -798,7 +799,20 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
             }
 
             let command_entries = filtered_command_entries(ctx, &input_buffer);
-            let palette_height = command_palette_height(&command_entries);
+            let file_entries = if command_entries.is_empty() {
+                file_palette_query(&input_buffer, cursor_pos)
+                    .map(|(_, query)| {
+                        filtered_file_entries(
+                            file_index.get_or_insert_with(|| build_file_index(&ctx.session().cwd)),
+                            &query,
+                        )
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let palette_height =
+                command_palette_height(&command_entries).max(file_palette_height(&file_entries));
             let approval_height =
                 approval_selector_height(awaiting_approval.as_ref(), approval_selection);
             let spinner_height = if active_turn.is_some() && awaiting_approval.is_none() {
@@ -841,7 +855,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 viewport.unseen_count,
             );
 
-            if palette_height > 0 {
+            if !command_entries.is_empty() {
                 render_command_palette(
                     frame,
                     chunks[1],
@@ -849,6 +863,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                     &command_entries,
                     palette_index,
                 );
+            } else if !file_entries.is_empty() {
+                render_file_palette(frame, chunks[1], &file_entries, palette_index);
             }
 
             if approval_height > 0 {
@@ -1200,7 +1216,23 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                     }
                 }
 
-                let palette_open = !filtered_command_entries(ctx, &input_buffer).is_empty();
+                let command_palette_open = !filtered_command_entries(ctx, &input_buffer).is_empty();
+                let file_token = file_palette_query(&input_buffer, cursor_pos);
+                let file_entries_now = if command_palette_open {
+                    Vec::new()
+                } else {
+                    file_token
+                        .as_ref()
+                        .map(|(_, query)| {
+                            filtered_file_entries(
+                                file_index
+                                    .get_or_insert_with(|| build_file_index(&ctx.session().cwd)),
+                                query,
+                            )
+                        })
+                        .unwrap_or_default()
+                };
+                let palette_open = command_palette_open || !file_entries_now.is_empty();
 
                 match key.code {
                     KeyCode::Char('o')
@@ -1233,17 +1265,34 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                     }
                     KeyCode::Down if palette_open => {
                         palette_touched = true;
-                        let len = filtered_command_entries(ctx, &input_buffer).len().min(8);
+                        let len = if !file_entries_now.is_empty() {
+                            file_entries_now.len()
+                        } else {
+                            filtered_command_entries(ctx, &input_buffer).len().min(8)
+                        };
                         palette_index = (palette_index + 1).min(len.saturating_sub(1));
                     }
                     KeyCode::Tab if palette_open => {
-                        let entries = filtered_command_entries(ctx, &input_buffer);
-                        if let Some(entry) = entries.get(palette_index.min(entries.len() - 1)) {
-                            input_buffer = format!("{} ", entry.name);
-                            cursor_pos = input_buffer.len();
-                            palette_index = 0;
-                            palette_touched = false;
+                        if !file_entries_now.is_empty() {
+                            if let (Some((at, _)), Some(path)) = (
+                                file_token,
+                                file_entries_now.get(palette_index.min(file_entries_now.len() - 1)),
+                            ) {
+                                input_buffer.replace_range(
+                                    at..cursor_pos,
+                                    &format!("@{} ", path.trim_end_matches('/')),
+                                );
+                                cursor_pos = at + path.trim_end_matches('/').len() + 2;
+                            }
+                        } else {
+                            let entries = filtered_command_entries(ctx, &input_buffer);
+                            if let Some(entry) = entries.get(palette_index.min(entries.len() - 1)) {
+                                input_buffer = format!("{} ", entry.name);
+                                cursor_pos = input_buffer.len();
+                            }
                         }
+                        palette_index = 0;
+                        palette_touched = false;
                     }
                     KeyCode::Up if history_index.is_some() || !history.is_empty() => {
                         if history_index.is_none() {
@@ -1381,6 +1430,20 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                             }
                             input_buffer.insert(cursor_pos, '\n');
                             cursor_pos += 1;
+                        } else if !file_entries_now.is_empty() && palette_touched {
+                            // Enter accepts the focused file completion.
+                            if let (Some((at, _)), Some(path)) = (
+                                file_token,
+                                file_entries_now.get(palette_index.min(file_entries_now.len() - 1)),
+                            ) {
+                                input_buffer.replace_range(
+                                    at..cursor_pos,
+                                    &format!("@{} ", path.trim_end_matches('/')),
+                                );
+                                cursor_pos = at + path.trim_end_matches('/').len() + 2;
+                            }
+                            palette_index = 0;
+                            palette_touched = false;
                         } else if palette_open && palette_touched {
                             let entries = filtered_command_entries(ctx, &input_buffer);
                             if let Some(entry) =
@@ -1438,8 +1501,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                                 turn_started_at = Some(std::time::Instant::now());
                                 active_turn = Some(spawn_turn_worker(
                                     ctx,
-                                    prompt,
-                                    None,
+                                    prompt.clone(),
+                                    expand_at_mentions(&prompt, &ctx.session().cwd),
                                     always_allowed.clone(),
                                 ));
                             }
@@ -1504,14 +1567,16 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                     _ => {}
                 }
 
-                if !input_buffer.trim_start().starts_with('/') {
+                let len = if input_buffer.trim_start().starts_with('/') {
+                    filtered_command_entries(ctx, &input_buffer).len().min(8)
+                } else {
+                    file_entries_now.len()
+                };
+                if len == 0 {
                     palette_index = 0;
                     palette_touched = false;
-                } else {
-                    let len = filtered_command_entries(ctx, &input_buffer).len().min(8);
-                    if palette_index >= len {
-                        palette_index = len.saturating_sub(1);
-                    }
+                } else if palette_index >= len {
+                    palette_index = len - 1;
                 }
             }
         }
@@ -2711,7 +2776,12 @@ fn maybe_submit_queued_prompt(
         *active_turn = Some(spawn_bash_worker(ctx.cloned_session(), command.to_string()));
     } else {
         handler.begin_live_turn(prompt.clone());
-        *active_turn = Some(spawn_turn_worker(ctx, prompt, None, always_allowed.clone()));
+        *active_turn = Some(spawn_turn_worker(
+            ctx,
+            prompt.clone(),
+            expand_at_mentions(&prompt, &ctx.session().cwd),
+            always_allowed.clone(),
+        ));
     }
 
     Ok(())
@@ -3465,6 +3535,144 @@ fn find_visible_command_entry(ctx: &TuiContext, command: &str) -> Option<Command
     visible_command_entries(ctx)
         .into_iter()
         .find(|entry| entry.name == command)
+}
+
+/// Detects an `@token` ending at the cursor: the `@` must be at the start of
+/// the buffer or follow whitespace, and the token itself contains no spaces.
+/// Returns the byte offset of the `@` and the partial path query.
+fn file_palette_query(input: &str, cursor: usize) -> Option<(usize, String)> {
+    let before = &input[..cursor.min(input.len())];
+    let at = before.rfind('@')?;
+    if at > 0 && !before[..at].ends_with(char::is_whitespace) {
+        return None;
+    }
+    let token = &before[at + 1..];
+    if token.contains(char::is_whitespace) {
+        return None;
+    }
+    Some((at, token.to_string()))
+}
+
+/// Builds the cwd-relative file index once (lazy). Skips hidden dirs and the
+/// usual heavy directories, like Claude Code's file palette.
+fn build_file_index(cwd: &std::path::Path) -> Vec<String> {
+    const SKIP: &[&str] = &[".git", "target", "node_modules", "vendor", "dist", "build"];
+    const MAX_ENTRIES: usize = 5000;
+    const MAX_DEPTH: usize = 8;
+
+    let mut entries = Vec::new();
+    let mut stack = vec![(cwd.to_path_buf(), String::new(), 0usize)];
+    while let Some((dir, rel, depth)) = stack.pop() {
+        if depth > MAX_DEPTH || entries.len() >= MAX_ENTRIES {
+            continue;
+        }
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for item in read.flatten() {
+            if entries.len() >= MAX_ENTRIES {
+                break;
+            }
+            let name = item.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || SKIP.contains(&name.as_str()) {
+                continue;
+            }
+            let path = if rel.is_empty() {
+                name.clone()
+            } else {
+                format!("{rel}/{name}")
+            };
+            let Ok(meta) = item.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                entries.push(format!("{path}/"));
+                stack.push((item.path(), path, depth + 1));
+            } else {
+                entries.push(path);
+            }
+        }
+    }
+    entries.sort();
+    entries
+}
+
+/// Substring-matches the file index against the `@` query (directories and
+/// shallower paths rank first), capped for the palette.
+fn filtered_file_entries(index: &[String], query: &str) -> Vec<String> {
+    let query = query.to_lowercase();
+    let mut matches: Vec<&String> = index
+        .iter()
+        .filter(|path| path.to_lowercase().contains(&query))
+        .collect();
+    matches.sort_by(|a, b| {
+        a.matches('/')
+            .count()
+            .cmp(&b.matches('/').count())
+            .then(a.cmp(b))
+    });
+    matches.into_iter().take(8).cloned().collect()
+}
+
+fn file_palette_height(entries: &[String]) -> u16 {
+    if entries.is_empty() {
+        0
+    } else {
+        entries.len() as u16 + 1
+    }
+}
+
+fn render_file_palette(frame: &mut Frame, area: Rect, entries: &[String], selected: usize) {
+    let mut lines = vec![Line::from("")];
+    lines.extend(entries.iter().take(8).enumerate().map(|(index, path)| {
+        let is_selected = index == selected;
+        let (marker, style) = if is_selected {
+            (
+                "❯ ",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            ("  ", Style::default())
+        };
+        Line::from(vec![
+            Span::styled(marker, style),
+            Span::styled(path.clone(), style),
+        ])
+    }));
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Expands `@path` mentions into `<file>` context blocks appended to the
+/// execution prompt, like Claude Code's file attachments. Unknown or
+/// oversized tokens are left untouched.
+fn expand_at_mentions(prompt: &str, cwd: &std::path::Path) -> Option<String> {
+    const MAX_FILE_BYTES: u64 = 200 * 1024;
+    let mut blocks = Vec::new();
+    for token in prompt.split_whitespace() {
+        let Some(rel) = token.strip_prefix('@') else {
+            continue;
+        };
+        let rel = rel.trim_end_matches('/');
+        if rel.is_empty() {
+            continue;
+        }
+        let path = cwd.join(rel);
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        blocks.push(format!("<file path=\"{rel}\">\n{content}\n</file>"));
+    }
+    if blocks.is_empty() {
+        None
+    } else {
+        Some(format!("{prompt}\n\n{}", blocks.join("\n\n")))
+    }
 }
 
 fn filtered_command_entries(ctx: &TuiContext, input_buffer: &str) -> Vec<CommandEntry> {
