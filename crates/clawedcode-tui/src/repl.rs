@@ -2342,6 +2342,7 @@ fn interrupt_active_turn(
 
     handler.clear_live_turn();
     *active_turn = None;
+    ctx.request_interrupt();
     handler.push_overlay("[warn] Interrupted by user");
     handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
 }
@@ -3222,6 +3223,7 @@ fn spawn_turn_worker(
     execution_prompt: Option<String>,
     always_allowed: Arc<Mutex<std::collections::HashSet<String>>>,
 ) -> ActiveTurn {
+    ctx.clear_interrupt();
     let runtime = ctx.replacement_runtime();
     let external_turn_executor = ctx.external_turn_executor();
     let permission_mode = ctx.permission_mode();

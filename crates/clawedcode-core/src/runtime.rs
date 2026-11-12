@@ -197,6 +197,7 @@ pub struct Runtime {
     pub(crate) compatibility: CompatibilitySnapshot,
     pub(crate) provider: BoxedProvider,
     permission_engine: PermissionEngine,
+    interrupt_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -465,6 +466,7 @@ impl Runtime {
             compatibility,
             provider,
             permission_engine: PermissionEngine::new(mode),
+            interrupt_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -601,6 +603,21 @@ impl Runtime {
 
     pub fn permission_mode(&self) -> PermissionMode {
         self.permission_engine.mode()
+    }
+
+    /// Cooperative interrupt: the TUI shares this flag with the worker
+    /// runtime; `esc` sets it and the stream/tool loops bail out early.
+    pub fn interrupt_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.interrupt_flag.clone()
+    }
+
+    pub fn set_interrupt_flag(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.interrupt_flag = flag;
+    }
+
+    fn interrupted(&self) -> bool {
+        self.interrupt_flag
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn set_permission_mode(&mut self, mode: PermissionMode) {
@@ -839,6 +856,9 @@ impl Runtime {
         let mut repeated_tool_count = 0usize;
 
         for _turn in 0..self.max_turns() {
+            if self.interrupted() {
+                break;
+            }
             let request = self.build_request_with_prompt_override(session, prompt_override);
             let stream = self.provider.stream(&request);
 
@@ -915,6 +935,9 @@ impl Runtime {
         let mut s = stream;
 
         while let Some(event) = s.next().await {
+            if self.interrupted() {
+                break;
+            }
             let event = match event {
                 Ok(e) => e,
                 Err(e) => {

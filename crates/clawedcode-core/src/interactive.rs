@@ -427,12 +427,28 @@ impl TuiContext {
     }
 
     pub fn replacement_runtime(&self) -> Runtime {
-        Runtime::with_mode(
+        let mut runtime = Runtime::with_mode(
             self.config.clone(),
             self.system_prompt.clone(),
             self.runtime.compatibility.clone(),
             self.runtime.permission_mode(),
-        )
+        );
+        runtime.set_interrupt_flag(self.runtime.interrupt_flag());
+        runtime
+    }
+
+    /// Sets the cooperative interrupt flag checked by the worker runtime's
+    /// stream and tool loops. Cleared when a new turn spawns.
+    pub fn request_interrupt(&self) {
+        self.runtime
+            .interrupt_flag()
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn clear_interrupt(&self) {
+        self.runtime
+            .interrupt_flag()
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn external_turn_executor(&self) -> Option<Arc<dyn ExternalTurnExecutor>> {
