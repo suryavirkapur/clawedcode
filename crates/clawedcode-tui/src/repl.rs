@@ -719,6 +719,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     let mut last_esc: Option<std::time::Instant> = None;
     let mut last_ctrl_c: Option<std::time::Instant> = None;
     let mut exit_hint: Option<std::time::Instant> = None;
+    let mut undo_stack: Vec<(String, usize)> = Vec::new();
+    let mut stashed_input: Option<(String, usize)> = None;
     let mut last_approval_id: Option<String> = None;
     let always_allowed: Arc<Mutex<std::collections::HashSet<String>>> =
         Arc::new(Mutex::new(std::collections::HashSet::new()));
@@ -1234,6 +1236,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 };
                 let palette_open = command_palette_open || !file_entries_now.is_empty();
 
+                let pre_edit_buffer = input_buffer.clone();
+                let pre_edit_cursor = cursor_pos;
                 match key.code {
                     KeyCode::Char('o')
                         if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1258,6 +1262,57 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                             permission_mode_label(ctx.permission_mode())
                         ));
                         handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
+                    }
+                    KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        let _ = terminal.clear();
+                    }
+                    KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        let panel = todos_panel(ctx);
+                        handler.show_panel(panel.title, panel.lines);
+                    }
+                    KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::ALT) => {
+                        ctx.show_thinking = !ctx.show_thinking;
+                        handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
+                        handler.push_overlay(format!(
+                            "[info] thinking {}",
+                            if ctx.show_thinking { "on" } else { "off" }
+                        ));
+                    }
+                    KeyCode::Char('_') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if let Some((buffer, cursor)) = undo_stack.pop() {
+                            input_buffer = buffer;
+                            cursor_pos = cursor.min(input_buffer.len());
+                        }
+                    }
+                    KeyCode::Char('-')
+                        if key
+                            .modifiers
+                            .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT) =>
+                    {
+                        if let Some((buffer, cursor)) = undo_stack.pop() {
+                            input_buffer = buffer;
+                            cursor_pos = cursor.min(input_buffer.len());
+                        }
+                    }
+                    KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if input_buffer.is_empty() {
+                            if let Some((buffer, cursor)) = stashed_input.take() {
+                                input_buffer = buffer;
+                                cursor_pos = cursor.min(input_buffer.len());
+                            }
+                        } else {
+                            stashed_input = Some((input_buffer.clone(), cursor_pos));
+                            input_buffer.clear();
+                            cursor_pos = 0;
+                            handler.push_overlay("[info] input stashed".to_string());
+                        }
+                    }
+                    KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if let Some(edited) = open_external_editor(&input_buffer) {
+                            input_buffer = edited;
+                            cursor_pos = input_buffer.len();
+                        }
+                        let _ = terminal.clear();
                     }
                     KeyCode::Up if palette_open => {
                         palette_touched = true;
@@ -1496,6 +1551,17 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                                     active_turn =
                                         Some(spawn_bash_worker(ctx.cloned_session(), command));
                                 }
+                            } else if let Some(task) = prompt.strip_prefix('&')
+                                && !task.trim().is_empty()
+                            {
+                                match ctx.spawn_subagent_background(task.trim()) {
+                                    Ok(result) => handler.push_overlay(format!(
+                                        "[info] Sub-agent queued (session: {}, status: running)",
+                                        &result.child_session_id.to_string()[..8],
+                                    )),
+                                    Err(err) => handler
+                                        .push_overlay(format!("[error] Sub-agent failed: {err}")),
+                                }
                             } else {
                                 handler.begin_live_turn(prompt.clone());
                                 turn_started_at = Some(std::time::Instant::now());
@@ -1565,6 +1631,18 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         history_index = None;
                     }
                     _ => {}
+                }
+
+                // Snapshot undo state when an editing key changed the buffer.
+                let undoable_edit = matches!(
+                    key.code,
+                    KeyCode::Char(_) if !key.modifiers.contains(KeyModifiers::ALT)
+                ) || matches!(key.code, KeyCode::Backspace | KeyCode::Delete);
+                if undoable_edit && input_buffer != pre_edit_buffer {
+                    undo_stack.push((pre_edit_buffer, pre_edit_cursor));
+                    if undo_stack.len() > 100 {
+                        undo_stack.remove(0);
+                    }
                 }
 
                 let len = if input_buffer.trim_start().starts_with('/') {
@@ -4053,6 +4131,65 @@ fn sessions_panel(ctx: &TuiContext) -> InfoPanel {
     }
 }
 
+/// `ctrl+t` todo panel — the TaskCreate task list for this session, like
+/// Claude Code's toggleTodos view.
+fn todos_panel(ctx: &TuiContext) -> InfoPanel {
+    let mut lines = Vec::new();
+    match clawedcode_core::tasks::TaskStore::for_session(ctx.session())
+        .and_then(|store| store.list_tasks())
+    {
+        Ok(tasks) if !tasks.is_empty() => {
+            for task in tasks {
+                let (mark, style_name) = match task.status {
+                    clawedcode_core::tasks::TaskStatus::Completed => ("☒", "completed"),
+                    clawedcode_core::tasks::TaskStatus::InProgress => ("◐", "in progress"),
+                    clawedcode_core::tasks::TaskStatus::Pending => ("☐", "pending"),
+                };
+                let suffix = task
+                    .active_form
+                    .as_deref()
+                    .filter(|_| task.status == clawedcode_core::tasks::TaskStatus::InProgress)
+                    .map(|form| format!(" — {form}"))
+                    .unwrap_or_default();
+                lines.push(format!(
+                    "{mark} #{} {}{}  ({style_name})",
+                    task.id, task.subject, suffix
+                ));
+            }
+        }
+        Ok(_) => lines.push("No tasks yet".to_string()),
+        Err(err) => lines.push(format!("Could not load tasks: {err}")),
+    }
+    InfoPanel {
+        title: "Todos".to_string(),
+        status: None,
+        lines,
+    }
+}
+
+/// `ctrl+g` external editor — drops the buffer into a temp file, opens
+/// $VISUAL/$EDITOR in cooked mode, then reads the result back.
+fn open_external_editor(initial: &str) -> Option<String> {
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".to_string());
+    let path = std::env::temp_dir().join(format!("clawedcode-{}.md", std::process::id()));
+    std::fs::write(&path, initial).ok()?;
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    let status = std::process::Command::new(editor).arg(&path).status();
+    let _ = enable_raw_mode();
+    let _ = execute!(io::stdout(), EnterAlternateScreen);
+    match status {
+        Ok(status) if status.success() => {
+            let edited = std::fs::read_to_string(&path).ok();
+            let _ = std::fs::remove_file(&path);
+            edited.map(|text| text.trim_end_matches('\n').to_string())
+        }
+        _ => None,
+    }
+}
+
 fn tasks_panel(ctx: &TuiContext) -> InfoPanel {
     let shell_count = list_background_tasks()
         .into_iter()
@@ -4122,18 +4259,25 @@ fn help_overlay_lines(ctx: &TuiContext) -> Vec<String> {
             "↑ / ↓        navigate options or prompt history".to_string(),
             "1 / 2 / 3    approve, always allow, or deny a tool request".to_string(),
             "Esc          interrupt the turn or dismiss panels".to_string(),
-            "Ctrl+R       expand or collapse tool output".to_string(),
+            "Esc Esc      clear the input".to_string(),
+            "Ctrl+R       reverse-i-search prompt history".to_string(),
+            "Ctrl+O       open the scrollable transcript (expands tool output)".to_string(),
+            "Ctrl+T       show the todo list".to_string(),
+            "Ctrl+L       redraw the screen".to_string(),
+            "Ctrl+_       undo the last edit".to_string(),
+            "Ctrl+S       stash / restore the draft".to_string(),
+            "Ctrl+G       edit the prompt in $EDITOR".to_string(),
+            "Alt+T        toggle thinking display".to_string(),
             "Shift+Tab    cycle permission mode".to_string(),
-            "Ctrl+O       open the scrollable transcript".to_string(),
-            "q / Ctrl+C   exit the REPL".to_string(),
+            "Ctrl+C ×2    exit the REPL".to_string(),
         ],
     );
     append_panel_section(
         &mut lines,
         "Prompt features",
         vec![
-            "!            bash-style intent prefix".to_string(),
-            "@            file/reference prefix".to_string(),
+            "!cmd         run a shell command without a model turn".to_string(),
+            "@path        attach file contents to the prompt".to_string(),
             "&            background-task intent prefix".to_string(),
         ],
     );
