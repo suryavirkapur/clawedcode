@@ -43,20 +43,137 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-const ACCENT: Color = Color::Rgb(215, 119, 87);
-const MUTED: Color = Color::Rgb(150, 150, 150);
-const DIM: Color = Color::Rgb(153, 153, 153);
-const SUBTLE: Color = Color::Rgb(80, 80, 80);
-const ERR_FG: Color = Color::Rgb(255, 107, 128);
-const WARN_FG: Color = Color::Rgb(255, 193, 7);
-const OK_FG: Color = Color::Rgb(78, 186, 101);
-const PERMISSION_FG: Color = Color::Rgb(177, 185, 249);
-const AUTO_ACCEPT_FG: Color = Color::Rgb(175, 135, 255);
-const PLAN_MODE_FG: Color = Color::Rgb(72, 150, 140);
-const PROMPT_BORDER: Color = Color::Rgb(136, 136, 136);
-const USER_MSG_BG: Color = Color::Rgb(55, 55, 55);
-const BASH_FG: Color = Color::Rgb(253, 93, 177);
-const BASH_MSG_BG: Color = Color::Rgb(65, 60, 65);
+#[derive(Debug, Clone, Copy)]
+pub struct Palette {
+    pub accent: Color,
+    pub muted: Color,
+    pub dim: Color,
+    pub subtle: Color,
+    pub err_fg: Color,
+    pub warn_fg: Color,
+    pub ok_fg: Color,
+    pub permission_fg: Color,
+    pub auto_accept_fg: Color,
+    pub plan_mode_fg: Color,
+    pub prompt_border: Color,
+    pub user_msg_bg: Color,
+    pub bash_fg: Color,
+    pub bash_msg_bg: Color,
+    pub text: Color,
+    pub diff_add: Color,
+    pub diff_del: Color,
+}
+
+/// Available themes, mirroring Claude Code's `/theme` picker entries.
+pub const THEME_NAMES: &[&str] = &[
+    "dark",
+    "light",
+    "dark-daltonized",
+    "light-daltonized",
+    "dark-ansi",
+    "light-ansi",
+];
+
+const DARK_PALETTE: Palette = Palette {
+    accent: Color::Rgb(215, 119, 87),
+    muted: Color::Rgb(150, 150, 150),
+    dim: Color::Rgb(153, 153, 153),
+    subtle: Color::Rgb(80, 80, 80),
+    err_fg: Color::Rgb(255, 107, 128),
+    warn_fg: Color::Rgb(255, 193, 7),
+    ok_fg: Color::Rgb(78, 186, 101),
+    permission_fg: Color::Rgb(177, 185, 249),
+    auto_accept_fg: Color::Rgb(175, 135, 255),
+    plan_mode_fg: Color::Rgb(72, 150, 140),
+    prompt_border: Color::Rgb(136, 136, 136),
+    user_msg_bg: Color::Rgb(55, 55, 55),
+    bash_fg: Color::Rgb(253, 93, 177),
+    bash_msg_bg: Color::Rgb(65, 60, 65),
+    text: Color::White,
+    diff_add: Color::Rgb(152, 195, 121),
+    diff_del: Color::Rgb(224, 108, 117),
+};
+
+const LIGHT_PALETTE: Palette = Palette {
+    accent: Color::Rgb(215, 119, 87),
+    muted: Color::Rgb(100, 100, 100),
+    dim: Color::Rgb(100, 100, 100),
+    subtle: Color::Rgb(170, 170, 170),
+    err_fg: Color::Rgb(180, 40, 60),
+    warn_fg: Color::Rgb(160, 110, 0),
+    ok_fg: Color::Rgb(30, 120, 50),
+    permission_fg: Color::Rgb(80, 90, 200),
+    auto_accept_fg: Color::Rgb(110, 60, 190),
+    plan_mode_fg: Color::Rgb(30, 110, 100),
+    prompt_border: Color::Rgb(120, 120, 120),
+    user_msg_bg: Color::Rgb(230, 230, 230),
+    bash_fg: Color::Rgb(180, 40, 120),
+    bash_msg_bg: Color::Rgb(245, 230, 235),
+    text: Color::Black,
+    diff_add: Color::Rgb(60, 130, 40),
+    diff_del: Color::Rgb(170, 50, 60),
+};
+
+const DARK_ANSI_PALETTE: Palette = Palette {
+    accent: Color::Yellow,
+    muted: Color::DarkGray,
+    dim: Color::DarkGray,
+    subtle: Color::DarkGray,
+    err_fg: Color::Red,
+    warn_fg: Color::Yellow,
+    ok_fg: Color::Green,
+    permission_fg: Color::Blue,
+    auto_accept_fg: Color::Magenta,
+    plan_mode_fg: Color::Cyan,
+    prompt_border: Color::Gray,
+    user_msg_bg: Color::Black,
+    bash_fg: Color::Magenta,
+    bash_msg_bg: Color::Black,
+    text: Color::White,
+    diff_add: Color::Green,
+    diff_del: Color::Red,
+};
+
+const LIGHT_ANSI_PALETTE: Palette = Palette {
+    text: Color::Black,
+    user_msg_bg: Color::White,
+    bash_msg_bg: Color::White,
+    ..DARK_ANSI_PALETTE
+};
+
+fn palette_for(theme: &str) -> Palette {
+    match theme {
+        "light" => LIGHT_PALETTE,
+        // Daltonized variants shift the accent toward hues that survive
+        // common red/green deficiencies; base palettes otherwise match.
+        "dark-daltonized" => Palette {
+            accent: Color::Rgb(86, 156, 214),
+            permission_fg: Color::Rgb(86, 156, 214),
+            ..DARK_PALETTE
+        },
+        "light-daltonized" => Palette {
+            accent: Color::Rgb(30, 100, 170),
+            permission_fg: Color::Rgb(30, 100, 170),
+            ..LIGHT_PALETTE
+        },
+        "dark-ansi" => DARK_ANSI_PALETTE,
+        "light-ansi" => LIGHT_ANSI_PALETTE,
+        _ => DARK_PALETTE,
+    }
+}
+
+static ACTIVE_PALETTE: Mutex<Palette> = Mutex::new(DARK_PALETTE);
+
+/// Set the active theme. Called once at REPL start and by `/theme`.
+fn set_theme(theme: &str) {
+    if let Ok(mut guard) = ACTIVE_PALETTE.lock() {
+        *guard = palette_for(theme);
+    }
+}
+
+fn pal() -> Palette {
+    ACTIVE_PALETTE.lock().map(|g| *g).unwrap_or(DARK_PALETTE)
+}
 const DASHBOARD_HEIGHT: u16 = 16;
 const BULLET: &str = "⏺";
 const HOOK_PREFIX: &str = "  ⎿  ";
@@ -298,6 +415,7 @@ const BUILTIN_COMMANDS: &[&str] = &[
     "/tools",
     "/status",
     "/model",
+    "/theme",
     "/permissions",
     "/init",
     "/resume",
@@ -347,6 +465,7 @@ fn skill_is_registerable(skill: &SkillDescriptor) -> bool {
 }
 
 pub fn run_with_context(mut ctx: TuiContext) -> Result<()> {
+    set_theme(ctx.theme_name());
     enable_raw_mode()?;
     execute!(stdout(), EnterAlternateScreen, SetTitle("ClawedCode"))?;
     let terminal = ratatui::init();
@@ -453,6 +572,7 @@ struct ReplHandler {
     expanded_tool_results: std::collections::HashSet<String>,
     quit_requested: bool,
     model_picker: Option<usize>,
+    theme_picker: Option<usize>,
     /// `/rewind` message selector — index into `rewind_candidates`.
     rewind_picker: Option<usize>,
     turn_tokens: u64,
@@ -476,6 +596,7 @@ impl ReplHandler {
             expanded_tool_results: std::collections::HashSet::new(),
             quit_requested: false,
             model_picker: None,
+            theme_picker: None,
             rewind_picker: None,
             turn_tokens: 0,
             total_input_tokens: 0,
@@ -790,7 +911,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     let mut approval_amend: Option<String> = None;
     let mut approval_explain = false;
     let mut approval_debug = false;
-    /// ask_user_question dialog: collected answers + current question index.
+    // ask_user_question dialog: collected answers + current question index.
     let mut question_index: usize = 0;
     let mut question_answers: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
     let mut active_turn: Option<ActiveTurn> = None;
@@ -926,6 +1047,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 ),
             }
             .max(model_picker_height(handler.model_picker, ctx))
+            .max(theme_picker_height(handler.theme_picker))
             .max(rewind_picker_height(handler.rewind_picker, ctx));
             let spinner_height = if active_turn.is_some() && awaiting_approval.is_none() {
                 1
@@ -1004,6 +1126,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 );
             } else if let Some(sel) = handler.model_picker {
                 render_model_picker(frame, chunks[2], sel, ctx);
+            } else if let Some(sel) = handler.theme_picker {
+                render_theme_picker(frame, chunks[2], sel);
             } else if let Some(sel) = handler.rewind_picker {
                 render_rewind_picker(frame, chunks[2], sel, ctx);
             }
@@ -1062,7 +1186,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                             .title(format!(" {} ", panel.title.as_str()))
                             .borders(Borders::ALL)
                             .border_type(BorderType::Rounded)
-                            .border_style(Style::default().fg(MUTED)),
+                            .border_style(Style::default().fg(pal().muted)),
                     )
                     .wrap(Wrap { trim: false })
                     .scroll((info_panel_scroll as u16, 0));
@@ -1217,6 +1341,28 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         }
                         KeyCode::Esc => {
                             handler.model_picker = None;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                if let Some(sel) = handler.theme_picker {
+                    let count = THEME_NAMES.len();
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            handler.theme_picker = Some(sel.saturating_sub(1));
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            handler.theme_picker = Some((sel + 1).min(count.saturating_sub(1)));
+                        }
+                        KeyCode::Enter => {
+                            handler.theme_picker = None;
+                            apply_theme_choice(ctx, &mut handler, THEME_NAMES[sel]);
+                            let _ = ctx.save_session();
+                        }
+                        KeyCode::Esc => {
+                            handler.theme_picker = None;
                         }
                         _ => {}
                     }
@@ -2185,7 +2331,7 @@ fn render_conversation(
             "─".repeat(right as usize)
         );
         frame.render_widget(
-            Paragraph::new(line).style(Style::default().fg(MUTED)),
+            Paragraph::new(line).style(Style::default().fg(pal().muted)),
             chunks[1],
         );
     }
@@ -2214,12 +2360,12 @@ fn render_dashboard(
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(ratatui::widgets::BorderType::Rounded)
-        .border_style(Style::default().fg(ACCENT))
+        .border_style(Style::default().fg(pal().accent))
         .title(Line::from(vec![
-            Span::styled(" ClawedCode", Style::default().fg(ACCENT)),
+            Span::styled(" ClawedCode", Style::default().fg(pal().accent)),
             Span::styled(
                 format!(" v{} ", env!("CARGO_PKG_VERSION")),
-                Style::default().fg(DIM),
+                Style::default().fg(pal().dim),
             ),
         ]))
         .padding(ratatui::widgets::Padding::horizontal(1));
@@ -2255,20 +2401,20 @@ fn welcome_left_lines(ctx: &TuiContext, width: usize) -> Vec<Line<'static>> {
         Line::from(""),
     ];
     for logo in clawd_logo(tick) {
-        lines.push(center(logo.to_string(), Style::default().fg(ACCENT)));
+        lines.push(center(logo.to_string(), Style::default().fg(pal().accent)));
     }
     lines.push(Line::from(""));
     lines.push(center(
         ctx.model_name().to_string(),
-        Style::default().fg(MUTED),
+        Style::default().fg(pal().muted),
     ));
     lines.push(center(
         provider_label().to_string(),
-        Style::default().fg(MUTED),
+        Style::default().fg(pal().muted),
     ));
     lines.push(center(
         display_path(&ctx.session().cwd),
-        Style::default().fg(MUTED),
+        Style::default().fg(pal().muted),
     ));
     lines
 }
@@ -2298,7 +2444,7 @@ fn welcome_lines(ctx: &TuiContext, width: usize) -> Vec<Line<'static>> {
             }
             None => spans.push(Span::raw(" ".repeat(left_width))),
         }
-        spans.push(Span::styled(" │ ", Style::default().fg(DIM)));
+        spans.push(Span::styled(" │ ", Style::default().fg(pal().dim)));
         if let Some(line) = right.get(index) {
             spans.extend(line.spans.iter().cloned());
         }
@@ -2328,7 +2474,7 @@ fn render_transcript_screen(frame: &mut Frame, area: Rect, state: &TranscriptMod
     let transcript = transcript.block(
         Block::default()
             .borders(Borders::BOTTOM)
-            .border_style(Style::default().fg(MUTED)),
+            .border_style(Style::default().fg(pal().muted)),
     );
     frame.render_widget(transcript, chunks[0]);
 
@@ -2340,7 +2486,7 @@ fn render_transcript_screen(frame: &mut Frame, area: Rect, state: &TranscriptMod
         transcript_footer_hint_line(state)
     };
     frame.render_widget(
-        Paragraph::new(bottom_line).style(Style::default().fg(MUTED)),
+        Paragraph::new(bottom_line).style(Style::default().fg(pal().muted)),
         chunks[2],
     );
 }
@@ -2360,7 +2506,9 @@ fn render_command_palette(
         let (marker, name_style) = if is_selected {
             (
                 "❯ ",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(pal().accent)
+                    .add_modifier(Modifier::BOLD),
             )
         } else {
             ("  ", Style::default().add_modifier(Modifier::BOLD))
@@ -2369,7 +2517,7 @@ fn render_command_palette(
         Line::from(vec![
             Span::styled(marker, name_style),
             Span::styled(format!("{:<14}", entry.name), name_style),
-            Span::styled(entry.description.clone(), Style::default().fg(DIM)),
+            Span::styled(entry.description.clone(), Style::default().fg(pal().dim)),
             Span::styled(format!("  {badge}"), Style::default().fg(badge_color)),
         ])
     }));
@@ -2463,12 +2611,10 @@ fn patch_preview_lines(input: &serde_json::Value, max_rows: usize) -> Vec<Line<'
         return Vec::new();
     }
 
-    let add_style = Style::default().fg(Color::Rgb(152, 195, 121));
-    let del_style = Style::default().fg(Color::Rgb(224, 108, 117));
-    let ctx_style = Style::default().fg(DIM);
-    let head_style = Style::default()
-        .fg(Color::White)
-        .add_modifier(Modifier::BOLD);
+    let add_style = Style::default().fg(pal().diff_add);
+    let del_style = Style::default().fg(pal().diff_del);
+    let ctx_style = Style::default().fg(pal().dim);
+    let head_style = Style::default().fg(pal().text).add_modifier(Modifier::BOLD);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     for raw in patch.lines() {
@@ -2574,7 +2720,7 @@ fn render_approval_selector(
     let border_width = area.width.saturating_sub(2) as usize;
     frame.render_widget(
         Paragraph::new(format!("╭{}╮", "─".repeat(border_width)))
-            .style(Style::default().fg(PERMISSION_FG)),
+            .style(Style::default().fg(pal().permission_fg)),
         Rect::new(area.x, area.y, area.width, 1),
     );
 
@@ -2584,19 +2730,19 @@ fn render_approval_selector(
             Span::styled(
                 title,
                 Style::default()
-                    .fg(PERMISSION_FG)
+                    .fg(pal().permission_fg)
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(""),
         Line::from(Span::styled(
             format!(" {arg}"),
-            Style::default().fg(Color::White),
+            Style::default().fg(pal().text),
         )),
         Line::from(""),
         Line::from(Span::styled(
             " Do you want to proceed?".to_string(),
-            Style::default().fg(DIM),
+            Style::default().fg(pal().dim),
         )),
     ];
 
@@ -2616,9 +2762,9 @@ fn render_approval_selector(
         let is_selected = index == selected;
         let marker = if is_selected { "❯ " } else { "  " };
         let style = if is_selected {
-            Style::default().fg(PERMISSION_FG)
+            Style::default().fg(pal().permission_fg)
         } else {
-            Style::default().fg(DIM)
+            Style::default().fg(pal().dim)
         };
         lines.push(Line::from(vec![
             Span::styled(format!(" {marker}"), style),
@@ -2632,7 +2778,7 @@ fn render_approval_selector(
                 " This tool requires your approval in {} mode.",
                 permission_mode_label(ctx.permission_mode())
             ),
-            Style::default().fg(MUTED),
+            Style::default().fg(pal().muted),
         )));
     }
     if debug {
@@ -2642,15 +2788,15 @@ fn render_approval_selector(
                 request.tool_use_id,
                 truncate_for_display(&input_json, 60)
             ),
-            Style::default().fg(SUBTLE),
+            Style::default().fg(pal().subtle),
         )));
     }
 
     if let Some(buffer) = amend {
         lines.push(Line::from(vec![
-            Span::styled(" ❯ ", Style::default().fg(ACCENT)),
-            Span::styled(buffer.to_string(), Style::default().fg(Color::White)),
-            Span::styled("▌", Style::default().fg(ACCENT)),
+            Span::styled(" ❯ ", Style::default().fg(pal().accent)),
+            Span::styled(buffer.to_string(), Style::default().fg(pal().text)),
+            Span::styled("▌", Style::default().fg(pal().accent)),
         ]));
     }
 
@@ -2662,7 +2808,10 @@ fn render_approval_selector(
     } else {
         " Esc to cancel".to_string()
     };
-    lines.push(Line::from(Span::styled(footer, Style::default().fg(DIM))));
+    lines.push(Line::from(Span::styled(
+        footer,
+        Style::default().fg(pal().dim),
+    )));
 
     frame.render_widget(
         Paragraph::new(lines),
@@ -2819,7 +2968,7 @@ fn render_question_dialog(
     let border_width = area.width.saturating_sub(2) as usize;
     frame.render_widget(
         Paragraph::new(format!("╭{}╮", "─".repeat(border_width)))
-            .style(Style::default().fg(PERMISSION_FG)),
+            .style(Style::default().fg(pal().permission_fg)),
         Rect::new(area.x, area.y, area.width, 1),
     );
 
@@ -2827,11 +2976,11 @@ fn render_question_dialog(
         Line::from(vec![
             Span::styled(
                 format!(" [{}]", question.header),
-                Style::default().fg(PERMISSION_FG),
+                Style::default().fg(pal().permission_fg),
             ),
             Span::styled(
                 format!(" {}", question.question),
-                Style::default().fg(Color::White),
+                Style::default().fg(pal().text),
             ),
         ]),
         Line::from(""),
@@ -2842,9 +2991,9 @@ fn render_question_dialog(
         let focused = index == selected;
         let marker = if focused { "❯" } else { " " };
         let style = if focused {
-            Style::default().fg(PERMISSION_FG)
+            Style::default().fg(pal().permission_fg)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(pal().text)
         };
         lines.push(Line::from(vec![
             Span::styled(format!(" {marker} "), style),
@@ -2852,14 +3001,14 @@ fn render_question_dialog(
         ]));
         lines.push(Line::from(Span::styled(
             format!("    {}", option.description),
-            Style::default().fg(DIM),
+            Style::default().fg(pal().dim),
         )));
     }
     let other_focused = selected == total - 1;
     let other_style = if other_focused {
-        Style::default().fg(PERMISSION_FG)
+        Style::default().fg(pal().permission_fg)
     } else {
-        Style::default().fg(DIM)
+        Style::default().fg(pal().dim)
     };
     lines.push(Line::from(vec![
         Span::styled(
@@ -2871,9 +3020,9 @@ fn render_question_dialog(
 
     if let Some(buffer) = amend {
         lines.push(Line::from(vec![
-            Span::styled(" ❯ ", Style::default().fg(ACCENT)),
-            Span::styled(buffer.to_string(), Style::default().fg(Color::White)),
-            Span::styled("▌", Style::default().fg(ACCENT)),
+            Span::styled(" ❯ ", Style::default().fg(pal().accent)),
+            Span::styled(buffer.to_string(), Style::default().fg(pal().text)),
+            Span::styled("▌", Style::default().fg(pal().accent)),
         ]));
     }
 
@@ -2888,7 +3037,10 @@ fn render_question_dialog(
     } else {
         format!(" ↑/↓ select · Enter to answer · Esc to skip{progress}")
     };
-    lines.push(Line::from(Span::styled(footer, Style::default().fg(DIM))));
+    lines.push(Line::from(Span::styled(
+        footer,
+        Style::default().fg(pal().dim),
+    )));
 
     frame.render_widget(
         Paragraph::new(lines),
@@ -2918,7 +3070,7 @@ fn spinner_line(turn_started_at: Option<std::time::Instant>, tokens: u64) -> Lin
     Line::from(vec![
         Span::styled(
             format!("{} ", SPINNER_FRAMES[frame_index]),
-            Style::default().fg(ACCENT),
+            Style::default().fg(pal().accent),
         ),
         Span::styled(
             format!("{}… ", SPINNER_VERBS[verb_index]),
@@ -2926,7 +3078,7 @@ fn spinner_line(turn_started_at: Option<std::time::Instant>, tokens: u64) -> Lin
         ),
         Span::styled(
             format!("(esc to interrupt · {seconds}s{tokens_part})"),
-            Style::default().fg(DIM),
+            Style::default().fg(pal().dim),
         ),
     ])
 }
@@ -2979,7 +3131,7 @@ fn render_input_box(
         return ratatui::layout::Position::new(area.x, area.y);
     }
 
-    let border_style = Style::default().fg(PROMPT_BORDER);
+    let border_style = Style::default().fg(pal().prompt_border);
     let border_width = area.width.saturating_sub(2) as usize;
     let top = format!("╭{}╮", "─".repeat(border_width));
     let bottom = format!("╰{}╯", "─".repeat(border_width));
@@ -3007,10 +3159,18 @@ fn render_input_box(
     let pointer = if bash_mode { "!" } else { POINTER };
     let prompt_style = if loading {
         Style::default()
-            .fg(if bash_mode { PERMISSION_FG } else { ACCENT })
+            .fg(if bash_mode {
+                pal().permission_fg
+            } else {
+                pal().accent
+            })
             .add_modifier(Modifier::DIM)
     } else {
-        Style::default().fg(if bash_mode { PERMISSION_FG } else { ACCENT })
+        Style::default().fg(if bash_mode {
+            pal().permission_fg
+        } else {
+            pal().accent
+        })
     };
 
     for (index, line) in all_lines.iter().take(8).enumerate() {
@@ -3101,11 +3261,11 @@ fn render_hint_line(
     };
 
     let left_style = if history_search.is_some() || exit_hint {
-        Style::default().fg(PERMISSION_FG)
+        Style::default().fg(pal().permission_fg)
     } else if mode != clawedcode_core::permissions::PermissionMode::Default {
         Style::default().fg(permission_mode_color(mode))
     } else {
-        Style::default().fg(SUBTLE)
+        Style::default().fg(pal().subtle)
     };
 
     let right = format!(
@@ -3126,7 +3286,7 @@ fn render_hint_line(
     );
     frame.render_widget(
         Paragraph::new(right)
-            .style(Style::default().fg(SUBTLE))
+            .style(Style::default().fg(pal().subtle))
             .alignment(Alignment::Right),
         chunks[1],
     );
@@ -3149,10 +3309,10 @@ fn permission_mode_label(mode: clawedcode_core::permissions::PermissionMode) -> 
 /// sage, bypass red.
 fn permission_mode_color(mode: clawedcode_core::permissions::PermissionMode) -> Color {
     match mode {
-        clawedcode_core::permissions::PermissionMode::Default => Color::White,
-        clawedcode_core::permissions::PermissionMode::AcceptEdits => AUTO_ACCEPT_FG,
-        clawedcode_core::permissions::PermissionMode::Plan => PLAN_MODE_FG,
-        clawedcode_core::permissions::PermissionMode::Bypass => ERR_FG,
+        clawedcode_core::permissions::PermissionMode::Default => pal().text,
+        clawedcode_core::permissions::PermissionMode::AcceptEdits => pal().auto_accept_fg,
+        clawedcode_core::permissions::PermissionMode::Plan => pal().plan_mode_fg,
+        clawedcode_core::permissions::PermissionMode::Bypass => pal().err_fg,
     }
 }
 
@@ -3195,18 +3355,18 @@ fn render_footer_bar(frame: &mut Frame, area: Rect, left: &str, right: Option<&s
         let chunks =
             Layout::horizontal([Constraint::Min(1), Constraint::Length(right_width)]).split(area);
         frame.render_widget(
-            Paragraph::new(left.to_string()).style(Style::default().fg(MUTED)),
+            Paragraph::new(left.to_string()).style(Style::default().fg(pal().muted)),
             chunks[0],
         );
         frame.render_widget(
             Paragraph::new(right.to_string())
-                .style(Style::default().fg(MUTED))
+                .style(Style::default().fg(pal().muted))
                 .alignment(Alignment::Right),
             chunks[1],
         );
     } else {
         frame.render_widget(
-            Paragraph::new(left.to_string()).style(Style::default().fg(MUTED)),
+            Paragraph::new(left.to_string()).style(Style::default().fg(pal().muted)),
             area,
         );
     }
@@ -3340,7 +3500,9 @@ fn render_rows(
                     result
                 }
                 RenderRow::Thinking(text) => {
-                    let style = Style::default().fg(DIM).add_modifier(Modifier::ITALIC);
+                    let style = Style::default()
+                        .fg(pal().dim)
+                        .add_modifier(Modifier::ITALIC);
                     if !expand_all {
                         // Reference collapses thinking to `∴ Thinking…` in the
                         // main view; ctrl+o expands to the full content.
@@ -3369,12 +3531,14 @@ fn render_rows(
                             tool_display_name(name).to_string(),
                             Style::default().add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(format!("({arg})"), Style::default().fg(DIM)),
+                        Span::styled(format!("({arg})"), Style::default().fg(pal().dim)),
                     ])]
                 }
                 RenderRow::ToolStatus(text) => vec![Line::from(Span::styled(
                     format!("{HOOK_PREFIX}{text}"),
-                    Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
+                    Style::default()
+                        .fg(pal().dim)
+                        .add_modifier(Modifier::ITALIC),
                 ))],
                 RenderRow::ToolResult {
                     tool_use_id,
@@ -3394,12 +3558,15 @@ fn render_rows(
                             "Task".to_string(),
                             Style::default().add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(format!("({child_session_id})"), Style::default().fg(DIM)),
+                        Span::styled(
+                            format!("({child_session_id})"),
+                            Style::default().fg(pal().dim),
+                        ),
                     ])];
                     for line in summary.lines() {
                         result.push(Line::from(vec![
-                            Span::styled(HOOK_PREFIX, Style::default().fg(DIM)),
-                            Span::styled(line.to_string(), Style::default().fg(DIM)),
+                            Span::styled(HOOK_PREFIX, Style::default().fg(pal().dim)),
+                            Span::styled(line.to_string(), Style::default().fg(pal().dim)),
                         ]));
                     }
                     result
@@ -3409,7 +3576,11 @@ fn render_rows(
 
             // Apply selection/match highlighting
             if is_selected || is_match {
-                let fg = if is_selected { ACCENT } else { Color::Yellow };
+                let fg = if is_selected {
+                    pal().accent
+                } else {
+                    Color::Yellow
+                };
                 for line in &mut lines {
                     for span in &mut line.spans {
                         span.style = span.style.fg(fg);
@@ -3471,10 +3642,14 @@ fn history_nav(
 fn render_user_message(text: &str, width: usize) -> Vec<Line<'static>> {
     // `! cmd` bash-input bands use the reference's bash colors.
     let bash = text.starts_with('!');
-    let bg = if bash { BASH_MSG_BG } else { USER_MSG_BG };
+    let bg = if bash {
+        pal().bash_msg_bg
+    } else {
+        pal().user_msg_bg
+    };
     let style = Style::default().bg(bg);
-    let text_style = Style::default().fg(Color::White).bg(bg);
-    let bang_style = Style::default().fg(BASH_FG).bg(bg);
+    let text_style = Style::default().fg(pal().text).bg(bg);
+    let bang_style = Style::default().fg(pal().bash_fg).bg(bg);
     let mut result = Vec::new();
     let push_band = |result: &mut Vec<Line<'static>>, raw: &str| {
         let rendered_len = if bash && raw.starts_with('!') {
@@ -3518,8 +3693,8 @@ fn render_tool_result(
     expanded_tools: &std::collections::HashSet<String>,
 ) -> Vec<Line<'static>> {
     let is_expanded = expanded_tools.contains(tool_use_id);
-    let body_color = if is_error { ERR_FG } else { DIM };
-    let hook_color = if is_error { ERR_FG } else { MUTED };
+    let body_color = if is_error { pal().err_fg } else { pal().dim };
+    let hook_color = if is_error { pal().err_fg } else { pal().muted };
 
     if content.trim().is_empty() {
         return vec![Line::from(vec![
@@ -3554,7 +3729,9 @@ fn render_tool_result(
                 Span::styled(HOOK_CONTINUATION, Style::default().fg(hook_color)),
                 Span::styled(
                     format!("… +{} lines (ctrl+o to expand)", content_lines.len() - 1),
-                    Style::default().fg(SUBTLE).add_modifier(Modifier::ITALIC),
+                    Style::default()
+                        .fg(pal().subtle)
+                        .add_modifier(Modifier::ITALIC),
                 ),
             ]));
         }
@@ -3567,13 +3744,13 @@ fn render_tool_result(
         .map(|(index, raw)| {
             let trimmed = raw.trim_start();
             let line_style = if is_error {
-                Style::default().fg(ERR_FG)
+                Style::default().fg(pal().err_fg)
             } else if trimmed.starts_with('+') {
-                Style::default().fg(OK_FG)
+                Style::default().fg(pal().ok_fg)
             } else if trimmed.starts_with('-') {
-                Style::default().fg(ERR_FG)
+                Style::default().fg(pal().err_fg)
             } else {
-                Style::default().fg(DIM)
+                Style::default().fg(pal().dim)
             };
             let prefix = if index == 0 {
                 HOOK_PREFIX
@@ -3592,13 +3769,13 @@ fn render_tool_result(
 /// everything else renders dim.
 fn info_line(text: &str) -> Line<'static> {
     let (color, rest) = if let Some(rest) = text.strip_prefix("[error] ") {
-        (ERR_FG, rest)
+        (pal().err_fg, rest)
     } else if let Some(rest) = text.strip_prefix("[warn] ") {
-        (WARN_FG, rest)
+        (pal().warn_fg, rest)
     } else if let Some(rest) = text.strip_prefix("[info] ") {
-        (DIM, rest)
+        (pal().dim, rest)
     } else {
-        (DIM, text)
+        (pal().dim, text)
     };
     Line::from(Span::styled(rest.to_string(), Style::default().fg(color)))
 }
@@ -3833,7 +4010,7 @@ fn queued_prompt_preview_lines(queued_prompts: &[String], width: usize) -> Vec<L
     if queued_prompts.len() > visible_count {
         lines.push(Line::from(Span::styled(
             format!("  … +{} more", queued_prompts.len() - visible_count),
-            Style::default().fg(SUBTLE),
+            Style::default().fg(pal().subtle),
         )));
     }
 
@@ -3879,7 +4056,7 @@ fn welcome_right_lines(ctx: &TuiContext, width: usize) -> Vec<Line<'static>> {
         lines.push(section_title("Connection"));
         lines.push(Line::from(Span::styled(
             format!("Interactive transport: {label}"),
-            Style::default().fg(DIM),
+            Style::default().fg(pal().dim),
         )));
         lines.push(Line::from(""));
     }
@@ -3891,7 +4068,7 @@ fn welcome_right_lines(ctx: &TuiContext, width: usize) -> Vec<Line<'static>> {
             .filter(|step| step.is_enabled)
         {
             let (mark, style) = if step.is_complete {
-                ("☑", Style::default().fg(DIM))
+                ("☑", Style::default().fg(pal().dim))
             } else {
                 ("☐", Style::default())
             };
@@ -3909,8 +4086,8 @@ fn welcome_right_lines(ctx: &TuiContext, width: usize) -> Vec<Line<'static>> {
         ];
         for (index, tip) in tips.iter().enumerate() {
             lines.push(Line::from(vec![
-                Span::styled(format!("{}. ", index + 1), Style::default().fg(DIM)),
-                Span::styled((*tip).to_string(), Style::default().fg(MUTED)),
+                Span::styled(format!("{}. ", index + 1), Style::default().fg(pal().dim)),
+                Span::styled((*tip).to_string(), Style::default().fg(pal().muted)),
             ]));
         }
     }
@@ -3918,7 +4095,7 @@ fn welcome_right_lines(ctx: &TuiContext, width: usize) -> Vec<Line<'static>> {
     if launched_in_home(&ctx.session().cwd) {
         lines.push(Line::from(Span::styled(
             "⚠ You launched clawedcode in your home directory — run it inside a project directory instead.",
-            Style::default().fg(WARN_FG),
+            Style::default().fg(pal().warn_fg),
         )));
     }
 
@@ -3929,7 +4106,7 @@ fn welcome_right_lines(ctx: &TuiContext, width: usize) -> Vec<Line<'static>> {
     if activity.is_empty() {
         lines.push(Line::from(Span::styled(
             "No recent activity",
-            Style::default().fg(MUTED),
+            Style::default().fg(pal().muted),
         )));
     } else {
         for item in activity {
@@ -5178,6 +5355,11 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
             source: CommandSource::BuiltIn,
         },
         CommandEntry {
+            name: "/theme".to_string(),
+            description: "Pick the UI theme".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
             name: "/permissions".to_string(),
             description: "Show permission mode and always-allowed tools".to_string(),
             source: CommandSource::BuiltIn,
@@ -5417,7 +5599,9 @@ fn render_file_palette(frame: &mut Frame, area: Rect, entries: &[String], select
         let (marker, style) = if is_selected {
             (
                 "❯ ",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(pal().accent)
+                    .add_modifier(Modifier::BOLD),
             )
         } else {
             ("  ", Style::default())
@@ -5582,7 +5766,7 @@ fn compare_command_entries(
 
 fn command_source_badge(source: CommandSource) -> (&'static str, Color) {
     match source {
-        CommandSource::BuiltIn => ("[built-in]", ACCENT),
+        CommandSource::BuiltIn => ("[built-in]", pal().accent),
         CommandSource::Skill => ("[skill]", Color::Cyan),
     }
 }
@@ -5788,11 +5972,14 @@ fn render_model_picker(frame: &mut Frame, area: Rect, selected: usize, ctx: &Tui
     let border_width = area.width.saturating_sub(2) as usize;
     frame.render_widget(
         Paragraph::new(format!("╭{}╮", "─".repeat(border_width)))
-            .style(Style::default().fg(ACCENT)),
+            .style(Style::default().fg(pal().accent)),
         Rect::new(area.x, area.y, area.width, 1),
     );
     let mut lines = vec![
-        Line::from(Span::styled(" Select model", Style::default().fg(ACCENT))),
+        Line::from(Span::styled(
+            " Select model",
+            Style::default().fg(pal().accent),
+        )),
         Line::from(""),
     ];
     for (index, model) in model_candidates(ctx).iter().enumerate() {
@@ -5804,9 +5991,9 @@ fn render_model_picker(frame: &mut Frame, area: Rect, selected: usize, ctx: &Tui
             ""
         };
         let style = if focused {
-            Style::default().fg(ACCENT)
+            Style::default().fg(pal().accent)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(pal().text)
         };
         lines.push(Line::from(vec![
             Span::styled(format!(" {marker}"), style),
@@ -5815,7 +6002,7 @@ fn render_model_picker(frame: &mut Frame, area: Rect, selected: usize, ctx: &Tui
     }
     lines.push(Line::from(Span::styled(
         " Enter to select · Esc to cancel",
-        Style::default().fg(DIM),
+        Style::default().fg(pal().dim),
     )));
     frame.render_widget(
         Paragraph::new(lines),
@@ -5826,6 +6013,102 @@ fn render_model_picker(frame: &mut Frame, area: Rect, selected: usize, ctx: &Tui
             area.height.saturating_sub(1),
         ),
     );
+}
+
+fn theme_picker_height(picker: Option<usize>) -> u16 {
+    if picker.is_none() {
+        return 0;
+    }
+    // border + title + blank + options + footer
+    THEME_NAMES.len() as u16 + 4
+}
+
+fn render_theme_picker(frame: &mut Frame, area: Rect, selected: usize) {
+    if area.height == 0 {
+        return;
+    }
+    let border_width = area.width.saturating_sub(2) as usize;
+    frame.render_widget(
+        Paragraph::new(format!("╭{}╮", "─".repeat(border_width)))
+            .style(Style::default().fg(pal().accent)),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    let mut lines = vec![
+        Line::from(Span::styled(
+            " Select theme",
+            Style::default().fg(pal().accent),
+        )),
+        Line::from(""),
+    ];
+    for (index, name) in THEME_NAMES.iter().enumerate() {
+        let focused = index == selected;
+        let marker = if focused { "❯" } else { " " };
+        let style = if focused {
+            Style::default().fg(pal().accent)
+        } else {
+            Style::default().fg(pal().text)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {marker}"), style),
+            Span::styled(name.to_string(), style),
+        ]));
+    }
+    lines.push(Line::from(Span::styled(
+        " Enter to select · Esc to cancel",
+        Style::default().fg(pal().dim),
+    )));
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect::new(
+            area.x,
+            area.y + 1,
+            area.width,
+            area.height.saturating_sub(1),
+        ),
+    );
+}
+
+fn apply_theme_choice(ctx: &mut TuiContext, handler: &mut ReplHandler, theme: &str) {
+    if !THEME_NAMES.contains(&theme) {
+        handler.push_overlay(format!(
+            "[error] Unknown theme '{theme}' (options: {})",
+            THEME_NAMES.join(", ")
+        ));
+        return;
+    }
+    ctx.set_theme_name(theme);
+    set_theme(theme);
+    if let Some(path) = clawedcode_core::config::default_config_path() {
+        if let Ok(existing) = fs::read_to_string(&path) {
+            // Replace the `theme` line inside the [ui] section, or append a
+            // minimal [ui] section when absent.
+            let mut in_ui = false;
+            let mut found = false;
+            let updated: String = existing
+                .lines()
+                .map(|line| {
+                    let t = line.trim_start();
+                    if t.starts_with('[') {
+                        in_ui = t.starts_with("[ui]");
+                        return line.to_string();
+                    }
+                    if in_ui && t.starts_with("theme") && t.contains('=') {
+                        found = true;
+                        return format!("theme = \"{theme}\"");
+                    }
+                    line.to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let updated = if found {
+                updated
+            } else {
+                format!("{updated}\n[ui]\ntheme = \"{theme}\"\n")
+            };
+            let _ = fs::write(&path, updated);
+        }
+    }
+    handler.push_overlay(format!("[info] Theme set to {theme}"));
 }
 
 /// User messages eligible for `/rewind`: (message index, preview text).
@@ -5853,7 +6136,7 @@ fn render_rewind_picker(frame: &mut Frame, area: Rect, selected: usize, ctx: &Tu
     let border_width = area.width.saturating_sub(2) as usize;
     frame.render_widget(
         Paragraph::new(format!("╭{}╮", "─".repeat(border_width)))
-            .style(Style::default().fg(ACCENT)),
+            .style(Style::default().fg(pal().accent)),
         Rect::new(area.x, area.y, area.width, 1),
     );
     let candidates = rewind_candidates(ctx);
@@ -5862,7 +6145,7 @@ fn render_rewind_picker(frame: &mut Frame, area: Rect, selected: usize, ctx: &Tu
     let mut lines = vec![
         Line::from(Span::styled(
             " Rewind to a previous message",
-            Style::default().fg(ACCENT),
+            Style::default().fg(pal().accent),
         )),
         Line::from(""),
     ];
@@ -5870,9 +6153,9 @@ fn render_rewind_picker(frame: &mut Frame, area: Rect, selected: usize, ctx: &Tu
         let focused = index == selected;
         let marker = if focused { "❯" } else { " " };
         let style = if focused {
-            Style::default().fg(ACCENT)
+            Style::default().fg(pal().accent)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(pal().text)
         };
         lines.push(Line::from(vec![
             Span::styled(format!(" {marker}"), style),
@@ -5881,7 +6164,7 @@ fn render_rewind_picker(frame: &mut Frame, area: Rect, selected: usize, ctx: &Tu
     }
     lines.push(Line::from(Span::styled(
         " Enter to rewind · Esc to cancel",
-        Style::default().fg(DIM),
+        Style::default().fg(pal().dim),
     )));
     frame.render_widget(
         Paragraph::new(lines),

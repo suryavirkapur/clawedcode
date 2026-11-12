@@ -472,6 +472,14 @@ impl TuiContext {
         self.runtime.config.model = model.to_string();
     }
 
+    pub fn theme_name(&self) -> &str {
+        &self.runtime.config.ui.theme
+    }
+
+    pub fn set_theme_name(&mut self, theme: &str) {
+        self.runtime.config.ui.theme = theme.to_string();
+    }
+
     pub fn provider_api_key_env(&self) -> &str {
         &self.runtime.config.provider.api_key_env
     }
