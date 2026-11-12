@@ -1741,6 +1741,7 @@ fn render_conversation(
         None,
         &[],
         &handler.expanded_tool_results,
+        false,
         chunks[0].width as usize,
     ))
     .wrap(Wrap { trim: false })
@@ -2464,6 +2465,7 @@ fn render_rows(
     selected_index: Option<usize>,
     search_matches: &[usize],
     expanded_tools: &std::collections::HashSet<String>,
+    expand_all: bool,
     width: usize,
 ) -> Vec<Line<'static>> {
     rows.iter()
@@ -2499,22 +2501,23 @@ fn render_rows(
                     result
                 }
                 RenderRow::Thinking(text) => {
-                    let mut result = Vec::new();
-                    for (index, line) in text.lines().enumerate() {
-                        let prefix = if index == 0 {
-                            format!("{BULLET} ")
+                    let style = Style::default().fg(DIM).add_modifier(Modifier::ITALIC);
+                    if !expand_all {
+                        // Reference collapses thinking to `∴ Thinking…` in the
+                        // main view; ctrl+o expands to the full content.
+                        let summary = if text.lines().count() > 1 || text.len() > 60 {
+                            "∴ Thinking…".to_string()
                         } else {
-                            "  ".to_string()
+                            format!("∴ {}", text.lines().next().unwrap_or(""))
                         };
-                        result.push(Line::from(vec![
-                            Span::styled(prefix, Style::default().fg(DIM)),
-                            Span::styled(
-                                line.to_string(),
-                                Style::default().fg(DIM).add_modifier(Modifier::ITALIC),
-                            ),
-                        ]));
+                        vec![Line::from(Span::styled(summary, style))]
+                    } else {
+                        let mut result = vec![Line::from(Span::styled("∴ Thinking", style))];
+                        for line in text.lines() {
+                            result.push(Line::from(Span::styled(format!("  {line}"), style)));
+                        }
+                        result
                     }
-                    result
                 }
                 RenderRow::ToolUse { name, input } => {
                     let arg = tool_display_arg(name, input);
@@ -2911,6 +2914,7 @@ fn transcript_render_lines(state: &TranscriptModeState, width: usize) -> Vec<Lin
         transcript_search_current(state),
         &state.search_matches,
         &expanded,
+        true,
         width,
     )
 }
