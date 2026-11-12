@@ -165,13 +165,13 @@ fn palette_for(theme: &str) -> Palette {
 static ACTIVE_PALETTE: Mutex<Palette> = Mutex::new(DARK_PALETTE);
 
 /// Set the active theme. Called once at REPL start and by `/theme`.
-fn set_theme(theme: &str) {
+pub(crate) fn set_theme(theme: &str) {
     if let Ok(mut guard) = ACTIVE_PALETTE.lock() {
         *guard = palette_for(theme);
     }
 }
 
-fn pal() -> Palette {
+pub(crate) fn pal() -> Palette {
     ACTIVE_PALETTE.lock().map(|g| *g).unwrap_or(DARK_PALETTE)
 }
 const DASHBOARD_HEIGHT: u16 = 16;

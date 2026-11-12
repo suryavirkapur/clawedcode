@@ -3,14 +3,42 @@ use ratatui::{
     text::{Line, Span},
 };
 
-const ACCENT: Color = Color::Rgb(224, 122, 95);
-const CODE_BG: Color = Color::Rgb(40, 40, 40);
-const CODE_FG: Color = Color::Rgb(180, 180, 180);
-const TABLE_BORDER: Color = Color::Rgb(100, 100, 100);
-const HEADER_FG: Color = Color::Rgb(255, 255, 255);
-const BOLD_FG: Color = Color::Rgb(240, 240, 240);
-const ITALIC_FG: Color = Color::Rgb(200, 200, 200);
-const BLOCKQUOTE_FG: Color = Color::Rgb(150, 150, 150);
+fn palette() -> crate::repl::Palette {
+    crate::repl::pal()
+}
+
+fn accent() -> Color {
+    palette().accent
+}
+
+fn code_bg() -> Color {
+    // Reuse the user-message band tone: it tracks dark/light correctly.
+    palette().user_msg_bg
+}
+
+fn code_fg() -> Color {
+    palette().muted
+}
+
+fn table_border() -> Color {
+    palette().prompt_border
+}
+
+fn header_fg() -> Color {
+    palette().text
+}
+
+fn bold_fg() -> Color {
+    palette().text
+}
+
+fn italic_fg() -> Color {
+    palette().dim
+}
+
+fn blockquote_fg() -> Color {
+    palette().muted
+}
 
 /// Parse markdown text into styled ratatui Lines.
 pub fn parse_markdown(text: &str) -> Vec<Line<'static>> {
@@ -28,17 +56,17 @@ pub fn parse_markdown(text: &str) -> Vec<Line<'static>> {
                 // End code block
                 lines.push(Line::from(Span::styled(
                     "─".repeat(40),
-                    Style::default().fg(CODE_BG),
+                    Style::default().fg(code_bg()),
                 )));
                 for code_line in &code_block_lines {
                     lines.push(Line::from(Span::styled(
                         format!("  {}", code_line),
-                        Style::default().fg(CODE_FG),
+                        Style::default().fg(code_fg()),
                     )));
                 }
                 lines.push(Line::from(Span::styled(
                     "─".repeat(40),
-                    Style::default().fg(CODE_BG),
+                    Style::default().fg(code_bg()),
                 )));
                 in_code_block = false;
                 code_block_lines.clear();
@@ -65,7 +93,7 @@ pub fn parse_markdown(text: &str) -> Vec<Line<'static>> {
         if line.trim() == "---" || line.trim() == "***" || line.trim() == "___" {
             lines.push(Line::from(Span::styled(
                 "─".repeat(40),
-                Style::default().fg(TABLE_BORDER),
+                Style::default().fg(table_border()),
             )));
             continue;
         }
@@ -80,7 +108,7 @@ pub fn parse_markdown(text: &str) -> Vec<Line<'static>> {
         if line.starts_with("> ") {
             let content = &line[2..];
             let spans = parse_inline(content);
-            let mut styled = vec![Span::styled("> ", Style::default().fg(BLOCKQUOTE_FG))];
+            let mut styled = vec![Span::styled("> ", Style::default().fg(blockquote_fg()))];
             styled.extend(spans);
             lines.push(Line::from(styled));
             continue;
@@ -101,7 +129,7 @@ pub fn parse_markdown(text: &str) -> Vec<Line<'static>> {
         if line.starts_with("- ") || line.starts_with("* ") {
             let content = &line[2..];
             let spans = parse_inline(content);
-            let mut styled = vec![Span::styled("  • ", Style::default().fg(ACCENT))];
+            let mut styled = vec![Span::styled("  • ", Style::default().fg(accent()))];
             styled.extend(spans);
             lines.push(Line::from(styled));
             continue;
@@ -113,7 +141,7 @@ pub fn parse_markdown(text: &str) -> Vec<Line<'static>> {
                 let spans = parse_inline(content);
                 let mut styled = vec![Span::styled(
                     format!("  {}. ", &line[..line.len() - content.len() - 2]),
-                    Style::default().fg(ACCENT),
+                    Style::default().fg(accent()),
                 )];
                 styled.extend(spans);
                 lines.push(Line::from(styled));
@@ -129,17 +157,17 @@ pub fn parse_markdown(text: &str) -> Vec<Line<'static>> {
     if in_code_block && !code_block_lines.is_empty() {
         lines.push(Line::from(Span::styled(
             "─".repeat(40),
-            Style::default().fg(CODE_BG),
+            Style::default().fg(code_bg()),
         )));
         for code_line in &code_block_lines {
             lines.push(Line::from(Span::styled(
                 format!("  {}", code_line),
-                Style::default().fg(CODE_FG),
+                Style::default().fg(code_fg()),
             )));
         }
         lines.push(Line::from(Span::styled(
             "─".repeat(40),
-            Style::default().fg(CODE_BG),
+            Style::default().fg(code_bg()),
         )));
     }
 
@@ -162,11 +190,13 @@ fn parse_header(line: &str) -> Option<Line<'static>> {
     let text = trimmed[level..].trim();
     let style = match level {
         1 => Style::default()
-            .fg(HEADER_FG)
+            .fg(header_fg())
             .add_modifier(Modifier::BOLD)
             .add_modifier(Modifier::UNDERLINED),
-        2 => Style::default().fg(HEADER_FG).add_modifier(Modifier::BOLD),
-        _ => Style::default().fg(BOLD_FG).add_modifier(Modifier::BOLD),
+        2 => Style::default()
+            .fg(header_fg())
+            .add_modifier(Modifier::BOLD),
+        _ => Style::default().fg(bold_fg()).add_modifier(Modifier::BOLD),
     };
     Some(Line::from(Span::styled(text.to_string(), style)))
 }
@@ -186,17 +216,17 @@ fn parse_table_row(line: &str) -> Line<'static> {
         .collect();
 
     let mut spans = Vec::new();
-    spans.push(Span::styled("| ", Style::default().fg(TABLE_BORDER)));
+    spans.push(Span::styled("| ", Style::default().fg(table_border())));
 
     for (i, cell) in cells.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled(" | ", Style::default().fg(TABLE_BORDER)));
+            spans.push(Span::styled(" | ", Style::default().fg(table_border())));
         }
         let cell_spans = parse_inline(cell);
         spans.extend(cell_spans);
     }
 
-    spans.push(Span::styled(" |", Style::default().fg(TABLE_BORDER)));
+    spans.push(Span::styled(" |", Style::default().fg(table_border())));
     Line::from(spans)
 }
 
@@ -289,17 +319,18 @@ fn style_span(text: &str, style: InlineStyle) -> Span<'static> {
     match style {
         InlineStyle::Bold => Span::styled(
             text.to_string(),
-            Style::default().fg(BOLD_FG).add_modifier(Modifier::BOLD),
+            Style::default().fg(bold_fg()).add_modifier(Modifier::BOLD),
         ),
         InlineStyle::Italic => Span::styled(
             text.to_string(),
             Style::default()
-                .fg(ITALIC_FG)
+                .fg(italic_fg())
                 .add_modifier(Modifier::ITALIC),
         ),
-        InlineStyle::Code => {
-            Span::styled(text.to_string(), Style::default().fg(CODE_FG).bg(CODE_BG))
-        }
+        InlineStyle::Code => Span::styled(
+            text.to_string(),
+            Style::default().fg(code_fg()).bg(code_bg()),
+        ),
     }
 }
 
