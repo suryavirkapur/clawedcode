@@ -53,7 +53,13 @@ impl PermissionEngine {
     pub fn decide(&self, needs_approval: bool, is_write_like: bool) -> PermissionDecision {
         match self.mode {
             PermissionMode::Bypass => PermissionDecision::Allow,
-            PermissionMode::Plan => PermissionDecision::Deny,
+            PermissionMode::Plan => {
+                if is_write_like {
+                    PermissionDecision::Deny
+                } else {
+                    PermissionDecision::Allow
+                }
+            }
             PermissionMode::AcceptEdits => {
                 if is_write_like {
                     PermissionDecision::Allow
@@ -99,10 +105,11 @@ mod tests {
     }
 
     #[test]
-    fn plan_mode_denies_everything() {
+    fn plan_mode_denies_writes_but_allows_reads() {
         let engine = PermissionEngine::new(PermissionMode::Plan);
         assert_eq!(engine.decide(true, true), PermissionDecision::Deny);
-        assert_eq!(engine.decide(false, false), PermissionDecision::Deny);
+        assert_eq!(engine.decide(false, false), PermissionDecision::Allow);
+        assert_eq!(engine.decide(true, false), PermissionDecision::Allow);
     }
 
     #[test]

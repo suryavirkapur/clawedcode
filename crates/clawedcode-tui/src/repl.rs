@@ -2086,7 +2086,7 @@ fn spinner_line(turn_started_at: Option<std::time::Instant>) -> Line<'static> {
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("(esc to interrupt · {}s)", seconds),
+            format!("({}s · esc to interrupt)", seconds),
             Style::default().fg(DIM),
         ),
     ])
@@ -3225,6 +3225,19 @@ fn spawn_turn_worker(
     let runtime = ctx.replacement_runtime();
     let external_turn_executor = ctx.external_turn_executor();
     let permission_mode = ctx.permission_mode();
+    // Plan mode pairs the engine's tool denial with a system reminder so the
+    // model plans instead of attempting edits — like Claude Code's plan mode.
+    let execution_prompt = if permission_mode == clawedcode_core::permissions::PermissionMode::Plan
+    {
+        let base = execution_prompt
+            .as_deref()
+            .unwrap_or(visible_prompt.as_str());
+        Some(format!(
+            "<system-reminder>Plan mode is active. The user does not want you to execute yet — do NOT edit files, run mutating commands, or otherwise make changes. Explore the codebase read-only and present a concrete plan for approval.</system-reminder>\n\n{base}"
+        ))
+    } else {
+        execution_prompt
+    };
     let mut session = ctx.cloned_session();
     let (event_tx, event_rx) = mpsc::channel();
     let (approval_tx, approval_rx) = mpsc::channel();
@@ -4122,8 +4135,10 @@ fn format_subagent_task_line(task: &SubAgentTaskState) -> String {
     )
 }
 
+/// Mirrors `runtime::is_write_like` — tools that mutate state. Task-store
+/// tools stay read-enough for plan mode; TaskStop and shells/edits are writes.
 fn is_write_like(tool_name: &str) -> bool {
-    matches!(tool_name, "shell" | "apply_patch")
+    matches!(tool_name, "shell" | "apply_patch" | "TaskStop")
 }
 
 fn find_skill_command(ctx: &TuiContext, command: &str) -> Option<SkillDescriptor> {
