@@ -46,6 +46,9 @@ pub struct Session {
     /// reference's singular "Current tag".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
+    /// Session-scoped prompt-bar color name (/color), e.g. "cyan".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_color: Option<String>,
     /// Extra directories the session's file tools may touch (/add-dir).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub additional_allowed_dirs: Vec<std::path::PathBuf>,
@@ -142,6 +145,7 @@ impl Session {
             execution_mode: mode,
             title: None,
             tag: None,
+            prompt_color: None,
             additional_allowed_dirs: Vec::new(),
         }
         .with_default_task_list_id()
@@ -175,6 +179,7 @@ impl Session {
             execution_mode: mode,
             title: None,
             tag: None,
+            prompt_color: None,
             additional_allowed_dirs: Vec::new(),
         }
     }
@@ -194,6 +199,7 @@ impl Session {
             execution_mode: SessionMode::Interactive,
             title: None,
             tag: None,
+            prompt_color: None,
             additional_allowed_dirs: Vec::new(),
         }
         .with_default_task_list_id()
@@ -277,6 +283,7 @@ impl Session {
             execution_mode: SessionMode::Interactive,
             title: None,
             tag: None,
+            prompt_color: None,
             additional_allowed_dirs: Vec::new(),
         }
     }

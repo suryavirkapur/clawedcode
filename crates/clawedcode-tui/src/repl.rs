@@ -449,6 +449,7 @@ const BUILTIN_COMMANDS: &[&str] = &[
     "/release-notes",
     "/onboarding",
     "/good-claude",
+    "/color",
     "/tag",
     "/add-dir",
     "/todos",
@@ -1217,6 +1218,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 &display_input,
                 display_cursor,
                 active_turn.is_some(),
+                prompt_bar_color(ctx),
             );
             frame.set_cursor_position(cursor);
 
@@ -3395,18 +3397,39 @@ fn wrap_input(input: &str, width: usize) -> Vec<String> {
 
 /// Draw the Claude Code input area: top+bottom rounded borders only
 /// (╭─╮ / ╰─╯), a colored `❯` pointer prompt, and the editing caret.
+/// `/color` named prompt-bar colors (reference AGENT_COLORS).
+const PROMPT_BAR_COLORS: &[(&str, Color)] = &[
+    ("red", Color::LightRed),
+    ("blue", Color::LightBlue),
+    ("green", Color::LightGreen),
+    ("yellow", Color::LightYellow),
+    ("purple", Color::LightMagenta),
+    ("orange", Color::Rgb(215, 119, 87)),
+    ("pink", Color::Rgb(253, 93, 177)),
+    ("cyan", Color::LightCyan),
+];
+
+fn prompt_bar_color(ctx: &TuiContext) -> Option<Color> {
+    let name = ctx.session().prompt_color.as_deref()?;
+    PROMPT_BAR_COLORS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, c)| *c)
+}
+
 fn render_input_box(
     frame: &mut Frame,
     area: Rect,
     input: &str,
     cursor_pos: usize,
     loading: bool,
+    border_color: Option<Color>,
 ) -> ratatui::layout::Position {
     if area.height == 0 {
         return ratatui::layout::Position::new(area.x, area.y);
     }
 
-    let border_style = Style::default().fg(pal().prompt_border);
+    let border_style = Style::default().fg(border_color.unwrap_or(pal().prompt_border));
     let border_width = area.width.saturating_sub(2) as usize;
     let top = format!("╭{}╮", "─".repeat(border_width));
     let bottom = format!("╰{}╯", "─".repeat(border_width));
@@ -5190,6 +5213,35 @@ fn handle_slash_command(
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
+                "/color" => {
+                    let arg = prompt
+                        .strip_prefix("/color")
+                        .map(str::trim)
+                        .unwrap_or_default()
+                        .to_lowercase();
+                    let names = PROMPT_BAR_COLORS
+                        .iter()
+                        .map(|(n, _)| *n)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    if arg.is_empty() {
+                        handler.push_overlay(format!(
+                            "[error] Please provide a color. Available: {names}, default"
+                        ));
+                    } else if arg == "default" {
+                        ctx.session_mut().prompt_color = None;
+                        handler.push_overlay("[info] Session color reset to default".to_string());
+                    } else if PROMPT_BAR_COLORS.iter().any(|(n, _)| *n == arg) {
+                        ctx.session_mut().prompt_color = Some(arg.clone());
+                        handler.push_overlay(format!("[info] Session color set to: {arg}"));
+                    } else {
+                        handler.push_overlay(format!(
+                            "[error] Invalid color \"{arg}\". Available: {names}, default"
+                        ));
+                    }
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
                 "/tag" => {
                     let arg = prompt
                         .strip_prefix("/tag")
@@ -6152,6 +6204,11 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
         CommandEntry {
             name: "/onboarding".to_string(),
             description: "Show onboarding tips".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/color".to_string(),
+            description: "Set the prompt bar color for this session".to_string(),
             source: CommandSource::BuiltIn,
         },
         CommandEntry {
@@ -8303,7 +8360,7 @@ mod command_policy_tests {
             Terminal::new(ratatui::backend::TestBackend::new(40, 4)).expect("terminal");
         terminal
             .draw(|frame| {
-                render_input_box(frame, Rect::new(0, 0, 40, 4), "hello", 5, false);
+                render_input_box(frame, Rect::new(0, 0, 40, 4), "hello", 5, false, None);
             })
             .expect("draw");
         let lines = buffer_lines(&terminal);
@@ -8326,7 +8383,7 @@ mod command_policy_tests {
             Terminal::new(ratatui::backend::TestBackend::new(40, 4)).expect("terminal");
         terminal
             .draw(|frame| {
-                render_input_box(frame, Rect::new(0, 0, 40, 4), "!ls -la", 7, false);
+                render_input_box(frame, Rect::new(0, 0, 40, 4), "!ls -la", 7, false, None);
             })
             .expect("draw");
         let lines = buffer_lines(&terminal);
