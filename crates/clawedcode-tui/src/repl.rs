@@ -268,6 +268,7 @@ const BUILTIN_COMMANDS: &[&str] = &[
     "/model",
     "/permissions",
     "/init",
+    "/resume",
     "/exit",
     "/quit",
 ];
@@ -3673,6 +3674,36 @@ fn handle_slash_command(
                                 compact_fork_error(prefix, &err)
                             ));
                         }
+                    }
+                    return Ok(true);
+                }
+                "/resume" => {
+                    let prefix = prompt
+                        .strip_prefix("/resume")
+                        .map(str::trim)
+                        .unwrap_or_default();
+                    if prefix.is_empty() {
+                        handler.push_overlay(
+                            "[info] Usage: /resume <session-id-or-prefix>".to_string(),
+                        );
+                        let _ = ctx.save_session();
+                        return Ok(true);
+                    }
+                    let _ = ctx.save_session();
+                    match resolve_saved_session(ctx, prefix) {
+                        Ok(source) => {
+                            let short = short_session_id(&source.id.to_string()).to_string();
+                            ctx.replace_session(source);
+                            let _ = ctx.save_session();
+                            handler.overlay_rows.clear();
+                            handler.clear_panel();
+                            handler.push_overlay(format!("[info] Resumed {short}"));
+                            handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
+                        }
+                        Err(err) => handler.push_overlay(format!(
+                            "[error] Resume failed: {}",
+                            compact_fork_error(prefix, &err)
+                        )),
                     }
                     return Ok(true);
                 }
