@@ -725,7 +725,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     let mut stashed_input: Option<(String, usize)> = None;
     let mut last_approval_id: Option<String> = None;
     let always_allowed: Arc<Mutex<std::collections::HashSet<String>>> =
-        Arc::new(Mutex::new(std::collections::HashSet::new()));
+        Arc::new(Mutex::new(load_always_allowed(&ctx.session().cwd)));
 
     if let Some(prompt) = ctx.take_startup_prompt() {
         handler.begin_live_turn(prompt.clone());
@@ -1068,6 +1068,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
 
                 if awaiting_approval.is_some() {
                     const APPROVAL_OPTIONS: usize = 3;
+                    let session_cwd = ctx.session().cwd.clone();
                     let choose = |choice: usize,
                                   awaiting_approval: &mut Option<ApprovalRequest>,
                                   handler: &mut ReplHandler,
@@ -1080,6 +1081,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                             if choice == 1 {
                                 if let Ok(mut set) = always_allowed.lock() {
                                     set.insert(req.tool_name.clone());
+                                    save_always_allowed(&session_cwd, &set);
                                 }
                             }
                             handler.record_live_tool_approval_decision(&req.tool_use_id, approved);
@@ -1552,6 +1554,26 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                                     turn_started_at = Some(std::time::Instant::now());
                                     active_turn =
                                         Some(spawn_bash_worker(ctx.cloned_session(), command));
+                                }
+                            } else if let Some(memory) = prompt.strip_prefix('#')
+                                && !memory.trim().is_empty()
+                            {
+                                let path = ctx.session().cwd.join("CLAUDE.md");
+                                let append = format!("\n{}\n", memory.trim());
+                                match std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open(&path)
+                                    .and_then(|mut f| {
+                                        std::io::Write::write_all(&mut f, append.as_bytes())
+                                    }) {
+                                    Ok(()) => handler.push_overlay(format!(
+                                        "[info] Saved to {}",
+                                        display_path(&path)
+                                    )),
+                                    Err(err) => handler.push_overlay(format!(
+                                        "[error] Could not save memory: {err}"
+                                    )),
                                 }
                             } else if let Some(task) = prompt.strip_prefix('&')
                                 && !task.trim().is_empty()
@@ -3774,6 +3796,49 @@ fn render_file_palette(frame: &mut Frame, area: Rect, entries: &[String], select
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+/// Persistent "always allow" rules, stored like Claude Code's permission
+/// rules in `.claude/settings.local.json` (`permissions.allow`).
+fn always_allow_path(cwd: &std::path::Path) -> std::path::PathBuf {
+    cwd.join(".claude").join("settings.local.json")
+}
+
+fn load_always_allowed(cwd: &std::path::Path) -> std::collections::HashSet<String> {
+    let Ok(text) = std::fs::read_to_string(always_allow_path(cwd)) else {
+        return std::collections::HashSet::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return std::collections::HashSet::new();
+    };
+    json.pointer("/permissions/allow")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn save_always_allowed(cwd: &std::path::Path, set: &std::collections::HashSet<String>) {
+    let path = always_allow_path(cwd);
+    let mut json = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let mut allow: Vec<String> = set.iter().cloned().collect();
+    allow.sort();
+    json["permissions"]["allow"] =
+        serde_json::Value::Array(allow.into_iter().map(serde_json::Value::from).collect());
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&json).unwrap_or_default(),
+    );
+}
+
 /// Expands `@path` mentions into `<file>` context blocks appended to the
 /// execution prompt, like Claude Code's file attachments. Unknown or
 /// oversized tokens are left untouched.
@@ -4332,7 +4397,8 @@ fn help_overlay_lines(ctx: &TuiContext) -> Vec<String> {
         vec![
             "!cmd         run a shell command without a model turn".to_string(),
             "@path        attach file contents to the prompt".to_string(),
-            "&            background-task intent prefix".to_string(),
+            "#text        save a memory to CLAUDE.md".to_string(),
+            "&prompt      queue a background sub-agent".to_string(),
         ],
     );
     append_panel_section(
