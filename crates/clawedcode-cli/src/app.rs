@@ -179,7 +179,7 @@ fn execute_update() -> Result<()> {
 
 fn build_approval_fn(yes: bool) -> ApprovalFn {
     if yes {
-        Box::new(|_, _, _| true)
+        Box::new(|_, _, _| true.into())
     } else {
         Box::new(|_tool_use_id, tool_name, input| {
             let input_preview = serde_json::to_string(input).unwrap_or_default();
@@ -192,13 +192,13 @@ fn build_approval_fn(yes: bool) -> ApprovalFn {
                 let _ = std::io::Write::flush(&mut std::io::stderr());
                 let mut line = String::new();
                 if std::io::stdin().read_line(&mut line).is_err() {
-                    return false;
+                    return false.into();
                 }
                 let trimmed = line.trim().to_lowercase();
-                trimmed == "y" || trimmed == "yes"
+                (trimmed == "y" || trimmed == "yes").into()
             } else {
                 eprintln!("Not a TTY; denying by default. Use --yes to auto-approve.");
-                false
+                false.into()
             }
         })
     }
@@ -393,7 +393,9 @@ async fn execute_streaming_submit_with_approval<A>(
     approval_fn: &A,
 ) -> Result<clawedcode_core::runtime::StreamingRuntimeOutput>
 where
-    A: Fn(&str, &str, &serde_json::Value) -> bool + Send + Sync,
+    A: Fn(&str, &str, &serde_json::Value) -> clawedcode_core::runtime::ApprovalOutcome
+        + Send
+        + Sync,
 {
     use std::io::Write;
     let mut turn = 1usize;
@@ -614,7 +616,7 @@ async fn execute_streaming_submit_with_json_protocol(
                 &approval_stdout,
                 &json_protocol_approval_response_record(tool_use_id, tool_name, approved),
             );
-            approved
+            approved.into()
         }
     };
 

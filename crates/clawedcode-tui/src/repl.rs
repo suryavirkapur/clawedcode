@@ -8,6 +8,7 @@ use clawedcode_core::onboarding::{
     increment_project_onboarding_seen_count, maybe_mark_project_onboarding_complete,
     onboarding_steps, should_show_project_onboarding,
 };
+use clawedcode_core::runtime::ApprovalOutcome;
 use clawedcode_core::session::{
     Message, Role, Session, SessionMode, TRANSPORT_SESSION_ID_MARKER_PREFIX,
     transport_session_id_marker,
@@ -670,7 +671,7 @@ enum TurnWorkerEvent {
 
 struct ActiveTurn {
     events: mpsc::Receiver<TurnWorkerEvent>,
-    approvals: mpsc::Sender<bool>,
+    approvals: mpsc::Sender<ApprovalOutcome>,
     _join: thread::JoinHandle<()>,
 }
 
@@ -716,6 +717,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     let mut queued_prompts: Vec<String> = Vec::new();
     let mut awaiting_approval: Option<ApprovalRequest> = None;
     let mut approval_selection: usize = 0;
+    let mut approval_amend: Option<String> = None;
     let mut active_turn: Option<ActiveTurn> = None;
     let mut info_panel_scroll: usize = 0;
     let mut last_area = Rect::default();
@@ -771,6 +773,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
         if pending_approval_id != last_approval_id {
             last_approval_id = pending_approval_id;
             approval_selection = 0;
+            approval_amend = None;
         }
 
         if ctx.session().messages.is_empty() && !onboarding_seen_recorded {
@@ -830,8 +833,11 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
             };
             let palette_height =
                 command_palette_height(&command_entries).max(file_palette_height(&file_entries));
-            let approval_height =
-                approval_selector_height(awaiting_approval.as_ref(), approval_selection);
+            let approval_height = approval_selector_height(
+                awaiting_approval.as_ref(),
+                approval_selection,
+                approval_amend.is_some(),
+            );
             let spinner_height = if active_turn.is_some() && awaiting_approval.is_none() {
                 1
             } else {
@@ -890,6 +896,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                     chunks[2],
                     awaiting_approval.as_ref().unwrap(),
                     approval_selection,
+                    approval_amend.as_deref(),
                     ctx,
                 );
             }
@@ -1083,6 +1090,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                     const APPROVAL_OPTIONS: usize = 3;
                     let session_cwd = ctx.session().cwd.clone();
                     let choose = |choice: usize,
+                                  feedback: Option<String>,
                                   awaiting_approval: &mut Option<ApprovalRequest>,
                                   handler: &mut ReplHandler,
                                   active_turn: &Option<ActiveTurn>,
@@ -1099,10 +1107,42 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                             }
                             handler.record_live_tool_approval_decision(&req.tool_use_id, approved);
                             if let Some(turn) = active_turn {
-                                let _ = turn.approvals.send(approved);
+                                let _ = turn.approvals.send(ApprovalOutcome { approved, feedback });
                             }
                         }
                     };
+
+                    if let Some(buffer) = approval_amend.as_mut() {
+                        match key.code {
+                            KeyCode::Char(c) => {
+                                buffer.push(c);
+                            }
+                            KeyCode::Backspace => {
+                                buffer.pop();
+                            }
+                            KeyCode::Enter => {
+                                let feedback = buffer.trim().to_string();
+                                let feedback = (!feedback.is_empty()).then_some(feedback);
+                                let choice = approval_selection;
+                                approval_amend = None;
+                                choose(
+                                    choice,
+                                    feedback,
+                                    &mut awaiting_approval,
+                                    &mut handler,
+                                    &active_turn,
+                                    &always_allowed,
+                                );
+                            }
+                            KeyCode::Esc => {
+                                approval_amend = None;
+                            }
+                            _ => {}
+                        }
+                        viewport.pinned_to_bottom = true;
+                        viewport.unseen_count = 0;
+                        continue;
+                    }
 
                     match key.code {
                         KeyCode::Up | KeyCode::Char('k') => {
@@ -1111,8 +1151,15 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         KeyCode::Down | KeyCode::Char('j') => {
                             approval_selection = (approval_selection + 1).min(APPROVAL_OPTIONS - 1);
                         }
+                        KeyCode::Tab => {
+                            // Amendable options: Yes (0) and No (2) per reference.
+                            if approval_selection != 1 {
+                                approval_amend = Some(String::new());
+                            }
+                        }
                         KeyCode::Char('1') => choose(
                             0,
+                            None,
                             &mut awaiting_approval,
                             &mut handler,
                             &active_turn,
@@ -1120,6 +1167,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         ),
                         KeyCode::Char('2') => choose(
                             1,
+                            None,
                             &mut awaiting_approval,
                             &mut handler,
                             &active_turn,
@@ -1127,6 +1175,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         ),
                         KeyCode::Char('3') | KeyCode::Char('n') | KeyCode::Char('N') => choose(
                             2,
+                            None,
                             &mut awaiting_approval,
                             &mut handler,
                             &active_turn,
@@ -1134,6 +1183,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         ),
                         KeyCode::Char('y') | KeyCode::Char('Y') => choose(
                             0,
+                            None,
                             &mut awaiting_approval,
                             &mut handler,
                             &active_turn,
@@ -1141,6 +1191,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         ),
                         KeyCode::Enter => choose(
                             approval_selection,
+                            None,
                             &mut awaiting_approval,
                             &mut handler,
                             &active_turn,
@@ -1148,6 +1199,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         ),
                         KeyCode::Esc => choose(
                             2,
+                            None,
                             &mut awaiting_approval,
                             &mut handler,
                             &active_turn,
@@ -1962,12 +2014,17 @@ fn command_palette_height(entries: &[CommandEntry]) -> u16 {
 }
 
 /// Height of the inline approval selector (0 when not awaiting approval).
-fn approval_selector_height(request: Option<&ApprovalRequest>, _selected: usize) -> u16 {
+fn approval_selector_height(
+    request: Option<&ApprovalRequest>,
+    _selected: usize,
+    amending: bool,
+) -> u16 {
     if request.is_none() {
         return 0;
     }
-    // border + title + blank + input + blank + question + 3 options + blank + footer
-    11
+    // border + title + blank + input + blank + question + 3 options + blank
+    // (+ amend input line) + footer
+    if amending { 12 } else { 11 }
 }
 
 /// Permission dialog: a top-only rounded border in `permission` blue, the
@@ -1979,6 +2036,7 @@ fn render_approval_selector(
     area: Rect,
     request: &ApprovalRequest,
     selected: usize,
+    amend: Option<&str>,
     ctx: &TuiContext,
 ) {
     let display_name = tool_display_name(&request.tool_name);
@@ -2052,11 +2110,23 @@ fn render_approval_selector(
         ]));
     }
 
+    if let Some(buffer) = amend {
+        lines.push(Line::from(vec![
+            Span::styled(" ❯ ", Style::default().fg(ACCENT)),
+            Span::styled(buffer.to_string(), Style::default().fg(Color::White)),
+            Span::styled("▌", Style::default().fg(ACCENT)),
+        ]));
+    }
+
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        " Esc to cancel · Tab to amend".to_string(),
-        Style::default().fg(DIM),
-    )));
+    let footer = if amend.is_some() {
+        " Enter to submit · Esc to cancel".to_string()
+    } else if selected != 1 {
+        " Esc to cancel · Tab to amend".to_string()
+    } else {
+        " Esc to cancel".to_string()
+    };
+    lines.push(Line::from(Span::styled(footer, Style::default().fg(DIM))));
 
     frame.render_widget(
         Paragraph::new(lines),
@@ -3184,7 +3254,7 @@ fn append_message_blocks(
 /// `<bash-input>`/`<bash-output>` context in the session like Claude Code does.
 fn spawn_bash_worker(session: Session, command: String) -> ActiveTurn {
     let (event_tx, event_rx) = mpsc::channel();
-    let (approval_tx, _approval_rx) = mpsc::channel::<bool>();
+    let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalOutcome>();
     let join = thread::spawn(move || {
         let mut session = session;
         let tool_use_id = format!("bash-mode-{}", uuid::Uuid::new_v4());
@@ -3247,7 +3317,7 @@ fn spawn_turn_worker(
     };
     let mut session = ctx.cloned_session();
     let (event_tx, event_rx) = mpsc::channel();
-    let (approval_tx, approval_rx) = mpsc::channel();
+    let (approval_tx, approval_rx) = mpsc::channel::<ApprovalOutcome>();
     let approval_rx = Arc::new(Mutex::new(approval_rx));
 
     let join = thread::spawn(move || {
@@ -3289,6 +3359,7 @@ fn spawn_turn_worker(
                         .lock()
                         .ok()
                         .and_then(|rx| rx.recv().ok())
+                        .map(|outcome| outcome.approved)
                         .unwrap_or(false)
                 };
                 match executor.submit_turn(
@@ -3333,7 +3404,7 @@ fn spawn_turn_worker(
             let approval_fn =
                 move |tool_use_id: &str, tool_name: &str, input: &serde_json::Value| {
                     if !is_write_like(tool_name) {
-                        return true;
+                        return true.into();
                     }
 
                     if always_allowed
@@ -3341,7 +3412,7 @@ fn spawn_turn_worker(
                         .map(|set| set.contains(tool_name))
                         .unwrap_or(false)
                     {
-                        return true;
+                        return true.into();
                     }
 
                     let request = ApprovalRequest {
@@ -3354,14 +3425,14 @@ fn spawn_turn_worker(
                         .send(TurnWorkerEvent::ApprovalRequested(request))
                         .is_err()
                     {
-                        return false;
+                        return ApprovalOutcome::default();
                     }
 
                     approval_rx
                         .lock()
                         .ok()
                         .and_then(|rx| rx.recv().ok())
-                        .unwrap_or(false)
+                        .unwrap_or_default()
                 };
 
             let tx = event_tx.clone();
@@ -4861,7 +4932,7 @@ mod command_policy_tests {
         };
         terminal
             .draw(|frame| {
-                render_approval_selector(frame, Rect::new(0, 0, 60, 11), &request, 0, &ctx);
+                render_approval_selector(frame, Rect::new(0, 0, 60, 11), &request, 0, None, &ctx);
             })
             .expect("draw");
         let text = buffer_lines(&terminal).join("\n");
@@ -5384,8 +5455,8 @@ mod command_policy_tests {
             tool_name: "shell".to_string(),
             input: serde_json::json!({"command": "ls -la"}),
         };
-        assert_eq!(approval_selector_height(None, 0), 0);
-        assert!(approval_selector_height(Some(&request), 0) >= 5);
+        assert_eq!(approval_selector_height(None, 0, false), 0);
+        assert!(approval_selector_height(Some(&request), 0, false) >= 5);
     }
 
     #[test]

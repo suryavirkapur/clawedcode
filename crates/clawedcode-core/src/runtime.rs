@@ -322,9 +322,26 @@ fn apply_prompt_override(messages: &mut [clawedcode_api::ProviderMessage], promp
     }];
 }
 
+/// Result of a tool-use approval prompt. `feedback` carries the user's
+/// amend note back to the model when the call is denied.
+#[derive(Debug, Clone, Default)]
+pub struct ApprovalOutcome {
+    pub approved: bool,
+    pub feedback: Option<String>,
+}
+
+impl From<bool> for ApprovalOutcome {
+    fn from(approved: bool) -> Self {
+        Self {
+            approved,
+            feedback: None,
+        }
+    }
+}
+
 /// Approval callback used in headless mode.
-/// Returns `true` if the tool call is approved, `false` to deny.
-pub type ApprovalFn = Box<dyn Fn(&str, &str, &serde_json::Value) -> bool + Send + Sync>;
+/// Returns an [`ApprovalOutcome`]; a plain `bool` maps via `From<bool>`.
+pub type ApprovalFn = Box<dyn Fn(&str, &str, &serde_json::Value) -> ApprovalOutcome + Send + Sync>;
 
 impl Runtime {
     pub fn tool_specs(&self) -> &[ToolSpec] {
@@ -680,7 +697,7 @@ impl Runtime {
         approval_fn: &A,
     ) -> RuntimeOutput
     where
-        A: Fn(&str, &str, &serde_json::Value) -> bool + Send + Sync,
+        A: Fn(&str, &str, &serde_json::Value) -> ApprovalOutcome + Send + Sync,
     {
         session.push(Role::User, prompt);
         if let Some(reply) = casual_reply_for_prompt(prompt) {
@@ -715,7 +732,7 @@ impl Runtime {
             session,
             visible_prompt,
             provider_prompt,
-            &|_, _, _| true,
+            &|_, _, _| true.into(),
         )
     }
 
@@ -727,7 +744,7 @@ impl Runtime {
         approval_fn: &A,
     ) -> RuntimeOutput
     where
-        A: Fn(&str, &str, &serde_json::Value) -> bool + Send + Sync,
+        A: Fn(&str, &str, &serde_json::Value) -> ApprovalOutcome + Send + Sync,
     {
         session.push(Role::User, visible_prompt);
         if let Some(reply) = casual_reply_for_prompt(provider_prompt) {
@@ -784,7 +801,7 @@ impl Runtime {
     ) -> StreamingRuntimeOutput
     where
         F: FnMut(&ApiEvent),
-        A: Fn(&str, &str, &serde_json::Value) -> bool + Send + Sync,
+        A: Fn(&str, &str, &serde_json::Value) -> ApprovalOutcome + Send + Sync,
     {
         session.push(Role::User, prompt);
         if let Some(reply) = casual_reply_for_prompt(prompt) {
@@ -809,7 +826,7 @@ impl Runtime {
     ) -> StreamingRuntimeOutput
     where
         F: FnMut(&ApiEvent),
-        A: Fn(&str, &str, &serde_json::Value) -> bool + Send + Sync,
+        A: Fn(&str, &str, &serde_json::Value) -> ApprovalOutcome + Send + Sync,
     {
         session.push(Role::User, visible_prompt);
         if let Some(reply) = execution_prompt.and_then(casual_reply_for_prompt) {
@@ -833,7 +850,7 @@ impl Runtime {
     where
         F: FnMut(&ApiEvent),
     {
-        self.submit_loop_with_approval(session, on_event, &|_, _, _| true, None)
+        self.submit_loop_with_approval(session, on_event, &|_, _, _| true.into(), None)
             .await
     }
 
@@ -846,7 +863,7 @@ impl Runtime {
     ) -> StreamingRuntimeOutput
     where
         F: FnMut(&ApiEvent),
-        A: Fn(&str, &str, &serde_json::Value) -> bool + Send + Sync,
+        A: Fn(&str, &str, &serde_json::Value) -> ApprovalOutcome + Send + Sync,
     {
         let mut total_text = String::new();
         let mut total_thinking = String::new();
@@ -926,7 +943,7 @@ impl Runtime {
     ) -> TurnResult
     where
         F: FnMut(&ApiEvent),
-        A: Fn(&str, &str, &serde_json::Value) -> bool + Send + Sync,
+        A: Fn(&str, &str, &serde_json::Value) -> ApprovalOutcome + Send + Sync,
     {
         let mut text_accum = String::new();
         let mut thinking_accum = String::new();
@@ -1230,7 +1247,9 @@ impl Runtime {
         input: serde_json::Value,
         session: &mut Session,
     ) -> ContentBlock {
-        self.execute_tool_with_approval(tool_use_id, tool_name, input, session, &|_, _, _| true)
+        self.execute_tool_with_approval(tool_use_id, tool_name, input, session, &|_, _, _| {
+            true.into()
+        })
     }
 
     fn execute_tool_with_approval<A: ?Sized>(
@@ -1242,7 +1261,7 @@ impl Runtime {
         approval_fn: &A,
     ) -> ContentBlock
     where
-        A: Fn(&str, &str, &serde_json::Value) -> bool + Send + Sync,
+        A: Fn(&str, &str, &serde_json::Value) -> ApprovalOutcome + Send + Sync,
     {
         let Some((needs_approval, write_like)) = self.tool_policy(tool_name) else {
             return ContentBlock::tool_error(tool_use_id, format!("Unknown tool: {tool_name}"));
@@ -1259,11 +1278,15 @@ impl Runtime {
                 ),
             ),
             PermissionDecision::Ask => {
-                if !approval_fn(tool_use_id, tool_name, &input) {
-                    return ContentBlock::tool_error(
-                        tool_use_id,
-                        format!("Tool '{tool_name}' denied by user"),
-                    );
+                let outcome = approval_fn(tool_use_id, tool_name, &input);
+                if !outcome.approved {
+                    let reason = match outcome.feedback {
+                        Some(feedback) if !feedback.trim().is_empty() => {
+                            format!("Tool '{tool_name}' denied by user: {}", feedback.trim())
+                        }
+                        _ => format!("Tool '{tool_name}' denied by user"),
+                    };
+                    return ContentBlock::tool_error(tool_use_id, reason);
                 }
                 self.execute_tool_inner(tool_use_id, tool_name, input, session)
             }
@@ -3151,7 +3174,7 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
                 "run_in_background": true
             }),
             &mut session,
-            &|_, _, _| false,
+            &|_, _, _| false.into(),
         );
 
         match result {
@@ -3210,7 +3233,7 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
             "TaskStop",
             serde_json::json!({ "task_id": task.id }),
             &mut session,
-            &|_, _, _| false,
+            &|_, _, _| false.into(),
         );
 
         match result {
@@ -4214,7 +4237,7 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
                     },
                     &|_id, name, _input| {
                         assert_eq!(name, "shell");
-                        true
+                        true.into()
                     },
                 )
                 .await
@@ -4278,7 +4301,7 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
                     },
                     &|_id, name, _input| {
                         assert_eq!(name, "shell");
-                        false
+                        false.into()
                     },
                 )
                 .await
@@ -4339,7 +4362,7 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
                     &mut session,
                     "read the file",
                     |event| events_seen.push(event.clone()),
-                    &|_id, _name, _input| false,
+                    &|_id, _name, _input| false.into(),
                 )
                 .await
         });
