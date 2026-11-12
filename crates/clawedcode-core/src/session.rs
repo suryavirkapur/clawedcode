@@ -42,6 +42,9 @@ pub struct Session {
     pub execution_mode: SessionMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Extra directories the session's file tools may touch (/add-dir).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_allowed_dirs: Vec<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -134,6 +137,7 @@ impl Session {
             transport_session_id: None,
             execution_mode: mode,
             title: None,
+            additional_allowed_dirs: Vec::new(),
         }
         .with_default_task_list_id()
     }
@@ -165,6 +169,7 @@ impl Session {
             transport_session_id: None,
             execution_mode: mode,
             title: None,
+            additional_allowed_dirs: Vec::new(),
         }
     }
 
@@ -182,6 +187,7 @@ impl Session {
             transport_session_id: None,
             execution_mode: SessionMode::Interactive,
             title: None,
+            additional_allowed_dirs: Vec::new(),
         }
         .with_default_task_list_id()
     }
@@ -263,6 +269,7 @@ impl Session {
             transport_session_id: None,
             execution_mode: SessionMode::Interactive,
             title: None,
+            additional_allowed_dirs: Vec::new(),
         }
     }
 }

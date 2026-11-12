@@ -22,9 +22,42 @@ pub trait Tool: Send + Sync {
     fn execute(&self, input: serde_json::Value, cwd: &Path) -> ToolResult;
 }
 
+static EXTRA_ALLOWED_ROOTS: std::sync::RwLock<Vec<PathBuf>> = std::sync::RwLock::new(Vec::new());
+
+/// Set the extra directories file tools may access for the current session
+/// (`/add-dir` in the TUI). Called by the runtime before each tool execution.
+pub fn set_extra_allowed_roots(roots: Vec<PathBuf>) {
+    if let Ok(mut guard) = EXTRA_ALLOWED_ROOTS.write() {
+        *guard = roots;
+    }
+}
+
+/// Paths added via `/add-dir`: canonicalized when the session recorded them.
+pub fn extra_allowed_roots() -> Vec<PathBuf> {
+    EXTRA_ALLOWED_ROOTS
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_default()
+}
+
+fn is_under_allowed_root(canonical: &Path, canonical_cwd: &Path) -> bool {
+    canonical.starts_with(canonical_cwd)
+        || extra_allowed_roots()
+            .iter()
+            .any(|root| canonical.starts_with(root))
+}
+
 fn resolve_under_cwd(cwd: &Path, rel: &str) -> Result<PathBuf, String> {
     let path = PathBuf::from_str(rel).map_err(|e| format!("Invalid path '{rel}': {e}"))?;
     if path.is_absolute() {
+        // Absolute paths are only permitted under cwd or a directory the
+        // session explicitly allowed via /add-dir.
+        if let Ok(canonical) = path.canonicalize() {
+            let canonical_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+            if is_under_allowed_root(&canonical, &canonical_cwd) {
+                return Ok(canonical);
+            }
+        }
         return Err("Path must be relative".into());
     }
 
@@ -105,7 +138,7 @@ impl Tool for ReadFile {
                 };
             }
         };
-        if !canonical_path.starts_with(&canonical_cwd) {
+        if !is_under_allowed_root(&canonical_path, &canonical_cwd) {
             return ToolResult {
                 content: "Path escapes working directory".into(),
                 is_error: true,

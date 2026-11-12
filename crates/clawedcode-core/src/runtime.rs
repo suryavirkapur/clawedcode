@@ -1355,6 +1355,7 @@ impl Runtime {
             }
         };
 
+        clawedcode_tools::set_extra_allowed_roots(session.additional_allowed_dirs.clone());
         finish_tool_result(tool_use_id, tool.execute(input, &session.cwd))
     }
 }

@@ -440,6 +440,7 @@ const BUILTIN_COMMANDS: &[&str] = &[
     "/rename",
     "/config",
     "/vim",
+    "/add-dir",
     "/todos",
     "/agents",
     "/hooks",
@@ -5114,6 +5115,59 @@ fn handle_slash_command(
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
+                "/add-dir" => {
+                    let arg = prompt
+                        .strip_prefix("/add-dir")
+                        .map(str::trim)
+                        .unwrap_or_default();
+                    if arg.is_empty() {
+                        let mut lines = vec![format!(
+                            "Working directory: {}",
+                            display_path(&ctx.session().cwd)
+                        )];
+                        if ctx.session().additional_allowed_dirs.is_empty() {
+                            lines.push("No additional directories.".to_string());
+                        } else {
+                            for dir in &ctx.session().additional_allowed_dirs {
+                                lines.push(format!("+ {}", display_path(dir)));
+                            }
+                        }
+                        handler.show_panel("Directories".to_string(), lines);
+                    } else {
+                        let raw = std::path::Path::new(arg);
+                        let joined = if raw.is_absolute() {
+                            raw.to_path_buf()
+                        } else {
+                            ctx.session().cwd.join(raw)
+                        };
+                        match joined.canonicalize() {
+                            Ok(canonical) if canonical.is_dir() => {
+                                if ctx.session().additional_allowed_dirs.contains(&canonical) {
+                                    handler.push_overlay(format!(
+                                        "[info] Already allowed: {}",
+                                        display_path(&canonical)
+                                    ));
+                                } else {
+                                    ctx.session_mut()
+                                        .additional_allowed_dirs
+                                        .push(canonical.clone());
+                                    handler.push_overlay(format!(
+                                        "[info] Added directory: {}",
+                                        display_path(&canonical)
+                                    ));
+                                }
+                            }
+                            Ok(_) => {
+                                handler.push_overlay(format!("[error] Not a directory: {arg}"))
+                            }
+                            Err(err) => {
+                                handler.push_overlay(format!("[error] Cannot resolve {arg}: {err}"))
+                            }
+                        }
+                    }
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
                 "/todos" => {
                     let panel = todos_panel(ctx);
                     handler.show_panel(panel.title, panel.lines);
@@ -5919,6 +5973,11 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
         CommandEntry {
             name: "/vim".to_string(),
             description: "Toggle vim modal editing".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/add-dir".to_string(),
+            description: "Allow tools to access another directory".to_string(),
             source: CommandSource::BuiltIn,
         },
         CommandEntry {
