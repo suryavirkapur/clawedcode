@@ -42,6 +42,10 @@ pub struct Session {
     pub execution_mode: SessionMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Searchable tag on the session (`/tag`); at most one tag, like the
+    /// reference's singular "Current tag".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
     /// Extra directories the session's file tools may touch (/add-dir).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub additional_allowed_dirs: Vec<std::path::PathBuf>,
@@ -137,6 +141,7 @@ impl Session {
             transport_session_id: None,
             execution_mode: mode,
             title: None,
+            tag: None,
             additional_allowed_dirs: Vec::new(),
         }
         .with_default_task_list_id()
@@ -169,6 +174,7 @@ impl Session {
             transport_session_id: None,
             execution_mode: mode,
             title: None,
+            tag: None,
             additional_allowed_dirs: Vec::new(),
         }
     }
@@ -187,6 +193,7 @@ impl Session {
             transport_session_id: None,
             execution_mode: SessionMode::Interactive,
             title: None,
+            tag: None,
             additional_allowed_dirs: Vec::new(),
         }
         .with_default_task_list_id()
@@ -269,6 +276,7 @@ impl Session {
             transport_session_id: None,
             execution_mode: SessionMode::Interactive,
             title: None,
+            tag: None,
             additional_allowed_dirs: Vec::new(),
         }
     }

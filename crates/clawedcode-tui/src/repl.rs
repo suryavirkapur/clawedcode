@@ -440,6 +440,7 @@ const BUILTIN_COMMANDS: &[&str] = &[
     "/rename",
     "/config",
     "/vim",
+    "/tag",
     "/add-dir",
     "/todos",
     "/agents",
@@ -5115,6 +5116,33 @@ fn handle_slash_command(
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
+                "/tag" => {
+                    let arg = prompt
+                        .strip_prefix("/tag")
+                        .map(str::trim)
+                        .unwrap_or_default();
+                    if arg.is_empty() {
+                        let current = ctx.session().tag.as_deref();
+                        handler.show_panel(
+                            "Tag".to_string(),
+                            match current {
+                                Some(t) => vec![
+                                    format!("Current tag: #{t}"),
+                                    "Run /tag <name> to change, /tag <same> to remove.".to_string(),
+                                ],
+                                None => vec!["No tag. /tag <name> to set.".to_string()],
+                            },
+                        );
+                    } else if ctx.session().tag.as_deref() == Some(arg) {
+                        ctx.session_mut().tag = None;
+                        handler.push_overlay(format!("[info] Removed tag #{arg}"));
+                    } else {
+                        ctx.session_mut().tag = Some(arg.to_string());
+                        handler.push_overlay(format!("[info] Tagged #{arg}"));
+                    }
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
                 "/add-dir" => {
                     let arg = prompt
                         .strip_prefix("/add-dir")
@@ -5973,6 +6001,11 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
         CommandEntry {
             name: "/vim".to_string(),
             description: "Toggle vim modal editing".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/tag".to_string(),
+            description: "Toggle a searchable tag on this session".to_string(),
             source: CommandSource::BuiltIn,
         },
         CommandEntry {
@@ -7284,10 +7317,13 @@ fn list_saved_sessions(ctx: &TuiContext, limit: usize) -> Vec<SavedSessionSummar
         .into_iter()
         .take(limit)
         .map(|session| {
-            let preview = session
+            let mut preview = session
                 .last_user_text()
                 .map(truncate_summary)
                 .unwrap_or_else(|| "No prompt".to_string());
+            if let Some(tag) = &session.tag {
+                preview = format!("#{tag} · {preview}");
+            }
             SavedSessionSummary {
                 id: session.id.to_string(),
                 cwd: session.cwd,
