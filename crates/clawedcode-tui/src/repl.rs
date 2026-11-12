@@ -453,6 +453,8 @@ struct ReplHandler {
     expanded_tool_results: std::collections::HashSet<String>,
     quit_requested: bool,
     model_picker: Option<usize>,
+    /// `/rewind` message selector — index into `rewind_candidates`.
+    rewind_picker: Option<usize>,
     turn_tokens: u64,
     total_input_tokens: u64,
     total_output_tokens: u64,
@@ -474,6 +476,7 @@ impl ReplHandler {
             expanded_tool_results: std::collections::HashSet::new(),
             quit_requested: false,
             model_picker: None,
+            rewind_picker: None,
             turn_tokens: 0,
             total_input_tokens: 0,
             total_output_tokens: 0,
@@ -912,7 +915,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 approval_explain,
                 approval_debug,
             )
-            .max(model_picker_height(handler.model_picker, ctx));
+            .max(model_picker_height(handler.model_picker, ctx))
+            .max(rewind_picker_height(handler.rewind_picker, ctx));
             let spinner_height = if active_turn.is_some() && awaiting_approval.is_none() {
                 1
             } else {
@@ -978,6 +982,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 );
             } else if let Some(sel) = handler.model_picker {
                 render_model_picker(frame, chunks[2], sel, ctx);
+            } else if let Some(sel) = handler.rewind_picker {
+                render_rewind_picker(frame, chunks[2], sel, ctx);
             }
 
             if queued_height > 0 {
@@ -1189,6 +1195,38 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         }
                         KeyCode::Esc => {
                             handler.model_picker = None;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                if let Some(sel) = handler.rewind_picker {
+                    let candidates = rewind_candidates(ctx);
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            handler.rewind_picker = Some(sel.saturating_sub(1));
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            handler.rewind_picker =
+                                Some((sel + 1).min(candidates.len().saturating_sub(1)));
+                        }
+                        KeyCode::Enter => {
+                            if let Some((msg_index, _)) = candidates.get(sel) {
+                                let msg_index = *msg_index;
+                                ctx.session_mut().messages.truncate(msg_index);
+                                handler.overlay_rows.clear();
+                                handler.clear_live_turn();
+                                handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
+                                handler.push_overlay(format!(
+                                    "[info] Rewound conversation to message {msg_index}"
+                                ));
+                                let _ = ctx.save_session();
+                            }
+                            handler.rewind_picker = None;
+                        }
+                        KeyCode::Esc => {
+                            handler.rewind_picker = None;
                         }
                         _ => {}
                     }
@@ -4090,6 +4128,16 @@ fn handle_slash_command(
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
+                "/rewind" => {
+                    let candidates = rewind_candidates(ctx);
+                    if candidates.is_empty() {
+                        handler.push_overlay("[info] No messages to rewind to".to_string());
+                    } else {
+                        handler.rewind_picker = Some(candidates.len() - 1);
+                    }
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
                 "/copy" => {
                     let which = prompt
                         .strip_prefix("/copy")
@@ -4654,6 +4702,11 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
         CommandEntry {
             name: "/btw".to_string(),
             description: "Ask a side question without touching session context".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/rewind".to_string(),
+            description: "Restore the conversation to a previous message".to_string(),
             source: CommandSource::BuiltIn,
         },
         CommandEntry {
@@ -5229,6 +5282,72 @@ fn render_model_picker(frame: &mut Frame, area: Rect, selected: usize, ctx: &Tui
     }
     lines.push(Line::from(Span::styled(
         " Enter to select · Esc to cancel",
+        Style::default().fg(DIM),
+    )));
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect::new(
+            area.x,
+            area.y + 1,
+            area.width,
+            area.height.saturating_sub(1),
+        ),
+    );
+}
+
+/// User messages eligible for `/rewind`: (message index, preview text).
+fn rewind_candidates(ctx: &TuiContext) -> Vec<(usize, String)> {
+    ctx.session()
+        .messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == Role::User)
+        .filter_map(|(i, m)| m.primary_text().map(|text| (i, truncate_summary(text))))
+        .collect()
+}
+
+fn rewind_picker_height(picker: Option<usize>, ctx: &TuiContext) -> u16 {
+    if picker.is_none() {
+        return 0;
+    }
+    (rewind_candidates(ctx).len() as u16 + 3).min(12)
+}
+
+fn render_rewind_picker(frame: &mut Frame, area: Rect, selected: usize, ctx: &TuiContext) {
+    if area.height == 0 {
+        return;
+    }
+    let border_width = area.width.saturating_sub(2) as usize;
+    frame.render_widget(
+        Paragraph::new(format!("╭{}╮", "─".repeat(border_width)))
+            .style(Style::default().fg(ACCENT)),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    let candidates = rewind_candidates(ctx);
+    let visible = area.height.saturating_sub(4) as usize;
+    let offset = selected.saturating_sub(visible.saturating_sub(1));
+    let mut lines = vec![
+        Line::from(Span::styled(
+            " Rewind to a previous message",
+            Style::default().fg(ACCENT),
+        )),
+        Line::from(""),
+    ];
+    for (index, (_, preview)) in candidates.iter().enumerate().skip(offset).take(visible) {
+        let focused = index == selected;
+        let marker = if focused { "❯" } else { " " };
+        let style = if focused {
+            Style::default().fg(ACCENT)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {marker}"), style),
+            Span::styled(preview.clone(), style),
+        ]));
+    }
+    lines.push(Line::from(Span::styled(
+        " Enter to rewind · Esc to cancel",
         Style::default().fg(DIM),
     )));
     frame.render_widget(
