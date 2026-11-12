@@ -21,7 +21,10 @@ use clawedcode_core::subagent::{
 use clawedcode_core::tool_input::decode_tool_input;
 use clawedcode_core::update::InstallMethod;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
+        KeyModifiers,
+    },
     execute,
     terminal::{
         EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
@@ -502,7 +505,12 @@ fn skill_is_registerable(skill: &SkillDescriptor) -> bool {
 pub fn run_with_context(mut ctx: TuiContext) -> Result<()> {
     set_theme(ctx.theme_name());
     enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen, SetTitle("ClawedCode"))?;
+    execute!(
+        stdout(),
+        EnterAlternateScreen,
+        SetTitle("ClawedCode"),
+        EnableBracketedPaste
+    )?;
     let terminal = ratatui::init();
     let result = run_loop(terminal, &mut ctx);
     restore_terminal()?;
@@ -1248,7 +1256,21 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
         let transcript_height = last_body_height;
 
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
+            let key = match event::read()? {
+                Event::Paste(text) => {
+                    // Bracketed paste: multi-line paste lands as literal text,
+                    // not as a stream of Enter presses that would submit early.
+                    if !text.is_empty() {
+                        input_buffer.insert_str(cursor_pos, &text);
+                        cursor_pos += text.len();
+                        history_index = None;
+                    }
+                    continue;
+                }
+                Event::Key(key) => key,
+                _ => continue,
+            };
+            {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
@@ -7732,10 +7754,10 @@ fn open_path_in_editor(path: &Path) -> Result<()> {
 #[cfg(unix)]
 fn suspend_process() {
     let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
     unsafe { libc::raise(libc::SIGTSTP) };
     let _ = enable_raw_mode();
-    let _ = execute!(io::stdout(), EnterAlternateScreen);
+    let _ = execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste);
 }
 
 /// Pipe text to the first available clipboard tool — mirrors `/copy`.
@@ -8134,7 +8156,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 
 fn restore_terminal() -> Result<()> {
     disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen)?;
+    execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen)?;
     ratatui::restore();
     Ok(())
 }
