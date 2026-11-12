@@ -729,6 +729,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     let mut awaiting_approval: Option<ApprovalRequest> = None;
     let mut approval_selection: usize = 0;
     let mut approval_amend: Option<String> = None;
+    let mut approval_explain = false;
+    let mut approval_debug = false;
     let mut active_turn: Option<ActiveTurn> = None;
     let mut info_panel_scroll: usize = 0;
     let mut last_area = Rect::default();
@@ -786,6 +788,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
             last_approval_id = pending_approval_id;
             approval_selection = 0;
             approval_amend = None;
+            approval_explain = false;
+            approval_debug = false;
         }
 
         if ctx.session().messages.is_empty() && !onboarding_seen_recorded {
@@ -849,6 +853,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 awaiting_approval.as_ref(),
                 approval_selection,
                 approval_amend.is_some(),
+                approval_explain,
+                approval_debug,
             )
             .max(model_picker_height(handler.model_picker, ctx));
             let spinner_height = if active_turn.is_some() && awaiting_approval.is_none() {
@@ -910,6 +916,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                     awaiting_approval.as_ref().unwrap(),
                     approval_selection,
                     approval_amend.as_deref(),
+                    approval_explain,
+                    approval_debug,
                     ctx,
                 );
             } else if let Some(sel) = handler.model_picker {
@@ -1192,6 +1200,12 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
                             approval_selection = (approval_selection + 1).min(APPROVAL_OPTIONS - 1);
+                        }
+                        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            approval_explain = !approval_explain;
+                        }
+                        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            approval_debug = !approval_debug;
                         }
                         KeyCode::Tab => {
                             // Amendable options: Yes (0) and No (2) per reference.
@@ -2150,13 +2164,15 @@ fn approval_selector_height(
     request: Option<&ApprovalRequest>,
     _selected: usize,
     amending: bool,
+    explain: bool,
+    debug: bool,
 ) -> u16 {
     if request.is_none() {
         return 0;
     }
     // border + title + blank + input + blank + question + 3 options + blank
-    // (+ amend input line) + footer
-    if amending { 12 } else { 11 }
+    // (+ amend input line) (+ explain/debug lines) + footer
+    11 + u16::from(amending) + u16::from(explain) + u16::from(debug)
 }
 
 /// Permission dialog: a top-only rounded border in `permission` blue, the
@@ -2169,6 +2185,8 @@ fn render_approval_selector(
     request: &ApprovalRequest,
     selected: usize,
     amend: Option<&str>,
+    explain: bool,
+    debug: bool,
     ctx: &TuiContext,
 ) {
     let display_name = tool_display_name(&request.tool_name);
@@ -2240,6 +2258,26 @@ fn render_approval_selector(
             Span::styled(format!(" {marker}"), style),
             Span::styled(format!("{}. {}", index + 1, option), style),
         ]));
+    }
+
+    if explain {
+        lines.push(Line::from(Span::styled(
+            format!(
+                " This tool requires your approval in {} mode.",
+                permission_mode_label(ctx.permission_mode())
+            ),
+            Style::default().fg(MUTED),
+        )));
+    }
+    if debug {
+        lines.push(Line::from(Span::styled(
+            format!(
+                " id: {} · input: {}",
+                request.tool_use_id,
+                truncate_for_display(&input_json, 60)
+            ),
+            Style::default().fg(SUBTLE),
+        )));
     }
 
     if let Some(buffer) = amend {
@@ -5461,7 +5499,16 @@ mod command_policy_tests {
         };
         terminal
             .draw(|frame| {
-                render_approval_selector(frame, Rect::new(0, 0, 60, 11), &request, 0, None, &ctx);
+                render_approval_selector(
+                    frame,
+                    Rect::new(0, 0, 60, 11),
+                    &request,
+                    0,
+                    None,
+                    false,
+                    false,
+                    &ctx,
+                );
             })
             .expect("draw");
         let text = buffer_lines(&terminal).join("\n");
@@ -5984,8 +6031,8 @@ mod command_policy_tests {
             tool_name: "shell".to_string(),
             input: serde_json::json!({"command": "ls -la"}),
         };
-        assert_eq!(approval_selector_height(None, 0, false), 0);
-        assert!(approval_selector_height(Some(&request), 0, false) >= 5);
+        assert_eq!(approval_selector_height(None, 0, false, false, false), 0);
+        assert!(approval_selector_height(Some(&request), 0, false, false, false) >= 5);
     }
 
     #[test]
