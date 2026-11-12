@@ -1304,6 +1304,15 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             approval_debug = !approval_debug;
                         }
+                        KeyCode::BackTab => {
+                            // Reference confirm:cycleMode — Shift+Tab cycles the
+                            // permission mode from inside file permission dialogs.
+                            let mode = ctx.cycle_permission_mode();
+                            handler.push_overlay(format!(
+                                "[info] {} (shift+tab to cycle)",
+                                permission_mode_label(mode)
+                            ));
+                        }
                         KeyCode::Tab => {
                             // Amendable options: Yes (0) and No (2) per reference.
                             if approval_selection != 1 {
