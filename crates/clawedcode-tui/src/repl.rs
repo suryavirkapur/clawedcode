@@ -736,6 +736,9 @@ struct ActiveTurn {
     approvals: mpsc::Sender<ApprovalOutcome>,
     _join: thread::JoinHandle<()>,
     compacting: bool,
+    /// `/btw` side questions stream like a normal turn but never persist —
+    /// the finished rows fold into the overlay instead of the session.
+    ephemeral: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3651,6 +3654,7 @@ fn spawn_bash_worker(session: Session, command: String) -> ActiveTurn {
         approvals: approval_tx,
         _join: join,
         compacting: false,
+        ephemeral: false,
     }
 }
 
@@ -3836,6 +3840,7 @@ fn spawn_turn_worker(
         approvals: approval_tx,
         _join: join,
         compacting: false,
+        ephemeral: false,
     }
 }
 
@@ -3859,6 +3864,15 @@ fn drain_turn_events(
                 TurnWorkerEvent::Finished(mut session) => {
                     if turn.compacting {
                         compact_session(&mut session);
+                    }
+                    if turn.ephemeral {
+                        let rows = handler.live_rows();
+                        handler.overlay_rows.extend(rows);
+                        handler.clear_live_turn();
+                        handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
+                        *awaiting_approval = None;
+                        finished = true;
+                        continue;
                     }
                     ctx.replace_session(session);
                     maybe_mark_project_onboarding_complete(&ctx.session().cwd);
@@ -3964,6 +3978,31 @@ fn handle_slash_command(
                 }
                 "/exit" | "/quit" => {
                     handler.request_quit();
+                    return Ok(true);
+                }
+                "/btw" => {
+                    let question = prompt
+                        .strip_prefix("/btw")
+                        .map(str::trim)
+                        .unwrap_or_default();
+                    if question.is_empty() {
+                        handler.push_overlay("[info] Usage: /btw <question>".to_string());
+                        let _ = ctx.save_session();
+                        return Ok(true);
+                    }
+                    if active_turn.is_some() {
+                        handler.push_overlay(
+                            "[info] Wait for the current turn to finish first".to_string(),
+                        );
+                        let _ = ctx.save_session();
+                        return Ok(true);
+                    }
+                    handler.push_overlay(format!("/btw {question}"));
+                    let mut turn =
+                        spawn_turn_worker(ctx, question.to_string(), None, always_allowed.clone());
+                    turn.ephemeral = true;
+                    *active_turn = Some(turn);
+                    let _ = ctx.save_session();
                     return Ok(true);
                 }
                 "/version" => {
@@ -4530,6 +4569,11 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
         CommandEntry {
             name: "/context".to_string(),
             description: "Show session context size and message counts".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/btw".to_string(),
+            description: "Ask a side question without touching session context".to_string(),
             source: CommandSource::BuiltIn,
         },
         CommandEntry {
