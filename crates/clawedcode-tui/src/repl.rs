@@ -448,6 +448,9 @@ const BUILTIN_COMMANDS: &[&str] = &[
     "/cost",
     "/session",
     "/output-style",
+    "/commit",
+    "/review",
+    "/security-review",
 ];
 
 fn is_reserved_command(name: &str) -> bool {
@@ -5188,6 +5191,80 @@ fn handle_slash_command(
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
+                "/commit" => {
+                    if active_turn.is_some() {
+                        handler.push_overlay("[info] A turn is already running.".to_string());
+                    } else {
+                        let execution = build_commit_prompt(&ctx.session().cwd);
+                        handler.begin_live_turn("/commit".to_string());
+                        *active_turn = Some(spawn_turn_worker(
+                            ctx,
+                            "/commit".to_string(),
+                            Some(execution),
+                            always_allowed.clone(),
+                        ));
+                    }
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/security-review" => {
+                    if active_turn.is_some() {
+                        handler.push_overlay("[info] A turn is already running.".to_string());
+                    } else {
+                        let execution = build_security_review_prompt(&ctx.session().cwd);
+                        handler.begin_live_turn("/security-review".to_string());
+                        *active_turn = Some(spawn_turn_worker(
+                            ctx,
+                            "/security-review".to_string(),
+                            Some(execution),
+                            always_allowed.clone(),
+                        ));
+                    }
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/review" => {
+                    if active_turn.is_some() {
+                        handler.push_overlay("[info] A turn is already running.".to_string());
+                    } else {
+                        let args = prompt
+                            .strip_prefix("/review")
+                            .map(str::trim)
+                            .unwrap_or_default();
+                        let execution = format!(
+                            r#"You are an expert code reviewer. Follow these steps:
+
+1. If no PR number is provided, run `gh pr list` to show open PRs
+2. If a PR number is provided, run `gh pr view <number>` to get PR details
+3. Run `gh pr diff <number>` to get the diff
+4. Analyze the changes and provide a thorough code review that includes:
+   - Overview of what the PR does
+   - Analysis of code quality and style
+   - Specific suggestions for improvements
+   - Any potential issues or risks
+
+Keep your review concise but thorough. Focus on:
+- Code correctness
+- Following project conventions
+- Performance implications
+- Test coverage
+- Security considerations
+
+Format your review with clear sections and bullet points.
+
+PR number: {args}"#
+                        );
+                        handler.begin_live_turn(format!("/review {args}").trim().to_string());
+                        *active_turn = Some(spawn_turn_worker(
+                            ctx,
+                            "/review".to_string(),
+                            Some(execution),
+                            always_allowed.clone(),
+                        ));
+                    }
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
                 "/session" => {
                     let session = ctx.session();
                     let lines = vec![
@@ -5882,6 +5959,21 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
         CommandEntry {
             name: "/output-style".to_string(),
             description: "Show or pick output style".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/commit".to_string(),
+            description: "Commit staged changes with a drafted message".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/review".to_string(),
+            description: "Review a pull request".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/security-review".to_string(),
+            description: "Security review of pending branch changes".to_string(),
             source: CommandSource::BuiltIn,
         },
         CommandEntry {
@@ -6634,6 +6726,281 @@ fn apply_theme_choice(ctx: &mut TuiContext, handler: &mut ReplHandler, theme: &s
         }
     }
     handler.push_overlay(format!("[info] Theme set to {theme}"));
+}
+
+const SECURITY_REVIEW_TEMPLATE: &str = r#"You are a senior security engineer conducting a focused security review of the changes on this branch.
+
+GIT STATUS:
+
+```
+{GIT_STATUS}
+```
+
+FILES MODIFIED:
+
+```
+{FILES_MODIFIED}
+```
+
+COMMITS:
+
+```
+{COMMITS}
+```
+
+DIFF CONTENT:
+
+```
+{DIFF_CONTENT}
+```
+
+Review the complete diff above. This contains all code changes in the PR.
+
+
+OBJECTIVE:
+Perform a security-focused code review to identify HIGH-CONFIDENCE security vulnerabilities that could have real exploitation potential. This is not a general code review - focus ONLY on security implications newly added by this PR. Do not comment on existing security concerns.
+
+CRITICAL INSTRUCTIONS:
+1. MINIMIZE FALSE POSITIVES: Only flag issues where you're >80% confident of actual exploitability
+2. AVOID NOISE: Skip theoretical issues, style concerns, or low-impact findings
+3. FOCUS ON IMPACT: Prioritize vulnerabilities that could lead to unauthorized access, data breaches, or system compromise
+4. EXCLUSIONS: Do NOT report the following issue types:
+   - Denial of Service (DOS) vulnerabilities, even if they allow service disruption
+   - Secrets or sensitive data stored on disk (these are handled by other processes)
+   - Rate limiting or resource exhaustion issues
+
+SECURITY CATEGORIES TO EXAMINE:
+
+**Input Validation Vulnerabilities:**
+- SQL injection via unsanitized user input
+- Command injection in system calls or subprocesses
+- XXE injection in XML parsing
+- Template injection in templating engines
+- NoSQL injection in database queries
+- Path traversal in file operations
+
+**Authentication & Authorization Issues:**
+- Authentication bypass logic
+- Privilege escalation paths
+- Session management flaws
+- JWT token vulnerabilities
+- Authorization logic bypasses
+
+**Crypto & Secrets Management:**
+- Hardcoded API keys, passwords, or tokens
+- Weak cryptographic algorithms or implementations
+- Improper key storage or management
+- Cryptographic randomness issues
+- Certificate validation bypasses
+
+**Injection & Code Execution:**
+- Remote code execution via deseralization
+- Pickle injection in Python
+- YAML deserialization vulnerabilities
+- Eval injection in dynamic code execution
+- XSS vulnerabilities in web applications (reflected, stored, DOM-based)
+
+**Data Exposure:**
+- Sensitive data logging or storage
+- PII handling violations
+- API endpoint data leakage
+- Debug information exposure
+
+Additional notes:
+- Even if something is only exploitable from the local network, it can still be a HIGH severity issue
+
+ANALYSIS METHODOLOGY:
+
+Phase 1 - Repository Context Research (Use file search tools):
+- Identify existing security frameworks and libraries in use
+- Look for established secure coding patterns in the codebase
+- Examine existing sanitization and validation patterns
+- Understand the project's security model and threat model
+
+Phase 2 - Comparative Analysis:
+- Compare new code changes against existing security patterns
+- Identify deviations from established secure practices
+- Look for inconsistent security implementations
+- Flag code that introduces new attack surfaces
+
+Phase 3 - Vulnerability Assessment:
+- Examine each modified file for security implications
+- Trace data flow from user inputs to sensitive operations
+- Look for privilege boundaries being crossed unsafely
+- Identify injection points and unsafe deserialization
+
+REQUIRED OUTPUT FORMAT:
+
+You MUST output your findings in markdown. The markdown output should contain the file, line number, severity, category (e.g. `sql_injection` or `xss`), description, exploit scenario, and fix recommendation.
+
+For example:
+
+# Vuln 1: XSS: `foo.py:42`
+
+* Severity: High
+* Description: User input from `username` parameter is directly interpolated into HTML without escaping, allowing reflected XSS attacks
+* Exploit Scenario: Attacker crafts URL like /bar?q=<script>alert(document.cookie)</script> to execute JavaScript in victim's browser, enabling session hijacking or data theft
+* Recommendation: Use Flask's escape() function or Jinja2 templates with auto-escaping enabled for all user inputs rendered in HTML
+
+SEVERITY GUIDELINES:
+- **HIGH**: Directly exploitable vulnerabilities leading to RCE, data breach, or authentication bypass
+- **MEDIUM**: Vulnerabilities requiring specific conditions but with significant impact
+- **LOW**: Defense-in-depth issues or lower-impact vulnerabilities
+
+CONFIDENCE SCORING:
+- 0.9-1.0: Certain exploit path identified, tested if possible
+- 0.8-0.9: Clear vulnerability pattern with known exploitation methods
+- 0.7-0.8: Suspicious pattern requiring specific conditions to exploit
+- Below 0.7: Don't report (too speculative)
+
+FINAL REMINDER:
+Focus on HIGH and MEDIUM findings only. Better to miss some theoretical issues than flood the report with false positives. Each finding should be something a security engineer would confidently raise in a PR review.
+
+FALSE POSITIVE FILTERING:
+
+> You do not need to run commands to reproduce the vulnerability, just read the code to determine if it is a real vulnerability. Do not use the bash tool or write to any files.
+>
+> HARD EXCLUSIONS - Automatically exclude findings matching these patterns:
+> 1. Denial of Service (DOS) vulnerabilities or resource exhaustion attacks.
+> 2. Secrets or credentials stored on disk if they are otherwise secured.
+> 3. Rate limiting concerns or service overload scenarios.
+> 4. Memory consumption or CPU exhaustion issues.
+> 5. Lack of input validation on non-security-critical fields without proven security impact.
+> 6. Input sanitization concerns for GitHub Action workflows unless they are clearly triggerable via untrusted input.
+> 7. A lack of hardening measures. Code is not expected to implement all security best practices, only flag concrete vulnerabilities.
+> 8. Race conditions or timing attacks that are theoretical rather than practical issues. Only report a race condition if it is concretely problematic.
+> 9. Vulnerabilities related to outdated third-party libraries. These are managed separately and should not be reported here.
+> 10. Memory safety issues such as buffer overflows or use-after-free-vulnerabilities are impossible in rust. Do not report memory safety issues in rust or any other memory safe languages.
+> 11. Files that are only unit tests or only used as part of running tests.
+> 12. Log spoofing concerns. Outputting un-sanitized user input to logs is not a vulnerability.
+> 13. SSRF vulnerabilities that only control the path. SSRF is only a concern if it can control the host or protocol.
+> 14. Including user-controlled content in AI system prompts is not a vulnerability.
+> 15. Regex injection. Injecting untrusted content into a regex is not a vulnerability.
+> 16. Regex DOS concerns.
+> 16. Insecure documentation. Do not report any findings in documentation files such as markdown files.
+> 17. A lack of audit logs is not a vulnerability.
+>
+> PRECEDENTS -
+> 1. Logging high value secrets in plaintext is a vulnerability. Logging URLs is assumed to be safe.
+> 2. UUIDs can be assumed to be unguessable and do not need to be validated.
+> 3. Environment variables and CLI flags are trusted values. Attackers are generally not able to modify them in a secure environment. Any attack that relies on controlling an environment variable is invalid.
+> 4. Resource management issues such as memory or file descriptor leaks are not valid.
+> 5. Subtle or low impact web vulnerabilities such as tabnabbing, XS-Leaks, prototype pollution, and open redirects should not be reported unless they are extremely high confidence.
+> 6. React and Angular are generally secure against XSS. These frameworks do not need to sanitize or escape user input unless it is using dangerouslySetInnerHTML, bypassSecurityTrustHtml, or similar methods. Do not report XSS vulnerabilities in React or Angular components or tsx files unless they are using unsafe methods.
+> 7. Most vulnerabilities in github action workflows are not exploitable in practice. Before validating a github action workflow vulnerability ensure it is concrete and has a very specific attack path.
+> 8. A lack of permission checking or authentication in client-side JS/TS code is not a vulnerability. Client-side code is not trusted and does not need to implement these checks, they are handled on the server-side. The same applies to all flows that send untrusted data to the backend, the backend is responsible for validating and sanitizing all inputs.
+> 9. Only include MEDIUM findings if they are obvious and concrete issues.
+> 10. Most vulnerabilities in ipython notebooks (*.ipynb files) are not exploitable in practice. Before validating a notebook vulnerability ensure it is concrete and has a very specific attack path where untrusted input can trigger the vulnerability.
+> 11. Logging non-PII data is not a vulnerability even if the data may be sensitive. Only report logging vulnerabilities if they expose sensitive information such as secrets, passwords, or personally identifiable information (PII).
+> 12. Command injection vulnerabilities in shell scripts are generally not exploitable in practice since shell scripts generally do not run with untrusted user input. Only report command injection vulnerabilities in shell scripts if they are concrete and have a very specific attack path for untrusted input.
+>
+> SIGNAL QUALITY CRITERIA - For remaining findings, assess:
+> 1. Is there a concrete, exploitable vulnerability with a clear attack path?
+> 2. Does this represent a real security risk vs theoretical best practice?
+> 3. Are there specific code locations and reproduction steps?
+> 4. Would this finding be actionable for a security team?
+>
+> For each finding, assign a confidence score from 1-10:
+> - 1-3: Low confidence, likely false positive or noise
+> - 4-6: Medium confidence, needs investigation
+> - 7-10: High confidence, likely true vulnerability
+
+START ANALYSIS:
+
+Begin your analysis now. Do this in 3 steps:
+
+1. Use a sub-task to identify vulnerabilities. Use the repository exploration tools to understand the codebase context, then analyze the PR changes for security implications. In the prompt for this sub-task, include all of the above.
+2. Then for each vulnerability identified by the above sub-task, create a new sub-task to filter out false-positives. Launch these sub-tasks as parallel sub-tasks. In the prompt for these sub-tasks, include everything in the "FALSE POSITIVE FILTERING" instructions.
+3. Filter out any vulnerabilities where the sub-task reported a confidence less than 8.
+
+Your final reply must contain the markdown report and nothing else."#;
+
+/// Run a command under `cwd` and capture combined output for prompt
+/// expansion (the reference's `!\`cmd\`` substitutions). Output is truncated
+/// so a huge diff cannot blow up the prompt.
+fn shell_capture(cwd: &Path, program: &str, args: &[&str]) -> String {
+    const CAP: usize = 40_000;
+    match Command::new(program).args(args).current_dir(cwd).output() {
+        Ok(out) => {
+            let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if !out.status.success() {
+                if !stderr.trim().is_empty() {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(&stderr);
+                }
+                text = format!("(exit {}): {text}", out.status.code().unwrap_or(-1));
+            }
+            if text.len() > CAP {
+                text.truncate(CAP);
+                text.push_str("\n... (truncated)");
+            }
+            text.trim().to_string()
+        }
+        Err(err) => format!("(failed to run {program}: {err})"),
+    }
+}
+
+/// `/commit`: the reference expands git context inline and prepends the git
+/// safety protocol before asking for a conventional commit.
+fn build_commit_prompt(cwd: &Path) -> String {
+    let status = shell_capture(cwd, "git", &["status"]);
+    let diff = shell_capture(cwd, "git", &["diff", "HEAD"]);
+    let branch = shell_capture(cwd, "git", &["branch", "--show-current"]);
+    let log = shell_capture(cwd, "git", &["log", "--oneline", "-10"]);
+    format!(
+        r#"## Context
+
+- Current git status:
+{status}
+
+- Current git diff (staged and unstaged changes):
+{diff}
+
+- Current branch: {branch}
+
+- Recent commits:
+{log}
+
+## Git Safety Protocol
+
+- NEVER update the git config
+- NEVER skip hooks (--no-verify, --no-gpg-sign, etc) unless the user explicitly requests it
+- CRITICAL: ALWAYS create NEW commits. NEVER use git commit --amend, unless the user explicitly requests it
+- Do not commit files that likely contain secrets (.env, credentials.json, etc). Warn the user if they specifically request to commit those files
+- If there are no changes to commit (i.e., no untracked files and no modifications), do not create an empty commit
+- Never use git commands with the -i flag (like git rebase -i or git add -i) since they require interactive input which is not supported
+
+## Your task
+
+Based on the above changes, create a single git commit:
+
+1. Analyze all staged changes and draft a commit message:
+   - Look at the recent commits above to follow this repository's commit message style
+   - Summarize the nature of the changes (new feature, enhancement, bug fix, refactoring, test, docs, etc.)
+   - Ensure the message accurately reflects the changes and their purpose
+   - Draft a concise (1-2 sentences) commit message that focuses on the "why" rather than the "what"
+
+2. Stage relevant files and create the commit using HEREDOC syntax
+
+3. After creating the commit, run `git status` to confirm the commit succeeded and report the result."#
+    )
+}
+
+/// `/security-review`: expands the reference's branch-diff capture slots
+/// (`origin/HEAD...`) into the verbatim review template.
+fn build_security_review_prompt(cwd: &Path) -> String {
+    let status = shell_capture(cwd, "git", &["status"]);
+    let files = shell_capture(cwd, "git", &["diff", "--name-only", "origin/HEAD..."]);
+    let commits = shell_capture(cwd, "git", &["log", "--no-decorate", "origin/HEAD..."]);
+    let diff = shell_capture(cwd, "git", &["diff", "origin/HEAD..."]);
+    SECURITY_REVIEW_TEMPLATE
+        .replace("{GIT_STATUS}", &status)
+        .replace("{FILES_MODIFIED}", &files)
+        .replace("{COMMITS}", &commits)
+        .replace("{DIFF_CONTENT}", &diff)
 }
 
 fn apply_resume_choice(ctx: &mut TuiContext, handler: &mut ReplHandler, prefix: &str) {
