@@ -4090,6 +4090,86 @@ fn handle_slash_command(
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
+                "/copy" => {
+                    let which = prompt
+                        .strip_prefix("/copy")
+                        .map(str::trim)
+                        .unwrap_or_default()
+                        .parse::<usize>()
+                        .unwrap_or(1)
+                        .max(1);
+                    let texts: Vec<String> = ctx
+                        .session()
+                        .messages
+                        .iter()
+                        .rev()
+                        .filter(|m| m.role == Role::Assistant)
+                        .filter_map(|m| m.primary_text().map(str::to_string))
+                        .collect();
+                    match texts.get(which - 1) {
+                        Some(text) => match copy_to_clipboard(text) {
+                            Ok(tool) => handler.push_overlay(format!(
+                                "[info] Copied response {which} to clipboard ({tool})"
+                            )),
+                            Err(err) => handler
+                                .push_overlay(format!("[error] Clipboard copy failed: {err}")),
+                        },
+                        None => handler.push_overlay(format!("[info] No response {which} to copy")),
+                    }
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/diff" => {
+                    let cwd = ctx.session().cwd.clone();
+                    let lines = std::process::Command::new("git")
+                        .args(["diff", "--stat", "HEAD"])
+                        .current_dir(&cwd)
+                        .output()
+                        .ok()
+                        .map(|out| {
+                            String::from_utf8_lossy(&out.stdout)
+                                .lines()
+                                .map(str::to_string)
+                                .collect::<Vec<_>>()
+                        })
+                        .filter(|lines| !lines.is_empty())
+                        .unwrap_or_else(|| vec!["No uncommitted changes".to_string()]);
+                    handler.show_panel("Diff".to_string(), lines);
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/doctor" => {
+                    let mut lines = vec![
+                        format!("ClawedCode v{}", env!("CARGO_PKG_VERSION")),
+                        format!("Model: {} · {}", ctx.model_name(), provider_label()),
+                        format!(
+                            "Config: {}",
+                            clawedcode_core::config::default_config_path()
+                                .map(|p| display_path(&p))
+                                .unwrap_or_else(|| "(none)".to_string())
+                        ),
+                        format!("Working dir: {}", display_path(&ctx.session().cwd)),
+                        format!(
+                            "Git repo: {}",
+                            if ctx.session().cwd.join(".git").exists() {
+                                "yes"
+                            } else {
+                                "no"
+                            }
+                        ),
+                        format!("Sessions: {}", display_path(&ctx.sessions_dir)),
+                    ];
+                    let key_env = ctx.provider_api_key_env().to_string();
+                    let key_status = if std::env::var(&key_env).is_ok() {
+                        "set"
+                    } else {
+                        "not set"
+                    };
+                    lines.push(format!("API key env {key_env}: {key_status}"));
+                    handler.show_panel("Doctor".to_string(), lines);
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
                 "/config" => {
                     let path = clawedcode_core::config::default_config_path()
                         .map(|p| display_path(&p))
@@ -4574,6 +4654,21 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
         CommandEntry {
             name: "/btw".to_string(),
             description: "Ask a side question without touching session context".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/copy".to_string(),
+            description: "Copy the last response to the clipboard".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/diff".to_string(),
+            description: "Show uncommitted git changes".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/doctor".to_string(),
+            description: "Check the ClawedCode environment".to_string(),
             source: CommandSource::BuiltIn,
         },
         CommandEntry {
@@ -5384,6 +5479,38 @@ fn suspend_process() {
     unsafe { libc::raise(libc::SIGTSTP) };
     let _ = enable_raw_mode();
     let _ = execute!(io::stdout(), EnterAlternateScreen);
+}
+
+/// Pipe text to the first available clipboard tool — mirrors `/copy`.
+fn copy_to_clipboard(text: &str) -> Result<&'static str> {
+    use std::io::Write;
+    let tools: &[(&str, &[&str])] = &[
+        ("pbcopy", &[]),
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+    ];
+    for (tool, args) in tools {
+        let Ok(mut child) = std::process::Command::new(tool)
+            .args(*args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        else {
+            continue;
+        };
+        if let Some(stdin) = child.stdin.as_mut() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        match child.wait() {
+            Ok(status) if status.success() => return Ok(tool),
+            _ => continue,
+        }
+    }
+    Err(anyhow::anyhow!(
+        "no clipboard tool found (pbcopy, wl-copy, xclip, xsel)"
+    ))
 }
 
 fn open_external_editor(initial: &str) -> Option<String> {
