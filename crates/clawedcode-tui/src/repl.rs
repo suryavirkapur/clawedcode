@@ -5290,8 +5290,8 @@ fn model_picker_height(picker: Option<usize>, ctx: &TuiContext) -> u16 {
     if picker.is_none() {
         return 0;
     }
-    // border + title + options + footer
-    model_candidates(ctx).len() as u16 + 3
+    // border + title + blank + options + footer
+    model_candidates(ctx).len() as u16 + 4
 }
 
 fn render_model_picker(frame: &mut Frame, area: Rect, selected: usize, ctx: &TuiContext) {
@@ -5356,7 +5356,7 @@ fn rewind_picker_height(picker: Option<usize>, ctx: &TuiContext) -> u16 {
     if picker.is_none() {
         return 0;
     }
-    (rewind_candidates(ctx).len() as u16 + 3).min(12)
+    (rewind_candidates(ctx).len() as u16 + 4).min(12)
 }
 
 fn render_rewind_picker(frame: &mut Frame, area: Rect, selected: usize, ctx: &TuiContext) {
