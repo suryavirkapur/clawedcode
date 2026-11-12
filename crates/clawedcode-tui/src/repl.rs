@@ -42,45 +42,213 @@ use std::{
 
 const ACCENT: Color = Color::Rgb(215, 119, 87);
 const MUTED: Color = Color::Rgb(150, 150, 150);
-const DIM: Color = Color::Rgb(110, 110, 110);
-const SUBTLE: Color = Color::Rgb(75, 75, 75);
-const ERR_FG: Color = Color::Rgb(220, 80, 80);
-const WARN_FG: Color = Color::Rgb(210, 170, 60);
-const OK_FG: Color = Color::Rgb(120, 180, 90);
+const DIM: Color = Color::Rgb(153, 153, 153);
+const SUBTLE: Color = Color::Rgb(80, 80, 80);
+const ERR_FG: Color = Color::Rgb(255, 107, 128);
+const WARN_FG: Color = Color::Rgb(255, 193, 7);
+const OK_FG: Color = Color::Rgb(78, 186, 101);
+const PERMISSION_FG: Color = Color::Rgb(177, 185, 249);
+const AUTO_ACCEPT_FG: Color = Color::Rgb(175, 135, 255);
+const PLAN_MODE_FG: Color = Color::Rgb(72, 150, 140);
+const PROMPT_BORDER: Color = Color::Rgb(136, 136, 136);
+const USER_MSG_BG: Color = Color::Rgb(55, 55, 55);
 const DASHBOARD_HEIGHT: u16 = 16;
 const BULLET: &str = "⏺";
 const HOOK_PREFIX: &str = "  ⎿  ";
 const HOOK_CONTINUATION: &str = "     ";
+const POINTER: &str = "❯";
 const MAX_VISIBLE_QUEUED_PROMPTS: usize = 3;
 const SPINNER_FRAME_MS: u128 = 120;
 const SPINNER_VERB_MS: u128 = 2_500;
 
-const SPINNER_FRAMES: &[char] = &['✶', '✻', '✽', '✳', '✢', '✷'];
+const SPINNER_FRAMES: &[char] = &['·', '✢', '✳', '✶', '✻', '✽', '✻', '✶', '✳', '✢'];
 const SPINNER_VERBS: &[&str] = &[
-    "Thinking",
-    "Pondering",
-    "Cogitating",
-    "Computing",
-    "Deliberating",
-    "Reasoning",
-    "Percolating",
-    "Musing",
-    "Noodling",
-    "Ruminating",
-    "Simmering",
-    "Brewing",
-    "Crafting",
-    "Forming",
-    "Hatching",
-    "Marinating",
-    "Scheming",
-    "Synthesizing",
-    "Vibing",
-    "Whisking",
-    "Booping",
-    "Beaming",
     "Accomplishing",
+    "Actioning",
+    "Actualizing",
+    "Architecting",
+    "Baking",
+    "Beaming",
+    "Beboppin'",
+    "Befuddling",
+    "Billowing",
+    "Blanching",
+    "Bloviating",
+    "Boogieing",
+    "Boondoggling",
+    "Booping",
+    "Bootstrapping",
+    "Brewing",
+    "Bunning",
+    "Burrowing",
+    "Calculating",
+    "Canoodling",
+    "Caramelizing",
+    "Cascading",
+    "Catapulting",
+    "Cerebrating",
+    "Channeling",
+    "Channelling",
+    "Choreographing",
+    "Churning",
+    "Clauding",
+    "Coalescing",
+    "Cogitating",
+    "Combobulating",
+    "Composing",
+    "Computing",
+    "Concocting",
+    "Considering",
+    "Contemplating",
+    "Cooking",
+    "Crafting",
+    "Creating",
+    "Crunching",
+    "Crystallizing",
+    "Cultivating",
+    "Deciphering",
+    "Deliberating",
+    "Determining",
+    "Dilly-dallying",
+    "Discombobulating",
+    "Doing",
+    "Doodling",
+    "Drizzling",
+    "Ebbing",
+    "Effecting",
+    "Elucidating",
+    "Embellishing",
+    "Enchanting",
+    "Envisioning",
+    "Evaporating",
+    "Fermenting",
+    "Fiddle-faddling",
+    "Finagling",
+    "Flambéing",
+    "Flibbertigibbeting",
+    "Flowing",
+    "Flummoxing",
+    "Fluttering",
+    "Forging",
+    "Forming",
+    "Frolicking",
+    "Frosting",
+    "Gallivanting",
+    "Galloping",
+    "Garnishing",
+    "Generating",
+    "Gesticulating",
+    "Germinating",
+    "Gitifying",
+    "Grooving",
+    "Gusting",
+    "Harmonizing",
+    "Hashing",
+    "Hatching",
+    "Herding",
+    "Honking",
+    "Hullaballooing",
+    "Hyperspacing",
+    "Ideating",
+    "Imagining",
+    "Improvising",
+    "Incubating",
+    "Inferring",
+    "Infusing",
+    "Ionizing",
+    "Jitterbugging",
+    "Julienning",
+    "Kneading",
+    "Leavening",
+    "Levitating",
+    "Lollygagging",
     "Manifesting",
+    "Marinating",
+    "Meandering",
+    "Metamorphosing",
+    "Misting",
+    "Moonwalking",
+    "Moseying",
+    "Mulling",
+    "Mustering",
+    "Musing",
+    "Nebulizing",
+    "Nesting",
+    "Newspapering",
+    "Noodling",
+    "Nucleating",
+    "Orbiting",
+    "Orchestrating",
+    "Osmosing",
+    "Perambulating",
+    "Percolating",
+    "Perusing",
+    "Philosophising",
+    "Photosynthesizing",
+    "Pollinating",
+    "Pondering",
+    "Pontificating",
+    "Pouncing",
+    "Precipitating",
+    "Prestidigitating",
+    "Processing",
+    "Proofing",
+    "Propagating",
+    "Puttering",
+    "Puzzling",
+    "Quantumizing",
+    "Razzle-dazzling",
+    "Razzmatazzing",
+    "Recombobulating",
+    "Reticulating",
+    "Roosting",
+    "Ruminating",
+    "Sautéing",
+    "Scampering",
+    "Schlepping",
+    "Scurrying",
+    "Seasoning",
+    "Shenaniganing",
+    "Shimmying",
+    "Simmering",
+    "Skedaddling",
+    "Sketching",
+    "Slithering",
+    "Smooshing",
+    "Sock-hopping",
+    "Spelunking",
+    "Spinning",
+    "Sprouting",
+    "Stewing",
+    "Sublimating",
+    "Swirling",
+    "Swooping",
+    "Symbioting",
+    "Synthesizing",
+    "Tempering",
+    "Thinking",
+    "Thoughting",
+    "Thundering",
+    "Tidying",
+    "Tinkering",
+    "Tomfooling",
+    "Topologizing",
+    "Transfiguring",
+    "Transmuting",
+    "Twisting",
+    "Unfurling",
+    "Unraveling",
+    "Unzipping",
+    "Upserting",
+    "Vibing",
+    "Waltzing",
+    "Whirring",
+    "Whisking",
+    "Wibbling",
+    "Wringing",
+    "Zesting",
+    "Zigzagging",
+    "Zooming",
 ];
 
 const CLAUDE_LOGO: &[&str] = &[" ▐▛███▜▌ ", "▝▜█████▛▘", "  ▘▘ ▝▝  "];
@@ -205,7 +373,6 @@ enum RenderRow {
     Assistant(String),
     Thinking(String),
     ToolUse {
-        id: String,
         name: String,
         input: String,
     },
@@ -254,18 +421,6 @@ impl ReplHandler {
             state: AppState::Idle,
             expanded_tool_results: std::collections::HashSet::new(),
         }
-    }
-
-    fn expand_all_tool_results(&mut self) {
-        for row in self.visible_rows() {
-            if let RenderRow::ToolResult { tool_use_id, .. } = row {
-                self.expanded_tool_results.insert(tool_use_id.clone());
-            }
-        }
-    }
-
-    fn collapse_all_tool_results(&mut self) {
-        self.expanded_tool_results.clear();
     }
 
     fn rebuild_from_session(&mut self, session: &Session, show_thinking: bool) {
@@ -429,7 +584,6 @@ fn render_live_tool_entry(entry: &LiveToolEntry) -> Vec<RenderRow> {
         match event {
             LiveToolEventState::Use { name, input } => {
                 rows.push(RenderRow::ToolUse {
-                    id: entry.tool_use_id.clone(),
                     name: name.clone(),
                     input: serde_json::to_string(input).unwrap_or_default(),
                 });
@@ -559,6 +713,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     let mut history: Vec<String> = Vec::new();
     let mut history_index: Option<usize> = None;
     let mut history_stash = String::new();
+    let mut history_search: Option<(String, Option<usize>)> = None;
+    let mut history_search_stash = String::new();
     let mut last_approval_id: Option<String> = None;
     let always_allowed: Arc<Mutex<std::collections::HashSet<String>>> =
         Arc::new(Mutex::new(std::collections::HashSet::new()));
@@ -613,6 +769,22 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
         }
         last_visible_line_count = visible_line_count;
 
+        // During reverse history search, the input box shows the current
+        // match (or the query) instead of the real buffer.
+        let display_input = if let Some((query, match_index)) = &history_search {
+            match match_index {
+                Some(index) => history.get(*index).cloned().unwrap_or_default(),
+                None => query.clone(),
+            }
+        } else {
+            input_buffer.clone()
+        };
+        let display_cursor = if history_search.is_some() {
+            display_input.len()
+        } else {
+            cursor_pos
+        };
+
         terminal.draw(|frame| {
             let area = frame.area();
             last_area = area;
@@ -636,7 +808,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
             } else {
                 (queued_prompts.len().min(MAX_VISIBLE_QUEUED_PROMPTS) + 1) as u16
             };
-            let input_height = input_box_height(&input_buffer, area.width);
+            let input_height = input_box_height(&display_input, area.width);
 
             let chunks = Layout::vertical([
                 Constraint::Min(1),
@@ -682,13 +854,16 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                     chunks[2],
                     awaiting_approval.as_ref().unwrap(),
                     approval_selection,
-                    &always_allowed,
+                    ctx,
                 );
             }
 
             if queued_height > 0 {
                 frame.render_widget(
-                    Paragraph::new(queued_prompt_preview_lines(&queued_prompts)),
+                    Paragraph::new(queued_prompt_preview_lines(
+                        &queued_prompts,
+                        chunks[3].width as usize,
+                    )),
                     chunks[3],
                 );
             }
@@ -697,10 +872,22 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 frame.render_widget(Paragraph::new(spinner_line(turn_started_at)), chunks[4]);
             }
 
-            let cursor = render_input_box(frame, chunks[5], &input_buffer, cursor_pos);
+            let cursor = render_input_box(
+                frame,
+                chunks[5],
+                &display_input,
+                display_cursor,
+                active_turn.is_some(),
+            );
             frame.set_cursor_position(cursor);
 
-            render_hint_line(frame, chunks[6], ctx, awaiting_approval.is_some());
+            render_hint_line(
+                frame,
+                chunks[6],
+                ctx,
+                awaiting_approval.is_some(),
+                history_search.as_ref().map(|(query, _)| query.as_str()),
+            );
 
             if let Some(panel) = &handler.info_panel {
                 let modal_area = centered_rect(72, 72, area);
@@ -931,6 +1118,49 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                     continue;
                 }
 
+                if let Some((query, match_index)) = history_search.clone() {
+                    let find = |query: &str, before: usize| -> Option<usize> {
+                        (0..before.min(history.len()))
+                            .rev()
+                            .find(|&index| history[index].contains(query))
+                    };
+                    match key.code {
+                        KeyCode::Esc => {
+                            input_buffer = history_search_stash.clone();
+                            cursor_pos = input_buffer.len();
+                            history_search = None;
+                        }
+                        KeyCode::Enter => {
+                            if let Some(index) = match_index {
+                                input_buffer = history[index].clone();
+                                cursor_pos = input_buffer.len();
+                            }
+                            history_search = None;
+                        }
+                        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            let before = match_index.unwrap_or(history.len());
+                            let index = find(&query, before);
+                            history_search = Some((query, index));
+                        }
+                        KeyCode::Backspace => {
+                            let mut query = query;
+                            query.pop();
+                            let index = find(&query, history.len());
+                            history_search = Some((query, index));
+                        }
+                        KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            let mut query = query;
+                            query.push(ch);
+                            let index = find(&query, history.len());
+                            history_search = Some((query, index));
+                        }
+                        _ => {
+                            history_search = None;
+                        }
+                    }
+                    continue;
+                }
+
                 if handler.info_panel.is_some() {
                     let max_scroll = handler
                         .info_panel
@@ -976,10 +1206,10 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         transcript_mode.viewport.pinned_to_bottom = false;
                     }
                     KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        if handler.expanded_tool_results.is_empty() {
-                            handler.expand_all_tool_results();
-                        } else {
-                            handler.collapse_all_tool_results();
+                        if !history.is_empty() {
+                            history_search_stash = input_buffer.clone();
+                            history_search = Some((String::new(), None));
+                            history_index = None;
                         }
                     }
                     KeyCode::BackTab if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -1293,6 +1523,7 @@ fn render_conversation(
         None,
         &[],
         &handler.expanded_tool_results,
+        chunks[0].width as usize,
     ))
     .wrap(Wrap { trim: false })
     .scroll((scroll_offset as u16, 0));
@@ -1385,7 +1616,7 @@ fn welcome_lines(ctx: &TuiContext) -> Vec<Line<'static>> {
 }
 
 fn render_transcript_screen(frame: &mut Frame, area: Rect, state: &TranscriptModeState) {
-    let transcript = Paragraph::new(transcript_render_lines(state))
+    let transcript = Paragraph::new(transcript_render_lines(state, area.width as usize))
         .wrap(Wrap { trim: false })
         .scroll((state.viewport.scroll_offset as u16, 0));
 
@@ -1466,62 +1697,107 @@ fn approval_selector_height(request: Option<&ApprovalRequest>, _selected: usize)
     if request.is_none() {
         return 0;
     }
-    // blank + tool summary + question + 3 options + input detail
-    7
+    // border + title + blank + input + blank + question + 3 options + blank + footer
+    10
 }
 
-/// Claude Code-style permission prompt rendered inline above the input box.
+/// Permission dialog: a top-only rounded border in `permission` blue, the
+/// tool title, the rendered input, "Do you want to proceed?", then the
+/// numbered options with a `❯` focus marker — matches PermissionDialog +
+/// PermissionPrompt from the reference implementation.
 fn render_approval_selector(
     frame: &mut Frame,
     area: Rect,
     request: &ApprovalRequest,
     selected: usize,
-    _always_allowed: &Arc<Mutex<std::collections::HashSet<String>>>,
+    ctx: &TuiContext,
 ) {
     let display_name = tool_display_name(&request.tool_name);
+    let title = if request.tool_name == "shell" {
+        "Bash command".to_string()
+    } else {
+        "Tool use".to_string()
+    };
     let input_json = serde_json::to_string(&request.input).unwrap_or_default();
     let arg = tool_display_arg(&request.tool_name, &input_json);
+    let cwd = display_path(&ctx.session().cwd);
+    let subject = if request.tool_name == "shell" {
+        request
+            .input
+            .get("command")
+            .and_then(|v| v.as_str())
+            .and_then(|cmd| cmd.split_whitespace().next())
+            .map(|word| format!("`{word}`"))
+            .unwrap_or_else(|| display_name.to_string())
+    } else {
+        display_name.to_string()
+    };
 
     let options = [
         "Yes".to_string(),
-        format!(
-            "Yes, and don't ask again for {} commands this session",
-            display_name
-        ),
-        "No, and tell ClawedCode what to do differently (esc)".to_string(),
+        format!("Yes, and don't ask again for {subject} commands in {cwd}"),
+        "No, and tell Claude what to do differently (esc)".to_string(),
     ];
 
+    // Top border line: ╭────╮ in the `permission` color.
+    let border_width = area.width.saturating_sub(2) as usize;
+    frame.render_widget(
+        Paragraph::new(format!("╭{}╮", "─".repeat(border_width)))
+            .style(Style::default().fg(PERMISSION_FG)),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+
     let mut lines = vec![
-        Line::from(""),
         Line::from(vec![
+            Span::raw(" "),
             Span::styled(
-                format!("{BULLET} "),
-                Style::default().add_modifier(Modifier::BOLD),
+                title,
+                Style::default()
+                    .fg(PERMISSION_FG)
+                    .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                display_name.to_string(),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!("({arg})"), Style::default().fg(DIM)),
         ]),
-        Line::from(Span::styled("Do you want to proceed?", Style::default())),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(" {arg}"),
+            Style::default().fg(Color::White),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            " Do you want to proceed?".to_string(),
+            Style::default().fg(DIM),
+        )),
     ];
 
     for (index, option) in options.iter().enumerate() {
         let is_selected = index == selected;
         let marker = if is_selected { "❯ " } else { "  " };
         let style = if is_selected {
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+            Style::default().fg(PERMISSION_FG)
         } else {
             Style::default().fg(DIM)
         };
         lines.push(Line::from(vec![
-            Span::styled(marker, style),
+            Span::styled(format!(" {marker}"), style),
             Span::styled(format!("{}. {}", index + 1, option), style),
         ]));
     }
 
-    frame.render_widget(Paragraph::new(lines), area);
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " Esc to cancel · Tab to amend".to_string(),
+        Style::default().fg(DIM),
+    )));
+
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect::new(
+            area.x,
+            area.y + 1,
+            area.width,
+            area.height.saturating_sub(1),
+        ),
+    );
 }
 
 /// Animated "working" line above the input box: `✻ Verb… (esc to interrupt · Ns)`.
@@ -1556,8 +1832,8 @@ fn input_box_height(input: &str, width: u16) -> u16 {
 }
 
 fn input_inner_width(width: u16) -> usize {
-    // box borders (2) + left padding (1) + "> " prefix (2)
-    (width as usize).saturating_sub(5).max(10)
+    // "❯ " prefix (2 display columns) — no side borders on the input area
+    (width as usize).saturating_sub(2).max(10)
 }
 
 /// Wrap `> {input}` into display lines fitting `width` characters.
@@ -1584,41 +1860,70 @@ fn wrap_input(input: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// Draw the Claude Code input box (rounded border, `>` prompt inside) and
-/// return the terminal cursor position for the editing caret.
+/// Draw the Claude Code input area: top+bottom rounded borders only
+/// (╭─╮ / ╰─╯), a colored `❯` pointer prompt, and the editing caret.
 fn render_input_box(
     frame: &mut Frame,
     area: Rect,
     input: &str,
     cursor_pos: usize,
+    loading: bool,
 ) -> ratatui::layout::Position {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(SUBTLE));
-    frame.render_widget(block, area);
+    if area.height == 0 {
+        return ratatui::layout::Position::new(area.x, area.y);
+    }
+
+    let border_style = Style::default().fg(PROMPT_BORDER);
+    let border_width = area.width.saturating_sub(2) as usize;
+    let top = format!("╭{}╮", "─".repeat(border_width));
+    let bottom = format!("╰{}╯", "─".repeat(border_width));
+
+    frame.render_widget(
+        Paragraph::new(top).style(border_style),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(bottom).style(border_style),
+        Rect::new(area.x, area.y + area.height - 1, area.width, 1),
+    );
 
     let inner = Rect::new(
-        area.x + 1,
+        area.x,
         area.y + 1,
-        area.width.saturating_sub(2),
+        area.width,
         area.height.saturating_sub(2),
     );
     let wrap_width = input_inner_width(area.width);
     let all_lines = wrap_input(input, wrap_width);
-    let visible: Vec<String> = all_lines.iter().take(8).cloned().collect();
-    frame.render_widget(
-        Paragraph::new(
-            visible
-                .into_iter()
-                .map(Line::from)
-                .collect::<Vec<Line<'static>>>(),
-        ),
-        inner,
-    );
+    let visible_count = all_lines.len().min(8);
+    let prompt_style = if loading {
+        Style::default().fg(ACCENT).add_modifier(Modifier::DIM)
+    } else {
+        Style::default().fg(ACCENT)
+    };
 
-    // Locate the caret in wrapped coordinates: prefix "> " + input[..cursor].
-    let prefix_chars = 2usize; // "> "
+    for (index, line) in all_lines.iter().take(8).enumerate() {
+        let y = inner.y + index as u16;
+        if index == 0 {
+            // First display line carries the "❯ " pointer prefix.
+            let body = line.strip_prefix("> ").unwrap_or(line);
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(format!("{POINTER} "), prompt_style),
+                    Span::raw(body.to_string()),
+                ])),
+                Rect::new(inner.x, y, inner.width, 1),
+            );
+        } else {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::raw(format!("  {line}")))),
+                Rect::new(inner.x, y, inner.width, 1),
+            );
+        }
+    }
+
+    // Locate the caret in wrapped coordinates: prefix "❯ " + input[..cursor].
+    let prefix_chars = 2usize;
     let cursor_chars = prefix_chars + input[..cursor_pos].chars().count();
     let text = format!("> {input}");
     let mut col = 0usize;
@@ -1638,27 +1943,39 @@ fn render_input_box(
         }
     }
     let row = row.min(7);
+    let _ = visible_count;
     ratatui::layout::Position::new(
         inner.x + col.min(wrap_width.saturating_sub(1)) as u16,
         inner.y + row as u16,
     )
 }
 
-/// Bottom hint line: approval hints, permission-mode banner, or `? for shortcuts`.
-fn render_hint_line(frame: &mut Frame, area: Rect, ctx: &TuiContext, awaiting: bool) {
+/// Bottom hint line: approval hints, history-search label, permission-mode
+/// banner, or `? for shortcuts`.
+fn render_hint_line(
+    frame: &mut Frame,
+    area: Rect,
+    ctx: &TuiContext,
+    awaiting: bool,
+    history_search: Option<&str>,
+) {
     let mode = ctx.permission_mode();
     let mode_text = permission_mode_label(mode);
 
     let left = if awaiting {
         "↑/↓ select · enter confirm · esc deny".to_string()
+    } else if let Some(query) = history_search {
+        format!("(reverse-i-search)`{query}`:")
     } else if mode != clawedcode_core::permissions::PermissionMode::Default {
-        format!("⏵⏵ {mode_text} · ? for shortcuts")
+        format!("{mode_text} · ? for shortcuts")
     } else {
         "? for shortcuts".to_string()
     };
 
-    let left_style = if mode != clawedcode_core::permissions::PermissionMode::Default {
-        Style::default().fg(ACCENT)
+    let left_style = if history_search.is_some() {
+        Style::default().fg(PERMISSION_FG)
+    } else if mode != clawedcode_core::permissions::PermissionMode::Default {
+        Style::default().fg(permission_mode_color(mode))
     } else {
         Style::default().fg(SUBTLE)
     };
@@ -1691,12 +2008,23 @@ fn permission_mode_label(mode: clawedcode_core::permissions::PermissionMode) -> 
     match mode {
         clawedcode_core::permissions::PermissionMode::Default => "default",
         clawedcode_core::permissions::PermissionMode::AcceptEdits => {
-            "accept edits on (shift+tab to cycle)"
+            "⏵⏵ accept edits on (shift+tab to cycle)"
         }
-        clawedcode_core::permissions::PermissionMode::Plan => "plan mode on (shift+tab to cycle)",
+        clawedcode_core::permissions::PermissionMode::Plan => "⏸ plan mode on (shift+tab to cycle)",
         clawedcode_core::permissions::PermissionMode::Bypass => {
-            "bypass permissions on (shift+tab to cycle)"
+            "⏵⏵ bypass permissions on (shift+tab to cycle)"
         }
+    }
+}
+
+/// Mode colors from the reference dark theme: autoAccept violet, planMode
+/// sage, bypass red.
+fn permission_mode_color(mode: clawedcode_core::permissions::PermissionMode) -> Color {
+    match mode {
+        clawedcode_core::permissions::PermissionMode::Default => Color::White,
+        clawedcode_core::permissions::PermissionMode::AcceptEdits => AUTO_ACCEPT_FG,
+        clawedcode_core::permissions::PermissionMode::Plan => PLAN_MODE_FG,
+        clawedcode_core::permissions::PermissionMode::Bypass => ERR_FG,
     }
 }
 
@@ -1822,7 +2150,7 @@ fn row_text(row: &RenderRow) -> String {
         RenderRow::User(text) => format!("> {text}"),
         RenderRow::Assistant(text) => format!("{BULLET} {text}"),
         RenderRow::Thinking(text) => format!("{BULLET} {text}"),
-        RenderRow::ToolUse { id: _, name, input } => {
+        RenderRow::ToolUse { name, input } => {
             let arg = tool_display_arg(name, input);
             format!("{BULLET} {}({arg})", tool_display_name(name))
         }
@@ -1846,6 +2174,7 @@ fn render_rows(
     selected_index: Option<usize>,
     search_matches: &[usize],
     expanded_tools: &std::collections::HashSet<String>,
+    width: usize,
 ) -> Vec<Line<'static>> {
     rows.iter()
         .enumerate()
@@ -1855,7 +2184,7 @@ fn render_rows(
 
             let mut lines = match row {
                 RenderRow::Spacer => vec![Line::from(String::new())],
-                RenderRow::User(text) => render_user_message(text),
+                RenderRow::User(text) => render_user_message(text, width),
                 RenderRow::Assistant(text) => {
                     let mut result = Vec::new();
                     if text.is_empty() {
@@ -1897,7 +2226,7 @@ fn render_rows(
                     }
                     result
                 }
-                RenderRow::ToolUse { id: _, name, input } => {
+                RenderRow::ToolUse { name, input } => {
                     let arg = tool_display_arg(name, input);
                     vec![Line::from(vec![
                         Span::styled(
@@ -1961,30 +2290,28 @@ fn render_rows(
         .collect()
 }
 
-/// Render a submitted user prompt the way Claude Code echoes it:
-/// a dim `>` followed by the raw text, continuation lines indented.
-fn render_user_message(text: &str) -> Vec<Line<'static>> {
+/// User messages render as a full-width band on `userMessageBackground`
+/// (rgb(55,55,55) in the dark theme), text only — no `>` prefix.
+fn render_user_message(text: &str, width: usize) -> Vec<Line<'static>> {
+    let style = Style::default().bg(USER_MSG_BG);
+    let text_style = Style::default().fg(Color::White).bg(USER_MSG_BG);
     let mut result = Vec::new();
+    let push_band = |result: &mut Vec<Line<'static>>, raw: &str| {
+        let text_len = raw.chars().count() + 1; // 1-char right padding
+        let pad = width.saturating_sub(text_len);
+        result.push(Line::from(vec![
+            Span::styled(raw.to_string(), text_style),
+            Span::styled(" ".repeat(pad + 1), style),
+        ]));
+    };
+
     if text.is_empty() {
-        result.push(Line::from(Span::styled(
-            ">",
-            Style::default().fg(DIM).add_modifier(Modifier::BOLD),
-        )));
+        push_band(&mut result, " ");
         return result;
     }
 
-    for (index, raw) in text.lines().enumerate() {
-        let mut spans = Vec::new();
-        if index == 0 {
-            spans.push(Span::styled(
-                "> ",
-                Style::default().fg(DIM).add_modifier(Modifier::BOLD),
-            ));
-        } else {
-            spans.push(Span::raw("  "));
-        }
-        spans.push(Span::styled(raw.to_string(), Style::default().fg(MUTED)));
-        result.push(Line::from(spans));
+    for raw in text.lines() {
+        push_band(&mut result, raw);
     }
     result
 }
@@ -2034,7 +2361,7 @@ fn render_tool_result(
             result.push(Line::from(vec![
                 Span::styled(HOOK_CONTINUATION, Style::default().fg(hook_color)),
                 Span::styled(
-                    format!("… +{} lines (ctrl+r to expand)", content_lines.len() - 1),
+                    format!("… +{} lines (ctrl+o to expand)", content_lines.len() - 1),
                     Style::default().fg(SUBTLE).add_modifier(Modifier::ITALIC),
                 ),
             ]));
@@ -2266,23 +2593,36 @@ fn navigate_transcript_search(state: &mut TranscriptModeState, forward: bool) {
     state.viewport.pinned_to_bottom = false;
 }
 
-fn transcript_render_lines(state: &TranscriptModeState) -> Vec<Line<'static>> {
+fn transcript_render_lines(state: &TranscriptModeState, width: usize) -> Vec<Line<'static>> {
+    // Transcript mode is the "expanded" view — every tool result renders in
+    // full (this is what "ctrl+o to expand" means in the reference).
+    let expanded: std::collections::HashSet<String> = state
+        .frozen_rows
+        .iter()
+        .filter_map(|row| match row {
+            RenderRow::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+            _ => None,
+        })
+        .collect();
     render_rows(
         &state.frozen_rows,
         transcript_search_current(state),
         &state.search_matches,
-        &std::collections::HashSet::new(),
+        &expanded,
+        width,
     )
 }
 
-fn queued_prompt_preview_lines(queued_prompts: &[String]) -> Vec<Line<'static>> {
+/// Queued prompts preview above the input area — dimmed echoes of what will
+/// run next, matching the queued-commands strip in the reference.
+fn queued_prompt_preview_lines(queued_prompts: &[String], width: usize) -> Vec<Line<'static>> {
     let visible_count = queued_prompts.len().min(MAX_VISIBLE_QUEUED_PROMPTS);
     let mut lines = Vec::new();
     for prompt in queued_prompts.iter().take(visible_count) {
-        lines.push(Line::from(vec![
-            Span::styled("> ", Style::default().fg(DIM).add_modifier(Modifier::BOLD)),
-            Span::styled(truncate_for_display(prompt, 96), Style::default().fg(DIM)),
-        ]));
+        lines.extend(render_user_message(
+            &truncate_for_display(prompt, 96),
+            width,
+        ));
     }
 
     if queued_prompts.len() > visible_count {
@@ -2467,11 +2807,8 @@ fn append_message_blocks(
                     }
                 }
             }
-            ContentBlock::ToolUse {
-                id, name, input, ..
-            } => {
+            ContentBlock::ToolUse { name, input, .. } => {
                 turn.rows.push(RenderRow::ToolUse {
-                    id: id.clone(),
                     name: name.clone(),
                     input: serde_json::to_string(input).unwrap_or_default(),
                 });
@@ -2531,7 +2868,16 @@ fn spawn_turn_worker(
                 };
                 let tx = event_tx.clone();
                 let approval_rx = approval_rx.clone();
+                let always_allowed = always_allowed.clone();
                 let mut request_approval = move |request: ApprovalRequest| {
+                    if always_allowed
+                        .lock()
+                        .map(|set| set.contains(&request.tool_name))
+                        .unwrap_or(false)
+                    {
+                        return true;
+                    }
+
                     if tx
                         .send(TurnWorkerEvent::ApprovalRequested(request))
                         .is_err()
@@ -4136,18 +4482,21 @@ mod command_policy_tests {
 
     #[test]
     fn queued_prompts_render_as_dim_prompt_echoes() {
-        let queued_lines = queued_prompt_preview_lines(&[
-            "first queued prompt".to_string(),
-            "second queued prompt".to_string(),
-        ]);
+        let queued_lines = queued_prompt_preview_lines(
+            &[
+                "first queued prompt".to_string(),
+                "second queued prompt".to_string(),
+            ],
+            80,
+        );
         let rendered_queue = queued_lines
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered_queue.contains("> first queued prompt"));
-        assert!(rendered_queue.contains("> second queued prompt"));
+        assert!(rendered_queue.contains("first queued prompt"));
+        assert!(rendered_queue.contains("second queued prompt"));
     }
 
     #[test]
