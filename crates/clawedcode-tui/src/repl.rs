@@ -4128,6 +4128,37 @@ fn handle_slash_command(
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
+                "/plan" => {
+                    ctx.set_permission_mode(clawedcode_core::permissions::PermissionMode::Plan);
+                    handler.push_overlay("[info] Plan mode on (shift+tab to cycle)".to_string());
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/skills" => {
+                    let lines = if ctx.skills().is_empty() {
+                        vec!["No skills discovered.".to_string()]
+                    } else {
+                        ctx.skills()
+                            .iter()
+                            .map(|skill| {
+                                format!(
+                                    "{} — {}",
+                                    skill.name,
+                                    skill.description.as_deref().unwrap_or("")
+                                )
+                            })
+                            .collect()
+                    };
+                    handler.show_panel("Skills".to_string(), lines);
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/keybindings" => {
+                    let panel = help_panel(ctx);
+                    handler.show_panel(panel.title, panel.lines);
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
                 "/rewind" => {
                     let candidates = rewind_candidates(ctx);
                     if candidates.is_empty() {
@@ -4702,6 +4733,21 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
         CommandEntry {
             name: "/btw".to_string(),
             description: "Ask a side question without touching session context".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/plan".to_string(),
+            description: "Enter plan mode — model plans without making changes".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/skills".to_string(),
+            description: "List discovered skills".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/keybindings".to_string(),
+            description: "Show the keyboard shortcut reference".to_string(),
             source: CommandSource::BuiltIn,
         },
         CommandEntry {
