@@ -1425,6 +1425,14 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                                 &always_allowed,
                             )? {
                                 handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
+                            } else if let Some(command) = prompt.strip_prefix('!') {
+                                let command = command.trim().to_string();
+                                if !command.is_empty() {
+                                    handler.begin_live_turn(prompt.clone());
+                                    turn_started_at = Some(std::time::Instant::now());
+                                    active_turn =
+                                        Some(spawn_bash_worker(ctx.cloned_session(), command));
+                                }
                             } else {
                                 handler.begin_live_turn(prompt.clone());
                                 turn_started_at = Some(std::time::Instant::now());
@@ -1921,20 +1929,30 @@ fn render_input_box(
     let wrap_width = input_inner_width(area.width);
     let all_lines = wrap_input(input, wrap_width);
     let visible_count = all_lines.len().min(8);
+    // Bash mode (`!cmd`) swaps the pointer glyph and tints it, like Claude Code.
+    let bash_mode = input.starts_with('!');
+    let pointer = if bash_mode { "!" } else { POINTER };
     let prompt_style = if loading {
-        Style::default().fg(ACCENT).add_modifier(Modifier::DIM)
+        Style::default()
+            .fg(if bash_mode { PERMISSION_FG } else { ACCENT })
+            .add_modifier(Modifier::DIM)
     } else {
-        Style::default().fg(ACCENT)
+        Style::default().fg(if bash_mode { PERMISSION_FG } else { ACCENT })
     };
 
     for (index, line) in all_lines.iter().take(8).enumerate() {
         let y = inner.y + index as u16;
         if index == 0 {
-            // First display line carries the "❯ " pointer prefix.
-            let body = line.strip_prefix("> ").unwrap_or(line);
+            // First display line carries the "❯ " (or "!" in bash mode) pointer.
+            let raw = line.strip_prefix("> ").unwrap_or(line);
+            let body = if bash_mode {
+                raw.strip_prefix('!').unwrap_or(raw)
+            } else {
+                raw
+            };
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
-                    Span::styled(format!("{POINTER} "), prompt_style),
+                    Span::styled(format!("{pointer} "), prompt_style),
                     Span::raw(body.to_string()),
                 ])),
                 Rect::new(inner.x, y, inner.width, 1),
@@ -1948,9 +1966,18 @@ fn render_input_box(
     }
 
     // Locate the caret in wrapped coordinates: prefix "❯ " + input[..cursor].
+    // In bash mode the leading `!` is shown as the pointer, not in the body.
     let prefix_chars = 2usize;
-    let cursor_chars = prefix_chars + input[..cursor_pos].chars().count();
-    let text = format!("> {input}");
+    let cursor_chars = prefix_chars
+        + input[..cursor_pos]
+            .chars()
+            .count()
+            .saturating_sub(if bash_mode { 1 } else { 0 });
+    let text = if bash_mode {
+        format!("> {}", input.strip_prefix('!').unwrap_or(input))
+    } else {
+        format!("> {input}")
+    };
     let mut col = 0usize;
     let mut row = 0usize;
     for (index, ch) in text.chars().enumerate() {
@@ -2677,6 +2704,11 @@ fn maybe_submit_queued_prompt(
     let prompt = queued_prompts.remove(0);
     if handle_slash_command(ctx, handler, &prompt, active_turn, always_allowed)? {
         handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
+    } else if let Some(command) = prompt.strip_prefix('!').map(str::trim)
+        && !command.is_empty()
+    {
+        handler.begin_live_turn(prompt.clone());
+        *active_turn = Some(spawn_bash_worker(ctx.cloned_session(), command.to_string()));
     } else {
         handler.begin_live_turn(prompt.clone());
         *active_turn = Some(spawn_turn_worker(ctx, prompt, None, always_allowed.clone()));
@@ -2817,7 +2849,30 @@ fn append_message_blocks(
         match block {
             ContentBlock::Text { text } => {
                 let text = text.trim();
-                if !text.is_empty() {
+                if role_prefix == "You" && text.starts_with("<bash-input>") {
+                    // Bash-mode entries recorded by `!cmd` runs — render like the live turn.
+                    let command = text
+                        .strip_prefix("<bash-input>")
+                        .and_then(|t| t.split("</bash-input>").next())
+                        .unwrap_or("")
+                        .trim();
+                    turn.rows.push(RenderRow::User(format!("! {command}")));
+                    turn.rows.push(RenderRow::ToolUse {
+                        name: "shell".to_string(),
+                        input: format!("{{\"command\":{command:?}}}"),
+                    });
+                    if let Some(output) = text.split("<bash-output>").nth(1) {
+                        let output = output.trim_end_matches("</bash-output>").trim_end();
+                        if !output.is_empty() {
+                            turn.rows.push(RenderRow::ToolResult {
+                                tool_use_id: String::new(),
+                                content: output.to_string(),
+                                is_error: false,
+                            });
+                        }
+                    }
+                    wrote_block = true;
+                } else if !text.is_empty() {
                     turn.rows.push(match role_prefix {
                         "You" => RenderRow::User(text.to_string()),
                         "ClawedCode" => RenderRow::Assistant(text.to_string()),
@@ -2872,6 +2927,53 @@ fn append_message_blocks(
     }
 }
 
+/// Runs a `!cmd` bash-mode command directly, bypassing the model, and records
+/// `<bash-input>`/`<bash-output>` context in the session like Claude Code does.
+fn spawn_bash_worker(session: Session, command: String) -> ActiveTurn {
+    let (event_tx, event_rx) = mpsc::channel();
+    let (approval_tx, _approval_rx) = mpsc::channel::<bool>();
+    let join = thread::spawn(move || {
+        let mut session = session;
+        let tool_use_id = format!("bash-mode-{}", uuid::Uuid::new_v4());
+        let _ = event_tx.send(TurnWorkerEvent::Ui(TuiEvent::ToolUse {
+            id: tool_use_id.clone(),
+            name: "shell".to_string(),
+            input: serde_json::json!({ "command": command }),
+        }));
+        let (content, is_error) = match std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .output()
+        {
+            Ok(output) => {
+                let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+                text.push_str(&String::from_utf8_lossy(&output.stderr));
+                if text.is_empty() && output.status.success() {
+                    text.push_str("(no output)");
+                }
+                (text, !output.status.success())
+            }
+            Err(err) => (format!("failed to run command: {err}"), true),
+        };
+        let _ = event_tx.send(TurnWorkerEvent::Ui(TuiEvent::ToolResult {
+            tool_use_id,
+            content: content.clone(),
+            is_error,
+        }));
+        let _ = event_tx.send(TurnWorkerEvent::Ui(TuiEvent::TurnComplete));
+        session.push(
+            Role::User,
+            format!("<bash-input>{command}</bash-input>\n<bash-output>{content}</bash-output>"),
+        );
+        let _ = event_tx.send(TurnWorkerEvent::Finished(session));
+    });
+    ActiveTurn {
+        events: event_rx,
+        approvals: approval_tx,
+        _join: join,
+    }
+}
+
 fn spawn_turn_worker(
     ctx: &TuiContext,
     visible_prompt: String,
@@ -2880,6 +2982,7 @@ fn spawn_turn_worker(
 ) -> ActiveTurn {
     let runtime = ctx.replacement_runtime();
     let external_turn_executor = ctx.external_turn_executor();
+    let permission_mode = ctx.permission_mode();
     let mut session = ctx.cloned_session();
     let (event_tx, event_rx) = mpsc::channel();
     let (approval_tx, approval_rx) = mpsc::channel();
@@ -2897,7 +3000,14 @@ fn spawn_turn_worker(
                 let tx = event_tx.clone();
                 let approval_rx = approval_rx.clone();
                 let always_allowed = always_allowed.clone();
+                let permission_engine =
+                    clawedcode_core::permissions::PermissionEngine::new(permission_mode);
                 let mut request_approval = move |request: ApprovalRequest| {
+                    match permission_engine.decide(true, is_write_like(&request.tool_name)) {
+                        clawedcode_core::permissions::PermissionDecision::Allow => return true,
+                        clawedcode_core::permissions::PermissionDecision::Deny => return false,
+                        clawedcode_core::permissions::PermissionDecision::Ask => {}
+                    }
                     if always_allowed
                         .lock()
                         .map(|set| set.contains(&request.tool_name))
@@ -4525,6 +4635,22 @@ mod command_policy_tests {
 
         assert!(rendered_queue.contains("first queued prompt"));
         assert!(rendered_queue.contains("second queued prompt"));
+    }
+
+    #[test]
+    fn bash_mode_entries_rebuild_as_bash_rows() {
+        let mut session = Session::new(std::path::PathBuf::from("/tmp/t"));
+        session.push(
+            Role::User,
+            "<bash-input>ls -la</bash-input>\n<bash-output>total 42</bash-output>".to_string(),
+        );
+        let mut handler = ReplHandler::new(false);
+        handler.rebuild_from_session(&session, false);
+        let lines = handler.visible_lines().join("\n");
+        assert!(lines.contains("! ls -la"));
+        assert!(lines.contains("Bash(ls -la)"));
+        assert!(lines.contains("total 42"));
+        assert!(!lines.contains("bash-input"));
     }
 
     #[test]
