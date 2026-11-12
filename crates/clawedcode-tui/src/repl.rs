@@ -5728,6 +5728,37 @@ PR number: {args}"#
                     return Ok(true);
                 }
                 "/config" => {
+                    let arg = prompt
+                        .strip_prefix("/config")
+                        .map(str::trim)
+                        .unwrap_or_default();
+                    if !arg.is_empty() {
+                        let mut parts = arg.splitn(2, char::is_whitespace);
+                        let key = parts.next().unwrap_or_default().to_lowercase();
+                        let value = parts.next().unwrap_or_default().trim();
+                        match key.as_str() {
+                            "model" if !value.is_empty() => {
+                                apply_model_choice(ctx, handler, value);
+                            }
+                            "theme" if !value.is_empty() => {
+                                apply_theme_choice(ctx, handler, value);
+                            }
+                            "thinking" if matches!(value, "on" | "off") => {
+                                ctx.show_thinking = value == "on";
+                                persist_ui_key("show_thinking", value);
+                                handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
+                                handler.push_overlay(format!(
+                                    "[info] Thinking set to {value}"
+                                ));
+                            }
+                            _ => handler.push_overlay(
+                                "[error] Settable keys: model <name>, theme <name>, thinking on|off"
+                                    .to_string(),
+                            ),
+                        }
+                        let _ = ctx.save_session();
+                        return Ok(true);
+                    }
                     let path = clawedcode_core::config::default_config_path()
                         .map(|p| display_path(&p))
                         .unwrap_or_else(|| "(none)".to_string());
@@ -5786,6 +5817,34 @@ PR number: {args}"#
                     return Ok(true);
                 }
                 "/permissions" => {
+                    let arg = prompt
+                        .strip_prefix("/permissions")
+                        .map(str::trim)
+                        .unwrap_or_default();
+                    if !arg.is_empty() {
+                        // /permissions <rule> adds, /permissions -<rule> removes.
+                        let (remove, rule) = if let Some(rest) = arg.strip_prefix('-') {
+                            (true, rest.trim())
+                        } else {
+                            (false, arg)
+                        };
+                        if !rule.is_empty() {
+                            if let Ok(mut set) = always_allowed.lock() {
+                                if remove {
+                                    set.remove(rule);
+                                    handler
+                                        .push_overlay(format!("[info] Removed allow rule: {rule}"));
+                                } else {
+                                    set.insert(rule.to_string());
+                                    handler
+                                        .push_overlay(format!("[info] Added allow rule: {rule}"));
+                                }
+                                save_always_allowed(&ctx.session().cwd, &set);
+                            }
+                        }
+                        let _ = ctx.save_session();
+                        return Ok(true);
+                    }
                     let mut lines = vec![format!(
                         "Mode: {}",
                         permission_mode_label(ctx.permission_mode())
@@ -7004,6 +7063,46 @@ fn render_theme_picker(frame: &mut Frame, area: Rect, selected: usize) {
             area.height.saturating_sub(1),
         ),
     );
+}
+
+/// Write `key = "value"` (or `key = value` for bools) inside the `[ui]`
+/// section of config.toml, appending the section when absent.
+fn persist_ui_key(key: &str, value: &str) {
+    let Some(path) = clawedcode_core::config::default_config_path() else {
+        return;
+    };
+    let Ok(existing) = fs::read_to_string(&path) else {
+        return;
+    };
+    let rendered = if value == "on" || value == "off" {
+        format!("{key} = {}", value == "on")
+    } else {
+        format!("{key} = \"{value}\"")
+    };
+    let mut in_ui = false;
+    let mut found = false;
+    let updated: String = existing
+        .lines()
+        .map(|line| {
+            let t = line.trim_start();
+            if t.starts_with('[') {
+                in_ui = t.starts_with("[ui]");
+                return line.to_string();
+            }
+            if in_ui && t.starts_with(key) && t.contains('=') {
+                found = true;
+                return rendered.clone();
+            }
+            line.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let updated = if found {
+        updated
+    } else {
+        format!("{updated}\n[ui]\n{rendered}\n")
+    };
+    let _ = fs::write(&path, updated);
 }
 
 fn apply_theme_choice(ctx: &mut TuiContext, handler: &mut ReplHandler, theme: &str) {
