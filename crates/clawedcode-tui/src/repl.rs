@@ -5677,6 +5677,23 @@ PR number: {args}"#
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
+                "/theme" => {
+                    let arg = prompt
+                        .strip_prefix("/theme")
+                        .map(str::trim)
+                        .unwrap_or_default();
+                    if arg.is_empty() {
+                        let current = THEME_NAMES
+                            .iter()
+                            .position(|t| *t == ctx.theme_name())
+                            .unwrap_or(0);
+                        handler.theme_picker = Some(current);
+                    } else {
+                        apply_theme_choice(ctx, handler, arg);
+                    }
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
                 "/permissions" => {
                     let mut lines = vec![format!(
                         "Mode: {}",
