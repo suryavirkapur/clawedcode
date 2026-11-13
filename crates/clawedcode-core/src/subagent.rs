@@ -107,6 +107,12 @@ impl SubAgentRuntime {
         let mut session = runtime.start_session(self.cwd.clone());
         let output = runtime.submit(&mut session, &subagent.prompt);
         session.save(&self.sessions_dir)?;
+        crate::hooks::run_subagent_stop_hooks(
+            &crate::hooks::load_hooks(&session.cwd),
+            &session.id.to_string(),
+            &session.cwd,
+            &session.id.to_string(),
+        );
 
         Ok(SubAgentResult {
             child_session_id: session.id,
@@ -161,6 +167,12 @@ impl SubAgentRuntime {
         }
         let output = runtime.submit(&mut session, &subagent.prompt);
         session.save(&self.sessions_dir)?;
+        crate::hooks::run_subagent_stop_hooks(
+            &crate::hooks::load_hooks(&session.cwd),
+            &parent_session.id.to_string(),
+            &session.cwd,
+            &session.id.to_string(),
+        );
 
         Ok(SubAgentResult {
             child_session_id: session.id,
@@ -220,6 +232,12 @@ impl SubAgentRuntime {
                 let output = runtime.submit(&mut child_session, &subagent.prompt);
                 let summary = summarize_output(&output.response, output.tools_executed);
                 let _ = child_session.save(&sessions_dir);
+                crate::hooks::run_subagent_stop_hooks(
+                    &crate::hooks::load_hooks(&child_session.cwd),
+                    &child_session.id.to_string(),
+                    &child_session.cwd,
+                    &child_session.id.to_string(),
+                );
                 (summary, output.tools_executed)
             }));
 

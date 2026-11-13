@@ -963,6 +963,22 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
     maybe_mark_project_onboarding_complete(&ctx.session().cwd);
 
+    // SessionStart hooks: stdout becomes one-shot context prepended to the
+    // first submitted prompt, like the reference's processSessionStartHooks.
+    let start_context = clawedcode_core::hooks::run_session_start_hooks(
+        &clawedcode_core::hooks::load_hooks(&ctx.session().cwd),
+        &ctx.session().id.to_string(),
+        &ctx.session().cwd,
+        "startup",
+        &ctx.model_name(),
+    );
+    if !start_context.is_empty() {
+        ctx.set_pending_prompt_prefix(Some(format!(
+            "<session-start-hook-context>\n{}\n</session-start-hook-context>",
+            start_context.join("\n\n")
+        )));
+    }
+
     let mut input_buffer = String::new();
     let mut cursor_pos: usize = 0;
     let mut screen = ReplScreen::Main;
@@ -2949,6 +2965,14 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
             }
         }
     }
+
+    // SessionEnd hooks fire once for every exit path (quit, double ctrl+c/d).
+    clawedcode_core::hooks::run_session_end_hooks(
+        &clawedcode_core::hooks::load_hooks(&ctx.session().cwd),
+        &ctx.session().id.to_string(),
+        &ctx.session().cwd,
+        "exit",
+    );
 
     Ok(())
 }
@@ -5419,13 +5443,22 @@ fn spawn_bash_worker(session: Session, command: String) -> ActiveTurn {
 }
 
 fn spawn_turn_worker(
-    ctx: &TuiContext,
+    ctx: &mut TuiContext,
     visible_prompt: String,
     execution_prompt: Option<String>,
     always_allowed: Arc<Mutex<std::collections::HashSet<String>>>,
 ) -> ActiveTurn {
     ctx.clear_interrupt();
     let mut runtime = ctx.replacement_runtime();
+    // SessionStart hook context (and any other one-shot prefix) rides along
+    // on the next submitted prompt.
+    let execution_prompt = match ctx.take_pending_prompt_prefix() {
+        Some(prefix) => Some(match execution_prompt {
+            Some(existing) => format!("{prefix}\n\n{existing}"),
+            None => format!("{prefix}\n\n{visible_prompt}"),
+        }),
+        None => execution_prompt,
+    };
     let interrupt_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     runtime.set_interrupt_flag(interrupt_flag.clone());
     let external_turn_executor = ctx.external_turn_executor();
@@ -5777,6 +5810,11 @@ fn to_tui_event(event: &ApiEvent) -> Option<TuiEvent> {
 /// plus the model's summary of the conversation — mirrors Claude Code's
 /// `/compact`, where the summary becomes the new starting context.
 fn compact_session(session: &mut Session) {
+    clawedcode_core::hooks::run_pre_compact_hooks(
+        &clawedcode_core::hooks::load_hooks(&session.cwd),
+        &session.id.to_string(),
+        &session.cwd,
+    );
     let summary = session
         .messages
         .iter()
@@ -5824,8 +5862,36 @@ fn handle_slash_command(
                     return Ok(true);
                 }
                 "/clear" => {
+                    // Reference /clear ends the session and starts a fresh
+                    // one — SessionEnd(clear) then SessionStart(clear).
+                    let hook_configs = clawedcode_core::hooks::load_hooks(&ctx.session().cwd);
+                    clawedcode_core::hooks::run_session_end_hooks(
+                        &hook_configs,
+                        &ctx.session().id.to_string(),
+                        &ctx.session().cwd,
+                        "clear",
+                    );
+                    let fresh = ctx.runtime.start_session_with_mode(
+                        ctx.session().cwd.clone(),
+                        SessionMode::Interactive,
+                    );
+                    ctx.replace_session(fresh);
+                    let context = clawedcode_core::hooks::run_session_start_hooks(
+                        &hook_configs,
+                        &ctx.session().id.to_string(),
+                        &ctx.session().cwd,
+                        "clear",
+                        &ctx.model_name(),
+                    );
+                    if !context.is_empty() {
+                        ctx.set_pending_prompt_prefix(Some(format!(
+                            "<session-start-hook-context>\n{}\n</session-start-hook-context>",
+                            context.join("\n\n")
+                        )));
+                    }
                     handler.overlay_rows.clear();
                     handler.clear_panel();
+                    handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
@@ -6513,9 +6579,7 @@ PR number: {args}"#
                         .flat_map(|m| m.content_blocks.iter())
                         .filter_map(|b| match b {
                             clawedcode_core::content::ContentBlock::ToolUse {
-                                name,
-                                input,
-                                ..
+                                name, input, ..
                             } if name == "read_file" => input
                                 .get("path")
                                 .and_then(|p| p.as_str())
@@ -8832,6 +8896,19 @@ fn apply_resume_choice(ctx: &mut TuiContext, handler: &mut ReplHandler, prefix: 
             let short = short_session_id(&source.id.to_string()).to_string();
             ctx.replace_session(source);
             let _ = ctx.save_session();
+            let context = clawedcode_core::hooks::run_session_start_hooks(
+                &clawedcode_core::hooks::load_hooks(&ctx.session().cwd),
+                &ctx.session().id.to_string(),
+                &ctx.session().cwd,
+                "resume",
+                &ctx.model_name(),
+            );
+            if !context.is_empty() {
+                ctx.set_pending_prompt_prefix(Some(format!(
+                    "<session-start-hook-context>\n{}\n</session-start-hook-context>",
+                    context.join("\n\n")
+                )));
+            }
             handler.overlay_rows.clear();
             handler.clear_panel();
             handler.push_overlay(format!("[info] Resumed {short}"));

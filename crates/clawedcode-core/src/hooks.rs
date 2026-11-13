@@ -328,6 +328,155 @@ pub fn run_post_tool_hooks(
     }
 }
 
+fn session_hook_input(
+    event: &str,
+    session_id: &str,
+    cwd: &Path,
+    extra: serde_json::Value,
+) -> String {
+    let mut payload = serde_json::json!({
+        "hook_event_name": event,
+        "session_id": session_id,
+        "cwd": cwd.display().to_string(),
+    });
+    if let (Some(base), serde_json::Value::Object(extra_obj)) = (payload.as_object_mut(), extra) {
+        base.extend(extra_obj);
+    }
+    payload.to_string()
+}
+
+/// Run `SessionStart` hooks — stdout becomes additional context for the
+/// session, like the reference's `processSessionStartHooks`.
+pub fn run_session_start_hooks(
+    config: &HooksConfig,
+    session_id: &str,
+    cwd: &Path,
+    source: &str,
+    model: &str,
+) -> Vec<String> {
+    if config.disabled {
+        return Vec::new();
+    }
+    let stdin = session_hook_input(
+        "SessionStart",
+        session_id,
+        cwd,
+        serde_json::json!({ "source": source, "model": model }),
+    );
+    let mut context = Vec::new();
+    for hook in hooks_for_event(config, "SessionStart") {
+        let Ok(out) = run_hook_command(&hook.command, cwd, &stdin) else {
+            continue;
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !stdout.is_empty() {
+            context.push(stdout);
+        }
+    }
+    context
+}
+
+/// Run `SessionEnd` hooks — fire-and-forget (clear, resume-away, exit).
+pub fn run_session_end_hooks(config: &HooksConfig, session_id: &str, cwd: &Path, reason: &str) {
+    if config.disabled {
+        return;
+    }
+    let stdin = session_hook_input(
+        "SessionEnd",
+        session_id,
+        cwd,
+        serde_json::json!({ "reason": reason }),
+    );
+    for hook in hooks_for_event(config, "SessionEnd") {
+        let _ = run_hook_command(&hook.command, cwd, &stdin);
+    }
+}
+
+/// Outcome of `Stop` hooks, which run when the assistant would finish a
+/// turn. A blocking hook forces the turn to continue with the reason fed
+/// back to the model.
+pub enum StopHookOutcome {
+    Continue,
+    Block(String),
+}
+
+/// Run `Stop` hooks. Exit 2 blocks stopping; stderr is the reason shown
+/// to the model (reference `runStopHooks` semantics).
+pub fn run_stop_hooks(
+    config: &HooksConfig,
+    session_id: &str,
+    cwd: &Path,
+    stop_hook_active: bool,
+) -> StopHookOutcome {
+    if config.disabled {
+        return StopHookOutcome::Continue;
+    }
+    let stdin = session_hook_input(
+        "Stop",
+        session_id,
+        cwd,
+        serde_json::json!({ "stop_hook_active": stop_hook_active }),
+    );
+    for hook in hooks_for_event(config, "Stop") {
+        let Ok(out) = run_hook_command(&hook.command, cwd, &stdin) else {
+            continue;
+        };
+        if out.status.code() == Some(2) {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            return StopHookOutcome::Block(if stderr.is_empty() {
+                format!("blocked by Stop hook `{}`", hook.command)
+            } else {
+                stderr
+            });
+        }
+    }
+    StopHookOutcome::Continue
+}
+
+/// Run `SubagentStop` hooks when a child agent finishes — fire-and-forget.
+pub fn run_subagent_stop_hooks(config: &HooksConfig, session_id: &str, cwd: &Path, agent_id: &str) {
+    if config.disabled {
+        return;
+    }
+    let stdin = session_hook_input(
+        "SubagentStop",
+        session_id,
+        cwd,
+        serde_json::json!({ "agent_id": agent_id }),
+    );
+    for hook in hooks_for_event(config, "SubagentStop") {
+        let _ = run_hook_command(&hook.command, cwd, &stdin);
+    }
+}
+
+/// Run `Notification` hooks — fired when the UI would notify the user
+/// (permission requests, idle). Fire-and-forget.
+pub fn run_notification_hooks(config: &HooksConfig, session_id: &str, cwd: &Path, message: &str) {
+    if config.disabled {
+        return;
+    }
+    let stdin = session_hook_input(
+        "Notification",
+        session_id,
+        cwd,
+        serde_json::json!({ "message": message }),
+    );
+    for hook in hooks_for_event(config, "Notification") {
+        let _ = run_hook_command(&hook.command, cwd, &stdin);
+    }
+}
+
+/// Run `PreCompact` hooks before session compaction — fire-and-forget.
+pub fn run_pre_compact_hooks(config: &HooksConfig, session_id: &str, cwd: &Path) {
+    if config.disabled {
+        return;
+    }
+    let stdin = session_hook_input("PreCompact", session_id, cwd, serde_json::json!({}));
+    for hook in hooks_for_event(config, "PreCompact") {
+        let _ = run_hook_command(&hook.command, cwd, &stdin);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

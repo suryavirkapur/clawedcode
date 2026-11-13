@@ -211,6 +211,7 @@ async fn execute_run(
     run_mode: crate::bootstrap::RunMode,
 ) -> Result<()> {
     let data_dir = cli.data_dir.clone();
+    let model = config.model.clone();
     let runtime = Runtime::with_mode(
         config,
         resolve_prompt(run_mode.system_prompt.as_deref()),
@@ -219,6 +220,24 @@ async fn execute_run(
     );
     let mut session = runtime.start_session_with_mode(cli.cwd, SessionMode::Headless);
     let approval_fn = build_approval_fn(run_mode.yes);
+    // SessionStart hooks: stdout becomes context prepended to the prompt.
+    let start_context = clawedcode_core::hooks::run_session_start_hooks(
+        &clawedcode_core::hooks::load_hooks(&session.cwd),
+        &session.id.to_string(),
+        &session.cwd,
+        "startup",
+        &model,
+    );
+    let prompt = if start_context.is_empty() {
+        run_mode.prompt.clone()
+    } else {
+        format!(
+            "<session-start-hook-context>\n{}\n</session-start-hook-context>\n\n{}",
+            start_context.join("\n\n"),
+            run_mode.prompt
+        )
+    };
+    let run_mode = crate::bootstrap::RunMode { prompt, ..run_mode };
 
     if run_mode.json {
         if run_mode.stream_json {
@@ -258,6 +277,12 @@ async fn execute_run(
             output.tool_count, output.tools_executed
         );
     }
+    clawedcode_core::hooks::run_session_end_hooks(
+        &clawedcode_core::hooks::load_hooks(&session.cwd),
+        &session.id.to_string(),
+        &session.cwd,
+        "exit",
+    );
     Ok(())
 }
 
@@ -661,6 +686,7 @@ async fn execute_headless(
     };
 
     let data_dir = cli.data_dir.clone();
+    let model = config.model.clone();
     let runtime = Runtime::with_mode(
         config,
         resolve_prompt(system_prompt.as_deref()),
@@ -669,6 +695,23 @@ async fn execute_headless(
     );
     let mut session = runtime.start_session_with_mode(cli.cwd, SessionMode::Headless);
     let approval_fn = build_approval_fn(yes);
+    // SessionStart hooks: stdout becomes context prepended to the prompt.
+    let start_context = clawedcode_core::hooks::run_session_start_hooks(
+        &clawedcode_core::hooks::load_hooks(&session.cwd),
+        &session.id.to_string(),
+        &session.cwd,
+        "startup",
+        &model,
+    );
+    let prompt = if start_context.is_empty() {
+        prompt
+    } else {
+        format!(
+            "<session-start-hook-context>\n{}\n</session-start-hook-context>\n\n{}",
+            start_context.join("\n\n"),
+            prompt
+        )
+    };
 
     if json {
         let output = runtime.submit_with_approval(&mut session, &prompt, &*approval_fn);
@@ -708,6 +751,12 @@ async fn execute_headless(
             })?;
         }
     }
+    clawedcode_core::hooks::run_session_end_hooks(
+        &clawedcode_core::hooks::load_hooks(&session.cwd),
+        &session.id.to_string(),
+        &session.cwd,
+        "exit",
+    );
     Ok(())
 }
 

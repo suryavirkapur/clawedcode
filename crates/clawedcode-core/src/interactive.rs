@@ -51,6 +51,9 @@ pub struct TuiContext {
     external_turn_executor: Option<Arc<dyn ExternalTurnExecutor>>,
     startup_prompt: Option<String>,
     transport_label: Option<String>,
+    /// Extra context prepended to the next submitted prompt once — used by
+    /// `SessionStart` hooks to inject context like the reference.
+    pending_prompt_prefix: Option<String>,
     last_compatibility_refresh: Instant,
 }
 
@@ -160,6 +163,7 @@ impl TuiContext {
             external_turn_executor,
             startup_prompt: None,
             transport_label: None,
+            pending_prompt_prefix: None,
             last_compatibility_refresh: Instant::now(),
         }
     }
@@ -170,6 +174,14 @@ impl TuiContext {
 
     pub fn take_startup_prompt(&mut self) -> Option<String> {
         self.startup_prompt.take()
+    }
+
+    pub fn set_pending_prompt_prefix(&mut self, prefix: Option<String>) {
+        self.pending_prompt_prefix = prefix;
+    }
+
+    pub fn take_pending_prompt_prefix(&mut self) -> Option<String> {
+        self.pending_prompt_prefix.take()
     }
 
     pub fn set_transport_label(&mut self, label: Option<String>) {

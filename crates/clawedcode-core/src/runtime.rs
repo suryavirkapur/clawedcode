@@ -955,6 +955,7 @@ impl Runtime {
             _ => {}
         }
 
+        let mut stop_hook_used = false;
         for _turn in 0..self.max_turns() {
             if self.interrupted() {
                 break;
@@ -1001,7 +1002,22 @@ impl Runtime {
             }
 
             if !turn_result.has_tool_use {
-                break;
+                // Stop hooks: a blocking hook feeds its reason back to the
+                // model as a user message and the turn continues.
+                match crate::hooks::run_stop_hooks(
+                    &hook_configs,
+                    &session.id.to_string(),
+                    &session.cwd,
+                    stop_hook_used,
+                ) {
+                    crate::hooks::StopHookOutcome::Block(reason) => {
+                        stop_hook_used = true;
+                        session.push(Role::User, &reason);
+                        effective_override = None;
+                        continue;
+                    }
+                    crate::hooks::StopHookOutcome::Continue => break,
+                }
             }
         }
 
@@ -1428,6 +1444,12 @@ impl Runtime {
                 ),
             ),
             PermissionDecision::Ask => {
+                crate::hooks::run_notification_hooks(
+                    &crate::hooks::load_hooks(&session.cwd),
+                    &session.id.to_string(),
+                    &session.cwd,
+                    &format!("Claude needs your permission to use {tool_name}"),
+                );
                 let outcome = approval_fn(tool_use_id, tool_name, &input);
                 if !outcome.approved {
                     let reason = match outcome.feedback {
