@@ -63,10 +63,12 @@ impl Tool for McpToolInstance {
             Ok(content) => ToolResult {
                 content,
                 is_error: false,
+                new_cwd: None,
             },
             Err(content) => ToolResult {
                 content,
                 is_error: true,
+                new_cwd: None,
             },
         }
     }
@@ -103,6 +105,7 @@ impl Tool for ListMcpResourcesToolInstance {
                             "Server \"{server_name}\" not found or does not support resources"
                         ),
                         is_error: true,
+                        new_cwd: None,
                     };
                 }
             }
@@ -116,6 +119,7 @@ impl Tool for ListMcpResourcesToolInstance {
             ToolResult {
                 content: "No resources found. MCP servers may still provide tools even if they have no resources.".to_string(),
                 is_error: false,
+                new_cwd: None,
             }
         } else {
             ToolResult {
@@ -124,6 +128,7 @@ impl Tool for ListMcpResourcesToolInstance {
                 }))
                 .unwrap_or_else(|_| "{\"resources\":[]}".to_string()),
                 is_error: false,
+                new_cwd: None,
             }
         }
     }
@@ -151,12 +156,14 @@ impl Tool for ReadMcpResourceToolInstance {
             return ToolResult {
                 content: "Missing 'server' parameter".to_string(),
                 is_error: true,
+                new_cwd: None,
             };
         };
         let Some(uri) = input.get("uri").and_then(|value| value.as_str()) else {
             return ToolResult {
                 content: "Missing 'uri' parameter".to_string(),
                 is_error: true,
+                new_cwd: None,
             };
         };
 
@@ -164,6 +171,7 @@ impl Tool for ReadMcpResourceToolInstance {
             return ToolResult {
                 content: format!("Server \"{server_name}\" not found"),
                 is_error: true,
+                new_cwd: None,
             };
         };
 
@@ -179,11 +187,13 @@ impl Tool for ReadMcpResourceToolInstance {
                     }))
                     .unwrap_or_else(|_| "{\"contents\":[]}".to_string()),
                     is_error: false,
+                    new_cwd: None,
                 }
             }
             Err(content) => ToolResult {
                 content,
                 is_error: true,
+                new_cwd: None,
             },
         }
     }
@@ -2451,6 +2461,7 @@ impl Runtime {
                 Some(ToolResult {
                     content: err,
                     is_error: true,
+                    new_cwd: None,
                 })
             })
         {
@@ -2543,6 +2554,24 @@ impl Runtime {
             }
         }
         let result = tool.execute(input.clone(), &session.cwd);
+        // A `cd` inside a shell command moves the session cwd like the
+        // reference's persistent shell — CwdChanged hooks fire on the shift.
+        if let Some(new_cwd) = result.new_cwd.clone() {
+            let abs_session = std::path::absolute(&session.cwd).unwrap_or_else(|_| session.cwd.clone());
+            if new_cwd != abs_session {
+                crate::hooks::run_simple_event_hooks(
+                    &crate::hooks::load_hooks(&session.cwd),
+                    "CwdChanged",
+                    &session.id.to_string(),
+                    &new_cwd,
+                    serde_json::json!({
+                        "old_cwd": abs_session.to_string_lossy(),
+                        "new_cwd": new_cwd.to_string_lossy(),
+                    }),
+                );
+                session.cwd = new_cwd;
+            }
+        }
         // FileChanged hooks fire on successful file edits like the reference.
         if tool_name == "apply_patch" && !result.is_error {
             if let Some(patch) = input.get("patch").and_then(|v| v.as_str()) {

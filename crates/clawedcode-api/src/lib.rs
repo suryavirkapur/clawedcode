@@ -111,6 +111,7 @@ pub enum ProviderContentBlock {
         content: String,
         #[serde(default)]
         is_error: bool,
+
     },
     Thinking {
         thinking: String,

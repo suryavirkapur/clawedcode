@@ -437,6 +437,7 @@ fn execute_todo_write(store: TaskStore, input: Value) -> Result<ToolResult, Stri
         return Ok(ToolResult {
             content: "Todos have been modified successfully.".to_string(),
             is_error: false,
+            new_cwd: None,
         });
     }
 
@@ -496,6 +497,7 @@ fn execute_todo_write(store: TaskStore, input: Value) -> Result<ToolResult, Stri
     Ok(ToolResult {
         content: "Todos have been modified successfully. Ensure that you continue to use the todo list to track your progress.".to_string(),
         is_error: false,
+        new_cwd: None,
     })
 }
 
@@ -533,6 +535,7 @@ fn execute_task_create(store: TaskStore, input: Value) -> Result<ToolResult, Str
     Ok(ToolResult {
         content: format!("Task #{} created successfully: {}", task.id, task.subject),
         is_error: false,
+        new_cwd: None,
     })
 }
 
@@ -542,6 +545,7 @@ fn execute_task_list(store: TaskStore) -> Result<ToolResult, String> {
         return Ok(ToolResult {
             content: "No tasks found".to_string(),
             is_error: false,
+            new_cwd: None,
         });
     }
 
@@ -584,6 +588,7 @@ fn execute_task_list(store: TaskStore) -> Result<ToolResult, String> {
     Ok(ToolResult {
         content: lines.join("\n"),
         is_error: false,
+        new_cwd: None,
     })
 }
 
@@ -595,6 +600,7 @@ fn execute_task_get(store: TaskStore, input: Value) -> Result<ToolResult, String
         return Ok(ToolResult {
             content: "Task not found".to_string(),
             is_error: false,
+            new_cwd: None,
         });
     };
 
@@ -626,6 +632,7 @@ fn execute_task_get(store: TaskStore, input: Value) -> Result<ToolResult, String
     Ok(ToolResult {
         content: lines.join("\n"),
         is_error: false,
+        new_cwd: None,
     })
 }
 
@@ -687,6 +694,7 @@ fn execute_task_update(store: TaskStore, input: Value) -> Result<ToolResult, Str
                 .error
                 .unwrap_or_else(|| format!("Task #{task_id} not found")),
             is_error: false,
+            new_cwd: None,
         });
     }
     Ok(ToolResult {
@@ -696,6 +704,7 @@ fn execute_task_update(store: TaskStore, input: Value) -> Result<ToolResult, Str
             outcome.updated_fields.join(", ")
         ),
         is_error: false,
+        new_cwd: None,
     })
 }
 
@@ -703,6 +712,7 @@ fn missing_param(name: &str) -> ToolResult {
     ToolResult {
         content: format!("Missing '{name}' parameter"),
         is_error: true,
+        new_cwd: None,
     }
 }
 

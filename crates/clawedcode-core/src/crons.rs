@@ -197,12 +197,14 @@ pub fn execute_cron_tool(
                 return Ok(Some(ToolResult {
                     content: "Missing 'cron' parameter".into(),
                     is_error: true,
+                    new_cwd: None,
                 }));
             };
             let Some(prompt) = input.get("prompt").and_then(Value::as_str) else {
                 return Ok(Some(ToolResult {
                     content: "Missing 'prompt' parameter".into(),
                     is_error: true,
+                    new_cwd: None,
                 }));
             };
             if expr.split_whitespace().count() != 5 {
@@ -211,6 +213,7 @@ pub fn execute_cron_tool(
                         "Invalid cron expression '{expr}'. Expected 5 fields: M H DoM Mon DoW."
                     ),
                     is_error: true,
+                    new_cwd: None,
                 }));
             }
             let Some(next) = next_fire_ms(expr, now_ms()) else {
@@ -219,6 +222,7 @@ pub fn execute_cron_tool(
                         "Cron expression '{expr}' does not match any calendar date in the next year."
                     ),
                     is_error: true,
+                    new_cwd: None,
                 }));
             };
             let record = CronRecord {
@@ -243,6 +247,7 @@ pub fn execute_cron_tool(
                     record.id, record.cron, record.next_fire_ms
                 ),
                 is_error: false,
+                new_cwd: None,
             }))
         }
         "CronList" => {
@@ -267,6 +272,7 @@ pub fn execute_cron_tool(
                     lines.join("\n")
                 },
                 is_error: false,
+                new_cwd: None,
             }))
         }
         "CronDelete" => {
@@ -274,6 +280,7 @@ pub fn execute_cron_tool(
                 return Ok(Some(ToolResult {
                     content: "Missing 'id' parameter".into(),
                     is_error: true,
+                    new_cwd: None,
                 }));
             };
             Ok(Some(ToolResult {
@@ -283,6 +290,7 @@ pub fn execute_cron_tool(
                     format!("No cron with id {id}")
                 },
                 is_error: false,
+                new_cwd: None,
             }))
         }
         _ => Ok(None),

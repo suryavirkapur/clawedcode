@@ -12,6 +12,10 @@ pub const LEGACY_AGENT_TOOL_NAME: &str = "Task";
 pub struct ToolResult {
     pub content: String,
     pub is_error: bool,
+    /// Set when the tool changed the session working directory (e.g. `cd` in
+    /// a shell command, like the reference's persistent shell cwd tracking).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_cwd: Option<std::path::PathBuf>,
 }
 
 /// A tool that can be invoked by the runtime.
@@ -105,6 +109,7 @@ impl Tool for ReadFile {
                 return ToolResult {
                     content: "Missing 'path' parameter".into(),
                     is_error: true,
+                    new_cwd: None,
                 };
             }
         };
@@ -115,6 +120,7 @@ impl Tool for ReadFile {
                 return ToolResult {
                     content: e,
                     is_error: true,
+                    new_cwd: None,
                 };
             }
         };
@@ -126,6 +132,7 @@ impl Tool for ReadFile {
                 return ToolResult {
                     content: format!("Cannot resolve cwd: {e}"),
                     is_error: true,
+                    new_cwd: None,
                 };
             }
         };
@@ -135,6 +142,7 @@ impl Tool for ReadFile {
                 return ToolResult {
                     content: format!("Cannot resolve path: {e}"),
                     is_error: true,
+                    new_cwd: None,
                 };
             }
         };
@@ -142,6 +150,7 @@ impl Tool for ReadFile {
             return ToolResult {
                 content: "Path escapes working directory".into(),
                 is_error: true,
+                new_cwd: None,
             };
         }
 
@@ -151,6 +160,7 @@ impl Tool for ReadFile {
                 return ToolResult {
                     content: format!("Cannot read file: {e}"),
                     is_error: true,
+                    new_cwd: None,
                 };
             }
         };
@@ -163,6 +173,7 @@ impl Tool for ReadFile {
                     READ_FILE_MAX_BYTES
                 ),
                 is_error: true,
+                new_cwd: None,
             };
         }
 
@@ -170,10 +181,12 @@ impl Tool for ReadFile {
             Ok(contents) => ToolResult {
                 content: contents,
                 is_error: false,
+                new_cwd: None,
             },
             Err(e) => ToolResult {
                 content: format!("Read error: {e}"),
                 is_error: true,
+                new_cwd: None,
             },
         }
     }
@@ -244,11 +257,23 @@ impl Tool for Shell {
                 return ToolResult {
                     content: "Missing 'command' parameter".into(),
                     is_error: true,
+                    new_cwd: None,
                 };
             }
         };
 
-        let spec = shell_command_spec(command, bash_is_available());
+        // Wrap with an EXIT trap that reports the shell's final cwd — a `cd`
+        // inside the command persists like the reference's persistent shell.
+        let wrapped = if cfg!(windows) {
+            command.to_string()
+        } else {
+            let trap = format!(
+                "trap 'printf \"\\n{}%s\\n\" \"$PWD\"' EXIT",
+                CWD_SENTINEL
+            );
+            format!("{}\n{}", trap, command)
+        };
+        let spec = shell_command_spec(&wrapped, bash_is_available());
         let output = build_shell_command(&spec, cwd).output();
 
         match output {
@@ -256,6 +281,8 @@ impl Tool for Shell {
                 let mut content = String::new();
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let stderr = String::from_utf8_lossy(&out.stderr);
+
+                let (stdout, new_cwd) = extract_cwd_sentinel(&stdout, cwd);
 
                 if !stdout.is_empty() {
                     content.push_str(&truncate(&stdout, SHELL_MAX_OUTPUT_BYTES));
@@ -273,14 +300,42 @@ impl Tool for Shell {
                 ToolResult {
                     content,
                     is_error: !out.status.success(),
+                    new_cwd,
                 }
             }
             Err(e) => ToolResult {
                 content: format!("Command execution failed: {e}"),
                 is_error: true,
+                new_cwd: None,
             },
         }
     }
+}
+
+const CWD_SENTINEL: &str = "__CLAWEDCODE_CWD__";
+
+/// Split the trailing cwd sentinel off captured stdout. Returns the output
+/// without the sentinel and the new cwd when it differs from `cwd`.
+fn extract_cwd_sentinel<'a>(stdout: &'a str, cwd: &Path) -> (std::borrow::Cow<'a, str>, Option<std::path::PathBuf>) {
+    let Some(pos) = stdout.rfind(CWD_SENTINEL) else {
+        return (std::borrow::Cow::Borrowed(stdout), None);
+    };
+    let after = &stdout[pos + CWD_SENTINEL.len()..];
+    let path_str = after.trim();
+    if path_str.is_empty() || path_str.contains('\n') {
+        return (std::borrow::Cow::Borrowed(stdout), None);
+    }
+    // Trim the sentinel and its preceding newline from the output.
+    let mut end = pos;
+    if end > 0 && stdout.as_bytes()[end - 1] == b'\n' {
+        end -= 1;
+    }
+    let new = std::path::PathBuf::from(path_str);
+    let changed = new != cwd;
+    (
+        std::borrow::Cow::Owned(stdout[..end].to_string()),
+        changed.then_some(new),
+    )
 }
 
 fn truncate(s: &str, max_bytes: usize) -> String {
@@ -323,6 +378,7 @@ impl Tool for ApplyPatch {
                 return ToolResult {
                     content: "Missing 'patch' parameter".into(),
                     is_error: true,
+                    new_cwd: None,
                 };
             }
         };
@@ -331,10 +387,12 @@ impl Tool for ApplyPatch {
             Ok(summary) => ToolResult {
                 content: summary,
                 is_error: false,
+                new_cwd: None,
             },
             Err(e) => ToolResult {
                 content: format!("apply_patch failed: {e}"),
                 is_error: true,
+                new_cwd: None,
             },
         }
     }
@@ -364,6 +422,7 @@ impl Tool for AskUserQuestion {
         ToolResult {
             content: "User declined to answer questions".into(),
             is_error: false,
+            new_cwd: None,
         }
     }
 }
@@ -1246,6 +1305,7 @@ impl Tool for NotebookEdit {
             return ToolResult {
                 content: "Missing 'notebook_path' parameter".into(),
                 is_error: true,
+                new_cwd: None,
             };
         };
         let path = match resolve_under_cwd(cwd, path_str) {
@@ -1254,6 +1314,7 @@ impl Tool for NotebookEdit {
                 return ToolResult {
                     content: err,
                     is_error: true,
+                    new_cwd: None,
                 };
             }
         };
@@ -1272,12 +1333,14 @@ impl Tool for NotebookEdit {
             return ToolResult {
                 content: format!("Failed to read {}", path.display()),
                 is_error: true,
+                new_cwd: None,
             };
         };
         let Ok(mut nb) = serde_json::from_str::<serde_json::Value>(&raw) else {
             return ToolResult {
                 content: "Invalid notebook JSON".into(),
                 is_error: true,
+                new_cwd: None,
             };
         };
         let language = nb
@@ -1291,6 +1354,7 @@ impl Tool for NotebookEdit {
             return ToolResult {
                 content: "Notebook has no cells".into(),
                 is_error: true,
+                new_cwd: None,
             };
         };
         // Cells can be addressed by their `id` field or a numeric index.
@@ -1307,6 +1371,7 @@ impl Tool for NotebookEdit {
                     return ToolResult {
                         content: "cell_type is required when edit_mode=insert".into(),
                         is_error: true,
+                        new_cwd: None,
                     };
                 };
                 let at = index.map(|i| i + 1).unwrap_or(0);
@@ -1328,6 +1393,7 @@ impl Tool for NotebookEdit {
                     return ToolResult {
                         content: "Cell not found for delete".into(),
                         is_error: true,
+                        new_cwd: None,
                     };
                 };
                 cells.remove(i);
@@ -1338,6 +1404,7 @@ impl Tool for NotebookEdit {
                     return ToolResult {
                         content: "Cell not found — provide cell_id".into(),
                         is_error: true,
+                        new_cwd: None,
                     };
                 };
                 let cell = &mut cells[i];
@@ -1357,10 +1424,12 @@ impl Tool for NotebookEdit {
                 Ok(()) => ToolResult {
                     content: msg,
                     is_error: false,
+                    new_cwd: None,
                 },
                 Err(e) => ToolResult {
                     content: format!("Failed to write notebook: {e}"),
                     is_error: true,
+                    new_cwd: None,
                 },
             },
             Err(res) => res,
@@ -1443,6 +1512,7 @@ impl Tool for Glob {
             return ToolResult {
                 content: "Missing 'pattern' parameter".into(),
                 is_error: true,
+                new_cwd: None,
             };
         };
         let base = input
@@ -1477,6 +1547,7 @@ impl Tool for Glob {
                 matches.join("\n")
             },
             is_error: false,
+            new_cwd: None,
         }
     }
 }
@@ -1496,6 +1567,7 @@ impl Tool for Grep {
             return ToolResult {
                 content: "Missing 'pattern' parameter".into(),
                 is_error: true,
+                new_cwd: None,
             };
         };
         let base = input
@@ -1522,11 +1594,13 @@ impl Tool for Grep {
                         text
                     },
                     is_error: false,
+                    new_cwd: None,
                 }
             }
             Err(_) => ToolResult {
                 content: "grep not available".into(),
                 is_error: true,
+                new_cwd: None,
             },
         }
     }
