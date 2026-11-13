@@ -744,6 +744,13 @@ mod tests {
 
     #[test]
     fn load_and_match_hooks() {
+        let _guard = crate::test_support::env_lock();
+        let fake_home = std::env::temp_dir().join("clawed_hooks_home");
+        std::fs::create_dir_all(&fake_home).unwrap();
+        unsafe {
+            std::env::set_var("HOME", &fake_home);
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+        }
         let dir = std::env::temp_dir().join("clawed_hooks_test");
         std::fs::create_dir_all(dir.join(".claude")).unwrap();
         std::fs::write(

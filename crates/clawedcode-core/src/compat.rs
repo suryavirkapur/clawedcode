@@ -1395,6 +1395,15 @@ Look for regressions first.
 
     #[test]
     fn discover_mcp_servers_ancestor_precedence() {
+        let _guard = crate::test_support::env_lock();
+        let fake_home = std::env::temp_dir().join("clawed_mcp_home_ancestor_precedence");
+        std::fs::create_dir_all(&fake_home).unwrap();
+        unsafe {
+            std::env::set_var("HOME", &fake_home);
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+            std::env::remove_var("CLAWEDCODE_MCP_CONFIG");
+            std::env::remove_var("CLAWEDCODE_MCP_CONFIG_STRICT");
+        }
         let root = temp_dir("mcp_ancestor");
         let level1 = root.join("level1");
         let level2 = level1.join("level2");
@@ -1448,6 +1457,15 @@ Look for regressions first.
 
     #[test]
     fn discover_mcp_servers_settings_base() {
+        let _guard = crate::test_support::env_lock();
+        let fake_home = std::env::temp_dir().join("clawed_mcp_home_settings_base");
+        std::fs::create_dir_all(&fake_home).unwrap();
+        unsafe {
+            std::env::set_var("HOME", &fake_home);
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+            std::env::remove_var("CLAWEDCODE_MCP_CONFIG");
+            std::env::remove_var("CLAWEDCODE_MCP_CONFIG_STRICT");
+        }
         let root = temp_dir("mcp_settings");
         let project = root.join("project");
         fs::create_dir_all(&project).unwrap();
@@ -1470,6 +1488,15 @@ Look for regressions first.
 
     #[test]
     fn discover_mcp_servers_cwd_overrides_ancestor() {
+        let _guard = crate::test_support::env_lock();
+        let fake_home = std::env::temp_dir().join("clawed_mcp_home_cwd_overrides_ancestor");
+        std::fs::create_dir_all(&fake_home).unwrap();
+        unsafe {
+            std::env::set_var("HOME", &fake_home);
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+            std::env::remove_var("CLAWEDCODE_MCP_CONFIG");
+            std::env::remove_var("CLAWEDCODE_MCP_CONFIG_STRICT");
+        }
         let root = temp_dir("mcp_override");
         let parent = root.join("parent");
         let child = parent.join("child");
