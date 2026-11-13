@@ -3223,7 +3223,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
         &clawedcode_core::hooks::load_hooks(&ctx.session().cwd),
         &ctx.session().id.to_string(),
         &ctx.session().cwd,
-        "exit",
+        "prompt_input_exit",
     );
 
     Ok(())
@@ -9568,6 +9568,13 @@ fn apply_resume_choice(ctx: &mut TuiContext, handler: &mut ReplHandler, prefix: 
     match resolve_saved_session(ctx, prefix) {
         Ok(source) => {
             let short = short_session_id(&source.id.to_string()).to_string();
+            // The old session ends with reason "resume" like the reference.
+            clawedcode_core::hooks::run_session_end_hooks(
+                &clawedcode_core::hooks::load_hooks(&ctx.session().cwd),
+                &ctx.session().id.to_string(),
+                &ctx.session().cwd,
+                "resume",
+            );
             ctx.replace_session(source);
             let _ = ctx.save_session();
             let context = clawedcode_core::hooks::run_session_start_hooks(

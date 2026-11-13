@@ -1675,7 +1675,7 @@ async fn execute_run(
         &clawedcode_core::hooks::load_hooks(&session.cwd),
         &session.id.to_string(),
         &session.cwd,
-        "exit",
+        "other",
     );
     Ok(())
 }
@@ -2388,7 +2388,7 @@ async fn execute_headless(
         &clawedcode_core::hooks::load_hooks(&session.cwd),
         &session.id.to_string(),
         &session.cwd,
-        "exit",
+        "other",
     );
     Ok(())
 }
