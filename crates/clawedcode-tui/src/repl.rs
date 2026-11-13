@@ -6238,7 +6238,7 @@ fn execute_skill_command(
         .strip_prefix(&skill.slash_command)
         .map(str::trim)
         .unwrap_or_default();
-    let execution_prompt = build_skill_execution_prompt(&skill, args);
+    let execution_prompt = build_skill_execution_prompt(&skill, args, &ctx.session().cwd);
     handler.push_overlay(format!("[info] Executing skill: {}", skill.slash_command));
     handler.begin_live_turn(visible_prompt.to_string());
     *active_turn = Some(spawn_turn_worker(
@@ -6929,8 +6929,14 @@ fn find_skill_command(ctx: &TuiContext, command: &str) -> Option<SkillDescriptor
         .cloned()
 }
 
-fn build_skill_execution_prompt(skill: &SkillDescriptor, args: &str) -> String {
+fn build_skill_execution_prompt(skill: &SkillDescriptor, args: &str, cwd: &Path) -> String {
     let args = args.trim();
+    // Legacy `.claude/commands/*.md` files are prompt templates, like the
+    // reference: the body becomes the user message after `$ARGUMENTS`/`$n`
+    // substitution and `` !`cmd` `` shell expansion.
+    if skill.legacy_command {
+        return expand_legacy_command_body(&skill.body, args, cwd);
+    }
     let argument_text = if args.is_empty() {
         "No explicit arguments were provided. Infer the likely task from the skill and ask for clarification only if required.".to_string()
     } else {
@@ -7454,6 +7460,38 @@ fn shell_capture(cwd: &Path, program: &str, args: &[&str]) -> String {
         }
         Err(err) => format!("(failed to run {program}: {err})"),
     }
+}
+
+/// Expand a legacy command-file body: `$ARGUMENTS`, `$1..$n` positional
+/// args, and `` !`cmd` `` shell captures.
+fn expand_legacy_command_body(body: &str, args: &str, cwd: &Path) -> String {
+    let tokens: Vec<&str> = args.split_whitespace().collect();
+    let mut out = body.replace("$ARGUMENTS", args);
+    for (index, token) in tokens.iter().enumerate() {
+        out = out.replace(&format!("${}", index + 1), token);
+    }
+
+    let mut expanded = String::with_capacity(out.len());
+    let mut rest = out.as_str();
+    while let Some(start) = rest.find("!`") {
+        let (head, tail) = rest.split_at(start);
+        expanded.push_str(head);
+        let tail = &tail[2..];
+        match tail.find('`') {
+            Some(end) => {
+                let output = shell_capture(cwd, "sh", &["-lc", &tail[..end]]);
+                expanded.push_str(&output);
+                rest = &tail[end + 1..];
+            }
+            None => {
+                expanded.push_str("!`");
+                expanded.push_str(tail);
+                rest = "";
+            }
+        }
+    }
+    expanded.push_str(rest);
+    expanded
 }
 
 /// `/commit`: the reference expands git context inline and prepends the git
