@@ -180,9 +180,25 @@ pub async fn execute(boot: BootstrappedApp) -> Result<()> {
                 resolve_prompt(None),
                 compatibility,
                 cli.cwd.clone(),
-                sessions_dir,
+                sessions_dir.clone(),
             );
             ctx.session.worktree_origin = worktree_origin;
+            // Reference-style top-level flags: `-c` continues the latest
+            // session, `-r <id>` resumes one, bare `-r` opens the picker.
+            if cli.continue_session {
+                ctx.session =
+                    find_latest_session(&sessions_dir).context("no sessions found to continue")?;
+            } else if let Some(resume) = cli.resume.as_deref() {
+                if resume.is_empty() {
+                    ctx.set_open_session_picker_at_start(true);
+                } else {
+                    ctx.session = Session::load_by_id(&sessions_dir, resume)
+                        .with_context(|| format!("failed to load session {resume}"))?;
+                }
+            }
+            if let Some(prompt) = cli.prompt.clone() {
+                ctx.set_startup_prompt(Some(prompt));
+            }
             if let Some(agent) = &agent_def {
                 ctx.runtime.apply_agent(agent);
             }
@@ -2856,6 +2872,10 @@ mod tests {
             mcp_config: None,
             strict_mcp_config: false,
             settings: None,
+            prompt: None,
+            print: false,
+            continue_session: false,
+            resume: None,
         }
     }
 

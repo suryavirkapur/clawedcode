@@ -174,6 +174,55 @@ pub fn resolve_mode(cli: &Cli) -> Result<ExecutionMode> {
         }));
     }
 
+    // Reference-style top-level flags: `clawedcode -p "x"` prints,
+    // `clawedcode -c` continues, `clawedcode -r <id>` resumes.
+    if cli.print {
+        // Bare `-p` reads the prompt from stdin when piped, like the reference.
+        let prompt = match cli.prompt.clone() {
+            Some(p) => p,
+            None => {
+                use std::io::{IsTerminal, Read};
+                let mut buf = String::new();
+                if !std::io::stdin().is_terminal() {
+                    std::io::stdin().read_to_string(&mut buf)?;
+                }
+                buf
+            }
+        };
+        let (json, stream_json) = match cli.output_format.as_deref() {
+            Some("json") => (true, false),
+            Some("stream-json") => (true, true),
+            Some("text") | None => (false, false),
+            Some(other) => anyhow::bail!("unknown --output-format: {other}"),
+        };
+        if cli.continue_session {
+            return Ok(ExecutionMode::Continue(ContinueMode {
+                prompt,
+                json,
+                show_thinking: false,
+                yes: false,
+            }));
+        }
+        if let Some(id) = cli.resume.as_deref().filter(|id| !id.is_empty()) {
+            return Ok(ExecutionMode::Resume(ResumeMode {
+                session_id: id.to_string(),
+                prompt: Some(prompt),
+                json,
+                stream_json,
+                show_thinking: false,
+                yes: false,
+            }));
+        }
+        return Ok(ExecutionMode::Run(RunMode {
+            prompt,
+            system_prompt: cli.append_system_prompt.clone(),
+            json,
+            stream_json,
+            show_thinking: false,
+            yes: false,
+        }));
+    }
+
     let cmd = cli.command.clone().unwrap_or(Command::Tui);
     match cmd {
         Command::Tui => Ok(ExecutionMode::Tui),
@@ -454,6 +503,10 @@ mod tests {
             mcp_config: None,
             strict_mcp_config: false,
             settings: None,
+            prompt: None,
+            print: false,
+            continue_session: false,
+            resume: None,
         }
     }
 
@@ -699,6 +752,10 @@ mod tests {
             mcp_config: None,
             strict_mcp_config: false,
             settings: None,
+            prompt: None,
+            print: false,
+            continue_session: false,
+            resume: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Tui));
@@ -733,6 +790,10 @@ mod tests {
             mcp_config: None,
             strict_mcp_config: false,
             settings: None,
+            prompt: None,
+            print: false,
+            continue_session: false,
+            resume: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -767,6 +828,10 @@ mod tests {
             mcp_config: None,
             strict_mcp_config: false,
             settings: None,
+            prompt: None,
+            print: false,
+            continue_session: false,
+            resume: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));
@@ -804,6 +869,10 @@ mod tests {
             mcp_config: None,
             strict_mcp_config: false,
             settings: None,
+            prompt: None,
+            print: false,
+            continue_session: false,
+            resume: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::DirectConnect(_)));
@@ -841,6 +910,10 @@ mod tests {
             mcp_config: None,
             strict_mcp_config: false,
             settings: None,
+            prompt: None,
+            print: false,
+            continue_session: false,
+            resume: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Ssh(_)));
@@ -885,6 +958,10 @@ mod tests {
             mcp_config: None,
             strict_mcp_config: false,
             settings: None,
+            prompt: None,
+            print: false,
+            continue_session: false,
+            resume: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -933,6 +1010,10 @@ mod tests {
             mcp_config: None,
             strict_mcp_config: false,
             settings: None,
+            prompt: None,
+            print: false,
+            continue_session: false,
+            resume: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));

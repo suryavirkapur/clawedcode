@@ -50,6 +50,8 @@ pub struct TuiContext {
     pub show_thinking: bool,
     external_turn_executor: Option<Arc<dyn ExternalTurnExecutor>>,
     startup_prompt: Option<String>,
+    /// Open the session picker at launch (`clawedcode --resume` bare).
+    open_session_picker_at_start: bool,
     transport_label: Option<String>,
     /// Extra context prepended to the next submitted prompt once — used by
     /// `SessionStart` hooks to inject context like the reference.
@@ -162,6 +164,7 @@ impl TuiContext {
             show_thinking,
             external_turn_executor,
             startup_prompt: None,
+            open_session_picker_at_start: false,
             transport_label: None,
             pending_prompt_prefix: None,
             last_compatibility_refresh: Instant::now(),
@@ -174,6 +177,14 @@ impl TuiContext {
 
     pub fn take_startup_prompt(&mut self) -> Option<String> {
         self.startup_prompt.take()
+    }
+
+    pub fn set_open_session_picker_at_start(&mut self, open: bool) {
+        self.open_session_picker_at_start = open;
+    }
+
+    pub fn take_open_session_picker_at_start(&mut self) -> bool {
+        std::mem::take(&mut self.open_session_picker_at_start)
     }
 
     pub fn set_pending_prompt_prefix(&mut self, prefix: Option<String>) {

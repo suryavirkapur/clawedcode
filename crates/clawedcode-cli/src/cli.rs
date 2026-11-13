@@ -79,6 +79,18 @@ pub struct Cli {
     /// Extra settings file merged after .claude/settings*.json.
     #[arg(long, global = true)]
     pub settings: Option<PathBuf>,
+    /// Prompt for the session (reference-style positional; use with --print
+    /// for headless output or alone to seed the interactive session).
+    pub prompt: Option<String>,
+    /// Print mode: respond to the prompt and exit instead of opening the TUI.
+    #[arg(short = 'p', long)]
+    pub print: bool,
+    /// Continue the most recent session.
+    #[arg(short = 'c', long)]
+    pub continue_session: bool,
+    /// Resume a session by id; bare --resume opens the session picker.
+    #[arg(short = 'r', long, num_args = 0..=1, default_missing_value = "")]
+    pub resume: Option<String>,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -302,6 +314,10 @@ mod tests {
             mcp_config: None,
             strict_mcp_config: false,
             settings: None,
+            prompt: None,
+            print: false,
+            continue_session: false,
+            resume: None,
         }
     }
 
@@ -339,6 +355,10 @@ mod tests {
             mcp_config: None,
             strict_mcp_config: false,
             settings: None,
+            prompt: None,
+            print: false,
+            continue_session: false,
+            resume: None,
         }
     }
 

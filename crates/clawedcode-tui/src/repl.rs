@@ -1102,6 +1102,10 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     let always_allowed: Arc<Mutex<std::collections::HashSet<String>>> =
         Arc::new(Mutex::new(load_always_allowed(&ctx.session().cwd)));
 
+    if ctx.take_open_session_picker_at_start() && !list_saved_sessions(ctx, 8).is_empty() {
+        handler.resume_picker = Some(0);
+    }
+
     if let Some(prompt) = ctx.take_startup_prompt() {
         handler.begin_live_turn(prompt.clone());
         turn_started_at = Some(std::time::Instant::now());
