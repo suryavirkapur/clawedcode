@@ -187,6 +187,45 @@ const SPINNER_FRAME_MS: u128 = 120;
 const SPINNER_VERB_MS: u128 = 2_500;
 
 const SPINNER_FRAMES: &[char] = &['·', '✢', '✳', '✶', '✻', '✽', '✻', '✶', '✳', '✢'];
+/// `settings.spinnerVerbs` — `{mode: "append"|"replace", verbs: [...]}`.
+static CUSTOM_SPINNER_VERBS: std::sync::RwLock<Option<Vec<String>>> =
+    std::sync::RwLock::new(None);
+
+fn apply_spinner_verbs(settings: &serde_json::Value) {
+    let Some(cfg) = settings.get("spinnerVerbs") else {
+        return;
+    };
+    let custom: Vec<String> = cfg
+        .get("verbs")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).map(str::to_string).collect())
+        .unwrap_or_default();
+    let resolved = if cfg.get("mode").and_then(|m| m.as_str()) == Some("replace") {
+        if custom.is_empty() {
+            SPINNER_VERBS.iter().map(|s| s.to_string()).collect()
+        } else {
+            custom
+        }
+    } else {
+        SPINNER_VERBS
+            .iter()
+            .map(|s| s.to_string())
+            .chain(custom)
+            .collect()
+    };
+    if let Ok(mut slot) = CUSTOM_SPINNER_VERBS.write() {
+        *slot = Some(resolved);
+    }
+}
+
+fn spinner_verbs() -> Vec<String> {
+    CUSTOM_SPINNER_VERBS
+        .read()
+        .ok()
+        .and_then(|v| v.clone())
+        .unwrap_or_else(|| SPINNER_VERBS.iter().map(|s| s.to_string()).collect())
+}
+
 const SPINNER_VERBS: &[&str] = &[
     "Accomplishing",
     "Actioning",
@@ -562,6 +601,7 @@ fn skill_is_registerable(skill: &SkillDescriptor) -> bool {
 
 pub fn run_with_context(mut ctx: TuiContext) -> Result<()> {
     set_theme(ctx.theme_name());
+    apply_spinner_verbs(&ctx.runtime.compatibility().settings);
     enable_raw_mode()?;
     execute!(
         stdout(),
@@ -4051,7 +4091,8 @@ fn spinner_line(turn_started_at: Option<std::time::Instant>, tokens: u64) -> Lin
         .map(|start| start.elapsed().as_millis())
         .unwrap_or(0);
     let frame_index = (elapsed / SPINNER_FRAME_MS) as usize % SPINNER_FRAMES.len();
-    let verb_index = (elapsed / SPINNER_VERB_MS) as usize % SPINNER_VERBS.len();
+    let verbs = spinner_verbs();
+    let verb_index = (elapsed / SPINNER_VERB_MS) as usize % verbs.len();
     let seconds = elapsed / 1000;
     let tokens_part = if tokens > 0 {
         format!(" · {tokens} tokens")
@@ -4065,7 +4106,7 @@ fn spinner_line(turn_started_at: Option<std::time::Instant>, tokens: u64) -> Lin
             Style::default().fg(pal().accent),
         ),
         Span::styled(
-            format!("{}… ", SPINNER_VERBS[verb_index]),
+            format!("{}… ", verbs[verb_index]),
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::styled(
@@ -11869,6 +11910,21 @@ mod command_policy_tests {
             let out =
                 with_image_references("describe", Some("describe".to_string()), &images).unwrap();
             assert_eq!(out, "describe");
+        }
+
+        #[test]
+        fn spinner_verbs_replace_and_append() {
+            apply_spinner_verbs(&serde_json::json!({
+                "spinnerVerbs": {"mode": "replace", "verbs": ["Vibing"]}
+            }));
+            assert_eq!(spinner_verbs(), vec!["Vibing".to_string()]);
+
+            apply_spinner_verbs(&serde_json::json!({
+                "spinnerVerbs": {"mode": "append", "verbs": ["Vibing"]}
+            }));
+            let verbs = spinner_verbs();
+            assert_eq!(verbs.len(), SPINNER_VERBS.len() + 1);
+            assert_eq!(verbs.last().unwrap(), "Vibing");
         }
     }
 }
