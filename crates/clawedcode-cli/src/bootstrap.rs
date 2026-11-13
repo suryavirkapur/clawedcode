@@ -613,6 +613,7 @@ mod tests {
             enable_auth_status: false,
             include_partial_messages: false,
             include_hook_events: false,
+            permission_prompt_tool: None,
         }
     }
 
@@ -896,6 +897,7 @@ mod tests {
             enable_auth_status: false,
             include_partial_messages: false,
             include_hook_events: false,
+            permission_prompt_tool: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Tui));
@@ -968,6 +970,7 @@ mod tests {
             enable_auth_status: false,
             include_partial_messages: false,
             include_hook_events: false,
+            permission_prompt_tool: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -1040,6 +1043,7 @@ mod tests {
             enable_auth_status: false,
             include_partial_messages: false,
             include_hook_events: false,
+            permission_prompt_tool: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));
@@ -1115,6 +1119,7 @@ mod tests {
             enable_auth_status: false,
             include_partial_messages: false,
             include_hook_events: false,
+            permission_prompt_tool: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::DirectConnect(_)));
@@ -1190,6 +1195,7 @@ mod tests {
             enable_auth_status: false,
             include_partial_messages: false,
             include_hook_events: false,
+            permission_prompt_tool: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Ssh(_)));
@@ -1272,6 +1278,7 @@ mod tests {
             enable_auth_status: false,
             include_partial_messages: false,
             include_hook_events: false,
+            permission_prompt_tool: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -1358,6 +1365,7 @@ mod tests {
             enable_auth_status: false,
             include_partial_messages: false,
             include_hook_events: false,
+            permission_prompt_tool: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));

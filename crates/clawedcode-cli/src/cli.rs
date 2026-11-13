@@ -174,6 +174,9 @@ pub struct Cli {
     /// Write debug logs to a file (implies --debug).
     #[arg(long, global = true)]
     pub debug_file: Option<PathBuf>,
+    /// MCP tool (mcp__server__tool) that decides tool-permission prompts.
+    #[arg(long, global = true)]
+    pub permission_prompt_tool: Option<String>,
     /// Include hook lifecycle records in stream-json output.
     #[arg(long, global = true)]
     pub include_hook_events: bool,
@@ -485,6 +488,7 @@ mod tests {
             enable_auth_status: false,
             include_partial_messages: false,
             include_hook_events: false,
+            permission_prompt_tool: None,
         }
     }
 
@@ -560,6 +564,7 @@ mod tests {
             enable_auth_status: false,
             include_partial_messages: false,
             include_hook_events: false,
+            permission_prompt_tool: None,
         }
     }
 

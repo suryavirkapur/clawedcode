@@ -11,4 +11,5 @@ readme.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+libc = "0.2.191"
 reqwest.workspace = true

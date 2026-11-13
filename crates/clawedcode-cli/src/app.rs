@@ -583,6 +583,59 @@ fn execute_update() -> Result<()> {
     Ok(())
 }
 
+/// `--permission-prompt-tool`: an `mcp__<server>__<tool>` spec whose tool is
+/// consulted for every permission decision instead of the interactive prompt.
+/// The tool receives {tool_use_id, tool_name, input} and its JSON result's
+/// `behavior` field decides allow/deny (deny on any failure).
+fn build_permission_prompt_tool_fn(
+    spec: &str,
+    mcp_servers: &std::collections::BTreeMap<String, clawedcode_mcp::McpServerConfig>,
+) -> Option<ApprovalFn> {
+    let (server, tool) = spec.strip_prefix("mcp__")?.split_once("__")?;
+    let config = mcp_servers.get(server)?.clone();
+    let server = server.to_string();
+    let tool = tool.to_string();
+    Some(Box::new(move |tool_use_id, tool_name, input| {
+        let args = serde_json::json!({
+            "tool_use_id": tool_use_id,
+            "tool_name": tool_name,
+            "input": input,
+        });
+        match clawedcode_mcp::run_mcp_tool_sync(&config, &server, &tool, args) {
+            Ok(text) => {
+                let parsed = serde_json::from_str::<serde_json::Value>(&text)
+                    .unwrap_or(serde_json::Value::Null);
+                match parsed["behavior"].as_str() {
+                    Some("allow") => true.into(),
+                    Some("deny") => {
+                        eprintln!("[permission-prompt-tool denied: {}]", tool_name);
+                        false.into()
+                    }
+                    _ => false.into(),
+                }
+            }
+            Err(e) => {
+                eprintln!("[permission-prompt-tool error: {e}]");
+                false.into()
+            }
+        }
+    }))
+}
+
+fn build_approval_fn_with_cli(
+    cli: &Cli,
+    mcp_servers: &std::collections::BTreeMap<String, clawedcode_mcp::McpServerConfig>,
+    yes: bool,
+) -> ApprovalFn {
+    if let Some(spec) = &cli.permission_prompt_tool {
+        if let Some(f) = build_permission_prompt_tool_fn(spec, mcp_servers) {
+            return f;
+        }
+        eprintln!("warning: unknown --permission-prompt-tool '{spec}'");
+    }
+    build_approval_fn(yes)
+}
+
 fn build_approval_fn(yes: bool) -> ApprovalFn {
     if yes {
         Box::new(|_, _, _| true.into())
@@ -734,6 +787,7 @@ async fn execute_run(
     let model = config.model.clone();
     let mut config = config;
     apply_cli_config_overrides(&mut config, &cli);
+    let mcp_servers = compatibility.mcp_servers.clone();
     let mut runtime = Runtime::with_mode(
         config,
         resolve_prompt(run_mode.system_prompt.as_deref()),
@@ -746,7 +800,7 @@ async fn execute_run(
     let mut session = runtime.start_session_with_mode(cli.cwd.clone(), SessionMode::Headless);
     session.worktree_origin = worktree_origin.clone();
     apply_cli_session_overrides(&mut runtime, &mut session, &cli)?;
-    let approval_fn = build_approval_fn(run_mode.yes);
+    let approval_fn = build_approval_fn_with_cli(&cli, &mcp_servers, run_mode.yes);
     // SessionStart hooks: stdout becomes context prepended to the prompt.
     let start_context = clawedcode_core::hooks::run_session_start_hooks(
         &clawedcode_core::hooks::load_hooks(&session.cwd),
@@ -857,6 +911,7 @@ async fn execute_resume(
 
     let mut config = config;
     apply_cli_config_overrides(&mut config, &cli);
+    let mcp_servers = compatibility.mcp_servers.clone();
     let mut runtime = Runtime::with_mode(
         config,
         resolve_prompt(None),
@@ -867,7 +922,7 @@ async fn execute_resume(
         runtime.apply_agent(agent);
     }
     apply_cli_session_overrides(&mut runtime, &mut session, &cli)?;
-    let approval_fn = build_approval_fn(resume_mode.yes);
+    let approval_fn = build_approval_fn_with_cli(&cli, &mcp_servers, resume_mode.yes);
 
     session.execution_mode = SessionMode::Resume;
 
@@ -939,6 +994,7 @@ async fn execute_continue(
 
     let mut config = config;
     apply_cli_config_overrides(&mut config, &cli);
+    let mcp_servers = compatibility.mcp_servers.clone();
     let mut runtime = Runtime::with_mode(
         config,
         resolve_prompt(None),
@@ -949,7 +1005,7 @@ async fn execute_continue(
         runtime.apply_agent(agent);
     }
     apply_cli_session_overrides(&mut runtime, &mut session, &cli)?;
-    let approval_fn = build_approval_fn(continue_mode.yes);
+    let approval_fn = build_approval_fn_with_cli(&cli, &mcp_servers, continue_mode.yes);
 
     session.execution_mode = SessionMode::Continue;
 
@@ -1458,6 +1514,7 @@ async fn execute_headless(
     let model = config.model.clone();
     let mut config = config;
     apply_cli_config_overrides(&mut config, &cli);
+    let mcp_servers = compatibility.mcp_servers.clone();
     let mut runtime = Runtime::with_mode(
         config,
         resolve_prompt(system_prompt.as_deref()),
@@ -1470,7 +1527,7 @@ async fn execute_headless(
     let mut session = runtime.start_session_with_mode(cli.cwd.clone(), SessionMode::Headless);
     session.worktree_origin = worktree_origin.clone();
     apply_cli_session_overrides(&mut runtime, &mut session, &cli)?;
-    let approval_fn = build_approval_fn(yes);
+    let approval_fn = build_approval_fn_with_cli(&cli, &mcp_servers, yes);
     // SessionStart hooks: stdout becomes context prepended to the prompt.
     let start_context = clawedcode_core::hooks::run_session_start_hooks(
         &clawedcode_core::hooks::load_hooks(&session.cwd),
@@ -3413,6 +3470,7 @@ mod tests {
             enable_auth_status: false,
             include_partial_messages: false,
             include_hook_events: false,
+            permission_prompt_tool: None,
         }
     }
 

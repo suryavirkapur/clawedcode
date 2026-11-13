@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 #[derive(Debug, Clone)]
@@ -334,7 +334,18 @@ impl McpStdioClient {
     }
 
     fn read_json(&mut self) -> Result<Value, String> {
+        self.read_json_with_timeout(MCP_IO_TIMEOUT)
+    }
+
+    /// Poll the child's stdout before each blocking read so a silent or
+    /// half-crashed server can't hang the CLI at discovery time.
+    fn read_json_with_timeout(&mut self, timeout: std::time::Duration) -> Result<Value, String> {
+        use std::os::unix::io::AsRawFd;
         let stdout = self.io.stdout();
+        let fd = stdout.get_ref().as_raw_fd();
+        if !poll_fd_readable(fd, timeout) {
+            return Err("MCP server response timed out".into());
+        }
         let mut content_length = None;
         let mut line = String::new();
 
@@ -366,9 +377,17 @@ impl McpStdioClient {
         let content_length = content_length.ok_or("missing Content-Length header")?;
 
         let mut body = vec![0u8; content_length];
-        stdout
-            .read_exact(&mut body)
-            .map_err(|e| format!("read body error: {e}"))?;
+        let mut filled = 0usize;
+        while filled < content_length {
+            let buffered = stdout.fill_buf().map_err(|e| format!("read body error: {e}"))?;
+            let take = buffered.len().min(content_length - filled);
+            body[filled..filled + take].copy_from_slice(&buffered[..take]);
+            stdout.consume(take);
+            filled += take;
+            if filled < content_length && !poll_fd_readable(fd, MCP_IO_TIMEOUT) {
+                return Err("MCP server response timed out".into());
+            }
+        }
 
         serde_json::from_slice(&body).map_err(|e| format!("parse error: {e}"))
     }
@@ -553,6 +572,20 @@ impl Drop for McpStdioClient {
     fn drop(&mut self) {
         self.io.kill();
     }
+}
+
+const MCP_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Wait until `fd` is readable or `timeout` elapses. Uses `poll(2)` so a
+/// wedged child process can't block us forever on a pipe read.
+fn poll_fd_readable(fd: std::os::unix::io::RawFd, timeout: std::time::Duration) -> bool {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+    unsafe { libc::poll(&mut pfd, 1, ms) > 0 && (pfd.revents & libc::POLLIN) != 0 }
 }
 
 pub fn discover_mcp_tools_sync(
