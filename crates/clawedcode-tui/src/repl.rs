@@ -5922,7 +5922,19 @@ fn drain_turn_events(
     if let Some(turn) = active_turn.as_mut() {
         while let Ok(event) = turn.events.try_recv() {
             match event {
-                TurnWorkerEvent::Ui(event) => handler.on_event(&event),
+                TurnWorkerEvent::Ui(event) => {
+                    // Plan-mode tools flip the session's permission mode —
+                    // the runtime can't mutate its own mode from `&self`.
+                    if let TuiEvent::ToolUse { name, .. } = &event {
+                        use clawedcode_core::permissions::PermissionMode;
+                        match name.as_str() {
+                            "EnterPlanMode" => ctx.set_permission_mode(PermissionMode::Plan),
+                            "ExitPlanMode" => ctx.set_permission_mode(PermissionMode::Default),
+                            _ => {}
+                        }
+                    }
+                    handler.on_event(&event);
+                }
                 TurnWorkerEvent::ApprovalRequested(request) => {
                     if turn.ephemeral {
                         // Side questions cannot use tools — auto-deny rather

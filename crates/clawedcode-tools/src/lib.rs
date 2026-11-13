@@ -607,6 +607,8 @@ pub fn builtin_tool_instances() -> Vec<Box<dyn Tool>> {
         Box::new(Shell),
         Box::new(ApplyPatch),
         Box::new(AskUserQuestion),
+        Box::new(Glob),
+        Box::new(Grep),
     ]
 }
 
@@ -681,9 +683,152 @@ pub fn builtin_tools() -> Vec<ToolSpec> {
                     "subagent_type": {
                         "type": "string",
                         "description": "Specialized agent type — `general-purpose` or a `.claude/agents/<name>.md` name. Omit to fork with the current conversation context."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Name for the spawned agent. Makes it addressable via SendMessage({to: name}) later."
+                    },
+                    "run_in_background": {
+                        "type": "boolean",
+                        "description": "Run this agent in the background and return its agent id immediately."
                     }
                 },
                 "required": ["description", "prompt"]
+            }),
+        },
+        ToolSpec {
+            name: "Skill".to_string(),
+            description: "Execute a skill (slash-command file or SKILL.md) as a forked sub-agent and return its result.".to_string(),
+            needs_approval: false,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "skill": {
+                        "type": "string",
+                        "description": "The skill name. E.g., \"commit\", \"review-pr\", or \"pdf\""
+                    },
+                    "args": {
+                        "type": "string",
+                        "description": "Optional arguments for the skill"
+                    }
+                },
+                "required": ["skill"]
+            }),
+        },
+        ToolSpec {
+            name: "Glob".to_string(),
+            description: "Find files by glob pattern (supports ** and *)".to_string(),
+            needs_approval: false,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Glob pattern, e.g. **/*.rs"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Directory to search (defaults to cwd)"
+                    }
+                },
+                "required": ["pattern"]
+            }),
+        },
+        ToolSpec {
+            name: "Grep".to_string(),
+            description: "Search file contents for a regex pattern (file:line:match output)".to_string(),
+            needs_approval: false,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Extended regex to search for"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Directory or file to search (defaults to cwd)"
+                    }
+                },
+                "required": ["pattern"]
+            }),
+        },
+        ToolSpec {
+            name: "WebFetch".to_string(),
+            description: "Fetch a URL and process its content with the given prompt.".to_string(),
+            needs_approval: true,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The URL to fetch content from"
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "The prompt to run on the fetched content"
+                    }
+                },
+                "required": ["url", "prompt"]
+            }),
+        },
+        ToolSpec {
+            name: "EnterPlanMode".to_string(),
+            description: "Transition into plan mode: research freely but make no edits until the user approves a plan.".to_string(),
+            needs_approval: false,
+            input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "ExitPlanMode".to_string(),
+            description: "Present the finished plan to the user for approval and exit plan mode.".to_string(),
+            needs_approval: false,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "plan": {
+                        "type": "string",
+                        "description": "The plan text to present for approval"
+                    }
+                },
+                "required": ["plan"]
+            }),
+        },
+        ToolSpec {
+            name: "Sleep".to_string(),
+            description: "Wait for a specified duration (seconds). Prefer this over `shell` sleep — it doesn't hold a shell process.".to_string(),
+            needs_approval: false,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "duration_seconds": {
+                        "type": "number",
+                        "description": "Seconds to wait"
+                    }
+                },
+                "required": ["duration_seconds"]
+            }),
+        },
+        ToolSpec {
+            name: "SendMessage".to_string(),
+            description: "Send a message to a previously spawned agent (by id or name) and return its reply. The agent resumes with its full context preserved.".to_string(),
+            needs_approval: false,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "to": {
+                        "type": "string",
+                        "description": "Recipient: agent name, agent id, or a unique id prefix"
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Plain text message content"
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "A 5-10 word summary shown as a preview in the UI"
+                    }
+                },
+                "required": ["to", "message"]
             }),
         },
         ToolSpec {
@@ -905,6 +1050,176 @@ pub struct ToolSpec {
     pub description: String,
     pub needs_approval: bool,
     pub input_schema: serde_json::Value,
+}
+
+/// Dedicated file-pattern search, like the reference's Glob tool.
+pub struct Glob;
+
+/// Dedicated content search, like the reference's Grep tool.
+pub struct Grep;
+
+fn glob_match(pattern: &str, path: &str) -> bool {
+    // `**` spans directories; `*`/`?` stay within a segment.
+    fn seg_match(pat: &[&str], parts: &[&str]) -> bool {
+        match (pat.first(), parts.first()) {
+            (None, None) => true,
+            (Some(&"**"), _) => {
+                seg_match(&pat[1..], parts) || (!parts.is_empty() && seg_match(pat, &parts[1..]))
+            }
+            (Some(p), Some(s)) => wildcard_match(p, s) && seg_match(&pat[1..], &parts[1..]),
+            _ => false,
+        }
+    }
+    fn wildcard_match(pat: &str, s: &str) -> bool {
+        let (p, s): (Vec<char>, Vec<char>) = (pat.chars().collect(), s.chars().collect());
+        let (mut i, mut j, mut star, mut mark) = (0usize, 0usize, usize::MAX, 0usize);
+        while j < s.len() {
+            if i < p.len() && (p[i] == '?' || p[i] == s[j]) {
+                i += 1;
+                j += 1;
+            } else if i < p.len() && p[i] == '*' {
+                star = i;
+                i += 1;
+                mark = j;
+            } else if star != usize::MAX {
+                i = star + 1;
+                mark += 1;
+                j = mark;
+            } else {
+                return false;
+            }
+        }
+        while i < p.len() && p[i] == '*' {
+            i += 1;
+        }
+        i == p.len()
+    }
+    let pat_parts: Vec<&str> = pattern.split('/').collect();
+    let path_parts: Vec<&str> = path.split('/').collect();
+    seg_match(&pat_parts, &path_parts)
+}
+
+fn walk_files(root: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') || name == "target" || name == "node_modules" {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            walk_files(&path, out);
+        } else {
+            out.push(path);
+        }
+    }
+}
+
+impl Tool for Glob {
+    fn name(&self) -> &str {
+        "Glob"
+    }
+    fn description(&self) -> &str {
+        "Find files by glob pattern (supports ** and *)"
+    }
+    fn needs_approval(&self) -> bool {
+        false
+    }
+    fn execute(&self, input: serde_json::Value, cwd: &Path) -> ToolResult {
+        let Some(pattern) = input.get("pattern").and_then(|v| v.as_str()) else {
+            return ToolResult {
+                content: "Missing 'pattern' parameter".into(),
+                is_error: true,
+            };
+        };
+        let base = input
+            .get("path")
+            .and_then(|v| v.as_str())
+            .and_then(|p| resolve_under_cwd(cwd, p).ok())
+            .unwrap_or_else(|| cwd.to_path_buf());
+        let mut files = Vec::new();
+        walk_files(&base, &mut files);
+        let mut matches: Vec<String> = files
+            .iter()
+            .filter_map(|f| {
+                let rel = f.strip_prefix(&base).ok()?.to_string_lossy().to_string();
+                let rel_abs = f
+                    .strip_prefix(cwd)
+                    .unwrap_or(f)
+                    .to_string_lossy()
+                    .to_string();
+                if glob_match(pattern, &rel) || glob_match(pattern, &rel_abs) {
+                    Some(rel_abs)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        matches.sort();
+        matches.truncate(500);
+        ToolResult {
+            content: if matches.is_empty() {
+                "No files matched".to_string()
+            } else {
+                matches.join("\n")
+            },
+            is_error: false,
+        }
+    }
+}
+
+impl Tool for Grep {
+    fn name(&self) -> &str {
+        "Grep"
+    }
+    fn description(&self) -> &str {
+        "Search file contents for a regex pattern (file:line:match output)"
+    }
+    fn needs_approval(&self) -> bool {
+        false
+    }
+    fn execute(&self, input: serde_json::Value, cwd: &Path) -> ToolResult {
+        let Some(pattern) = input.get("pattern").and_then(|v| v.as_str()) else {
+            return ToolResult {
+                content: "Missing 'pattern' parameter".into(),
+                is_error: true,
+            };
+        };
+        let base = input
+            .get("path")
+            .and_then(|v| v.as_str())
+            .and_then(|p| resolve_under_cwd(cwd, p).ok())
+            .unwrap_or_else(|| cwd.to_path_buf());
+        // Prefer system grep/ripgrep for real regex support.
+        let output = std::process::Command::new("grep")
+            .args(["-rInE", "--color=never", pattern, "."])
+            .current_dir(&base)
+            .output();
+        match output {
+            Ok(out) => {
+                let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+                if text.len() > 100_000 {
+                    text.truncate(100_000);
+                    text.push_str("\n[truncated]");
+                }
+                ToolResult {
+                    content: if text.trim().is_empty() {
+                        "No matches found".to_string()
+                    } else {
+                        text
+                    },
+                    is_error: false,
+                }
+            }
+            Err(_) => ToolResult {
+                content: "grep not available".into(),
+                is_error: true,
+            },
+        }
+    }
 }
 
 #[cfg(test)]

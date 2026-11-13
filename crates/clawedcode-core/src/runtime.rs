@@ -302,6 +302,8 @@ struct AgentToolInput {
     description: String,
     prompt: String,
     subagent_type: Option<String>,
+    name: Option<String>,
+    run_in_background: bool,
 }
 
 enum PreparedAgentExecution {
@@ -1263,6 +1265,7 @@ impl Runtime {
                                 agent_system_prompt: run.agent_system_prompt,
                                 allowed_tools: run.allowed_tools,
                                 agent_type: run.agent_type,
+                                name: parsed_for_thread.name.clone(),
                             },
                         )
                         .map_err(|err| err.to_string())?;
@@ -1392,23 +1395,353 @@ impl Runtime {
             session.cwd.clone(),
         );
 
-        match runtime.spawn_fork_from_parent(
-            session,
-            SubAgentConfig {
-                prompt: parsed.prompt.clone(),
-                max_turns: run.max_turns,
-                permission_mode: run.permission_mode,
-                agent_system_prompt: run.agent_system_prompt,
-                allowed_tools: run.allowed_tools,
-                agent_type: run.agent_type,
-            },
-        ) {
+        let subagent = SubAgentConfig {
+            prompt: parsed.prompt.clone(),
+            max_turns: run.max_turns,
+            permission_mode: run.permission_mode,
+            agent_system_prompt: run.agent_system_prompt,
+            allowed_tools: run.allowed_tools,
+            agent_type: run.agent_type,
+            name: parsed.name.clone(),
+        };
+
+        if parsed.run_in_background {
+            // Reference's run_in_background Task param: launch async and
+            // return the agentId for later SendMessage/TaskOutput use.
+            return match runtime.spawn_in_background_and_link_to_parent(session, subagent) {
+                Ok(state) => {
+                    session.add_child(state.child_session_id);
+                    ContentBlock::tool_result(
+                        tool_use_id,
+                        format!(
+                            "Async agent launched successfully.\nagentId: {} (use SendMessage with to: '{}' to continue this agent)\nThe agent is working in the background.",
+                            state.child_session_id, state.child_session_id
+                        ),
+                    )
+                }
+                Err(err) => ContentBlock::tool_error(tool_use_id, err.to_string()),
+            };
+        }
+
+        match runtime.spawn_fork_from_parent(session, subagent) {
             Ok(result) => {
                 session.add_child(result.child_session_id);
                 ContentBlock::tool_result(tool_use_id, render_agent_tool_result(&parsed, &result))
             }
             Err(err) => ContentBlock::tool_error(tool_use_id, err.to_string()),
         }
+    }
+
+    /// `Skill` tool — run a discovered skill as a forked sub-agent, like the
+    /// reference's forked SkillTool execution.
+    fn execute_skill_tool(
+        &self,
+        tool_use_id: &str,
+        input: serde_json::Value,
+        session: &mut Session,
+    ) -> ContentBlock {
+        let Some(skill_name) = input.get("skill").and_then(|v| v.as_str()) else {
+            return ContentBlock::tool_error(tool_use_id, "Missing 'skill' parameter");
+        };
+        let skill_name = skill_name.trim();
+        if skill_name.is_empty() {
+            return ContentBlock::tool_error(
+                tool_use_id,
+                format!("Invalid skill format: {skill_name}"),
+            );
+        }
+        let args = input
+            .get("args")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+
+        let Ok(skills) = crate::compat::discover_skills(&session.cwd) else {
+            return ContentBlock::tool_error(tool_use_id, "Could not discover skills");
+        };
+        let Some(skill) = skills.iter().find(|skill| {
+            skill.name.eq_ignore_ascii_case(skill_name)
+                || skill
+                    .slash_command
+                    .trim_start_matches('/')
+                    .eq_ignore_ascii_case(skill_name)
+        }) else {
+            let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+            return ContentBlock::tool_error(
+                tool_use_id,
+                format!(
+                    "Unknown skill \"{skill_name}\".{}",
+                    if names.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" Available skills: {}", names.join(", "))
+                    }
+                ),
+            );
+        };
+
+        let Some(sessions_dir) = session_store_dir() else {
+            return ContentBlock::tool_error(
+                tool_use_id,
+                "No sessions directory available for Skill execution",
+            );
+        };
+
+        let prompt = format!(
+            "Execute the skill \"{name}\".\n\nSkill instructions:\n{body}\n\n{args}",
+            name = skill.name,
+            body = skill.body,
+            args = if args.trim().is_empty() {
+                "No explicit arguments were provided.".to_string()
+            } else {
+                format!("User arguments:\n{args}")
+            }
+        );
+
+        let runtime = SubAgentRuntime::new(
+            self.config.clone(),
+            self.system_prompt.clone(),
+            self.compatibility.clone(),
+            sessions_dir,
+            session.cwd.clone(),
+        );
+
+        match runtime.spawn_fork_from_parent(
+            session,
+            SubAgentConfig {
+                prompt,
+                max_turns: self.max_turns(),
+                permission_mode: self.permission_mode(),
+                agent_system_prompt: None,
+                allowed_tools: None,
+                agent_type: Some(format!("skill:{}", skill.name)),
+                name: Some(skill.name.clone()),
+            },
+        ) {
+            Ok(result) => {
+                session.add_child(result.child_session_id);
+                ContentBlock::tool_result(
+                    tool_use_id,
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "success": true,
+                        "commandName": skill.name,
+                        "status": "forked",
+                        "agentId": result.child_session_id,
+                        "result": result.summary,
+                    }))
+                    .unwrap_or_else(|_| result.summary),
+                )
+            }
+            Err(err) => ContentBlock::tool_error(tool_use_id, err.to_string()),
+        }
+    }
+
+    /// `SendMessage` — resume a previously spawned child agent by id prefix
+    /// or name and return its reply, like the reference's agent resumption.
+    fn execute_send_message_tool(
+        &self,
+        tool_use_id: &str,
+        input: serde_json::Value,
+        session: &mut Session,
+    ) -> ContentBlock {
+        let Some(to) = input.get("to").and_then(|v| v.as_str()) else {
+            return ContentBlock::tool_error(tool_use_id, "Missing 'to' parameter");
+        };
+        let Some(message) = input.get("message").and_then(|v| v.as_str()) else {
+            return ContentBlock::tool_error(tool_use_id, "Missing 'message' parameter");
+        };
+        let to = to.trim();
+
+        let Some(sessions_dir) = session_store_dir() else {
+            return ContentBlock::tool_error(
+                tool_use_id,
+                "No sessions directory available for SendMessage",
+            );
+        };
+
+        // Resolve `to` against this session's children: exact/prefix id or
+        // the agent's `name` (stored as the child title).
+        let mut resolved: Option<Session> = None;
+        let mut ambiguous = false;
+        for child_id in &session.child_sessions {
+            let Ok(child) = Session::load(&sessions_dir, *child_id) else {
+                continue;
+            };
+            let id_match = child.id.to_string().starts_with(to);
+            let name_match = child
+                .title
+                .as_deref()
+                .is_some_and(|title| title.eq_ignore_ascii_case(to));
+            if id_match || name_match {
+                if resolved.is_some() {
+                    ambiguous = true;
+                    break;
+                }
+                resolved = Some(child);
+            }
+        }
+        if ambiguous {
+            return ContentBlock::tool_error(
+                tool_use_id,
+                format!("Agent reference \"{to}\" is ambiguous — use the full agentId"),
+            );
+        }
+        let Some(mut child) = resolved else {
+            return ContentBlock::tool_error(
+                tool_use_id,
+                format!("No agent found for \"{to}\" — spawn one with Agent/Task first"),
+            );
+        };
+
+        let runtime = SubAgentRuntime::new(
+            self.config.clone(),
+            self.system_prompt.clone(),
+            self.compatibility.clone(),
+            sessions_dir,
+            session.cwd.clone(),
+        );
+        match runtime.resume_child(
+            session,
+            &mut child,
+            &SubAgentConfig {
+                prompt: message.to_string(),
+                max_turns: self.max_turns(),
+                permission_mode: self.permission_mode(),
+                agent_system_prompt: None,
+                allowed_tools: None,
+                agent_type: None,
+                name: None,
+            },
+            message,
+        ) {
+            Ok(output) => ContentBlock::tool_result(
+                tool_use_id,
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "success": true,
+                    "to": to,
+                    "agentId": child.id,
+                    "response": output.response,
+                }))
+                .unwrap_or_else(|_| output.response),
+            ),
+            Err(err) => ContentBlock::tool_error(tool_use_id, err.to_string()),
+        }
+    }
+
+    /// `WebFetch` — fetch a URL and run the model's `prompt` over the
+    /// extracted text, returning the reference's output shape.
+    fn execute_web_fetch_tool(&self, tool_use_id: &str, input: serde_json::Value) -> ContentBlock {
+        let Some(url) = input.get("url").and_then(|v| v.as_str()) else {
+            return ContentBlock::tool_error(tool_use_id, "Missing 'url' parameter");
+        };
+        let Some(prompt) = input.get("prompt").and_then(|v| v.as_str()) else {
+            return ContentBlock::tool_error(tool_use_id, "Missing 'prompt' parameter");
+        };
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return ContentBlock::tool_error(
+                tool_use_id,
+                format!("Invalid URL: {url} — must start with http:// or https://"),
+            );
+        }
+
+        let started = std::time::Instant::now();
+        let output = std::process::Command::new("curl")
+            .args([
+                "-sSL",
+                "--max-time",
+                "30",
+                "-A",
+                "clawedcode/0.1",
+                "-w",
+                "\n%{http_code}",
+                url,
+            ])
+            .output();
+        let Ok(output) = output else {
+            return ContentBlock::tool_error(tool_use_id, "WebFetch failed: curl not available");
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let (body, code) = match stdout.rfind('\n') {
+            Some(index) => {
+                let code = stdout[index + 1..].trim().parse::<u16>().unwrap_or(0);
+                (&stdout[..index], code)
+            }
+            None => (stdout.as_ref(), 0),
+        };
+        if code == 0 || code >= 400 {
+            return ContentBlock::tool_error(
+                tool_use_id,
+                format!("WebFetch failed: HTTP {code} for {url}"),
+            );
+        }
+
+        let text = html_to_text(body);
+        let text: String = text.chars().take(100_000).collect();
+        let bytes = body.len();
+
+        // The reference runs the prompt through a small model.
+        let request = CompletionRequest {
+            model: self.config.model.clone(),
+            prompt_pack: self.config.prompts.default_prompt_pack.clone(),
+            system_prompt_name: self.system_prompt.name.to_string(),
+            system_prompt_body: "You process fetched web content. Answer the user's \
+                question about the content directly and concisely."
+                .to_string(),
+            prompt: prompt.to_string(),
+            messages: vec![clawedcode_api::ProviderMessage {
+                role: clawedcode_api::ProviderRole::User,
+                content: vec![clawedcode_api::ProviderContentBlock::Text {
+                    text: format!("Content fetched from {url}:\n\n{text}\n\n---\n\n{prompt}"),
+                }],
+            }],
+            tools: Vec::new(),
+            skill_count: 0,
+            mcp_servers: Default::default(),
+            effort: None,
+        };
+        let result = self
+            .run_in_runtime(self.provider.complete(&request))
+            .map(|response| response.response)
+            .unwrap_or_else(|err| format!("(model processing failed: {err})"));
+
+        ContentBlock::tool_result(
+            tool_use_id,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "bytes": bytes,
+                "code": code,
+                "codeText": http_code_text(code),
+                "result": result,
+                "durationMs": started.elapsed().as_millis(),
+                "url": url,
+            }))
+            .unwrap_or_else(|_| result),
+        )
+    }
+
+    /// `Sleep` — wait a bounded duration, interruptible like the reference.
+    fn execute_sleep_tool(&self, tool_use_id: &str, input: serde_json::Value) -> ContentBlock {
+        let seconds = input
+            .get("duration_seconds")
+            .or_else(|| input.get("seconds"))
+            .or_else(|| input.get("duration"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        if seconds <= 0.0 || seconds > 600.0 {
+            return ContentBlock::tool_error(
+                tool_use_id,
+                "duration_seconds must be between 0 and 600".to_string(),
+            );
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(seconds);
+        while std::time::Instant::now() < deadline {
+            if self.interrupted() {
+                return ContentBlock::tool_result(
+                    tool_use_id,
+                    format!("Sleep interrupted after {:.1}s", seconds),
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        ContentBlock::tool_result(tool_use_id, format!("Slept for {seconds}s"))
     }
 
     pub fn execute_tool(
@@ -1524,6 +1857,10 @@ impl Runtime {
         match tool_name {
             TASK_OUTPUT_TOOL_NAME => Some((false, false)),
             TASK_STOP_TOOL_NAME => Some((true, true)),
+            "Skill" | "SendMessage" | "Sleep" | "EnterPlanMode" | "ExitPlanMode" => {
+                Some((false, false))
+            }
+            "WebFetch" => Some((true, false)),
             _ if is_agent_tool(tool_name) => Some((false, false)),
             _ if is_task_store_tool(tool_name) => Some((false, false)),
             _ => None,
@@ -1612,6 +1949,43 @@ impl Runtime {
     ) -> ContentBlock {
         if is_agent_tool(tool_name) {
             return self.execute_agent_tool(tool_use_id, input, session);
+        }
+
+        if tool_name == "Skill" {
+            return self.execute_skill_tool(tool_use_id, input, session);
+        }
+
+        if tool_name == "SendMessage" {
+            return self.execute_send_message_tool(tool_use_id, input, session);
+        }
+
+        if tool_name == "WebFetch" {
+            return self.execute_web_fetch_tool(tool_use_id, input);
+        }
+
+        if tool_name == "Sleep" {
+            return self.execute_sleep_tool(tool_use_id, input);
+        }
+
+        if tool_name == "EnterPlanMode" {
+            return ContentBlock::tool_result(
+                tool_use_id,
+                "Entered plan mode. You should now focus on researching the task \
+                 and creating a plan. Do not make any edits until the user approves \
+                 the plan."
+                    .to_string(),
+            );
+        }
+
+        if tool_name == "ExitPlanMode" {
+            let plan = input
+                .get("plan")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no plan provided)");
+            return ContentBlock::tool_result(
+                tool_use_id,
+                format!("Plan submitted for user approval:\n\n{plan}"),
+            );
         }
 
         if let Some(result) =
@@ -1823,6 +2197,107 @@ fn compact_message_group(messages: &[Message]) -> Message {
     Message::from_text(Role::User, summary)
 }
 
+/// Crude HTML → text extraction for WebFetch: drops script/style blocks,
+/// tags, and decodes the common entities.
+fn html_to_text(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut chars = html.chars().peekable();
+    let mut skip_depth = 0usize;
+    let mut in_tag = false;
+    let mut tag = String::new();
+    while let Some(c) = chars.next() {
+        if in_tag {
+            if c == '>' {
+                in_tag = false;
+                let t = tag.to_ascii_lowercase();
+                let name = t
+                    .trim_start_matches('/')
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("");
+                if t.starts_with('/') {
+                    if name == "script" || name == "style" {
+                        skip_depth = skip_depth.saturating_sub(1);
+                    }
+                } else if name == "script" || name == "style" {
+                    skip_depth += 1;
+                } else if matches!(
+                    name,
+                    "p" | "br" | "div" | "li" | "tr" | "h1" | "h2" | "h3" | "h4"
+                ) {
+                    out.push('\n');
+                }
+                tag.clear();
+            } else {
+                tag.push(c);
+            }
+            continue;
+        }
+        if c == '<' {
+            in_tag = true;
+            continue;
+        }
+        if skip_depth > 0 {
+            continue;
+        }
+        if c == '&' {
+            let mut entity = String::new();
+            for next in chars.by_ref() {
+                if next == ';' || !next.is_alphanumeric() && next != '#' {
+                    break;
+                }
+                entity.push(next);
+            }
+            out.push_str(match entity.as_str() {
+                "amp" => "&",
+                "lt" => "<",
+                "gt" => ">",
+                "quot" => "\"",
+                "nbsp" => " ",
+                "#39" | "apos" => "'",
+                _ => "",
+            });
+            continue;
+        }
+        out.push(c);
+    }
+    // Collapse whitespace runs.
+    let mut collapsed = String::with_capacity(out.len());
+    let mut last_ws = false;
+    for c in out.chars() {
+        if c.is_whitespace() {
+            if !last_ws {
+                collapsed.push(' ');
+            }
+            last_ws = true;
+        } else {
+            collapsed.push(c);
+            last_ws = false;
+        }
+    }
+    collapsed
+}
+
+fn http_code_text(code: u16) -> &'static str {
+    match code {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        304 => "Not Modified",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "",
+    }
+}
+
 fn parse_agent_tool_input(input: &serde_json::Value) -> Result<AgentToolInput, String> {
     let Some(description) = input.get("description").and_then(|value| value.as_str()) else {
         return Err("Missing 'description' parameter".to_string());
@@ -1845,6 +2320,15 @@ fn parse_agent_tool_input(input: &serde_json::Value) -> Result<AgentToolInput, S
             .get("subagent_type")
             .and_then(|value| value.as_str())
             .map(|value| value.to_string()),
+        name: input
+            .get("name")
+            .and_then(|value| value.as_str())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        run_in_background: input
+            .get("run_in_background")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
     })
 }
 

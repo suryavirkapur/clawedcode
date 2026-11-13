@@ -26,6 +26,9 @@ pub struct SubAgentConfig {
     pub allowed_tools: Option<Vec<String>>,
     /// The resolved `subagent_type` name, for hook payloads.
     pub agent_type: Option<String>,
+    /// Optional `name` param — stored as the child session title so the
+    /// agent is addressable via `SendMessage({to: name})`.
+    pub name: Option<String>,
 }
 
 impl Default for SubAgentConfig {
@@ -37,6 +40,7 @@ impl Default for SubAgentConfig {
             agent_system_prompt: None,
             allowed_tools: None,
             agent_type: None,
+            name: None,
         }
     }
 }
@@ -172,6 +176,9 @@ impl SubAgentRuntime {
         let runtime = self.build_runtime(&subagent);
         let fresh = subagent.agent_system_prompt.is_some();
         let mut session = self.build_child_session(parent_session, !fresh);
+        if let Some(name) = &subagent.name {
+            session.title = Some(name.clone());
+        }
         if fresh {
             session.push(Role::System, runtime.effective_system_prompt_body(&session));
         }
@@ -198,6 +205,28 @@ impl SubAgentRuntime {
         })
     }
 
+    /// Resume a previously spawned child agent: push `message` onto its
+    /// session and run another turn, like the reference's SendMessage
+    /// resumption ("the agent resumes with its full context preserved").
+    pub fn resume_child(
+        &self,
+        parent_session: &Session,
+        child_session: &mut Session,
+        subagent: &SubAgentConfig,
+        message: &str,
+    ) -> Result<crate::runtime::RuntimeOutput> {
+        let runtime = self.build_runtime(subagent);
+        let output = runtime.submit(child_session, message);
+        child_session.save(&self.sessions_dir)?;
+        crate::hooks::run_subagent_stop_hooks(
+            &crate::hooks::load_hooks(&child_session.cwd),
+            &parent_session.id.to_string(),
+            &child_session.cwd,
+            &child_session.id.to_string(),
+        );
+        Ok(output)
+    }
+
     pub fn spawn_in_background_and_link_to_parent(
         &self,
         parent_session: &mut Session,
@@ -205,6 +234,9 @@ impl SubAgentRuntime {
     ) -> Result<SubAgentTaskState> {
         let fresh = subagent.agent_system_prompt.is_some();
         let mut child_session = self.build_child_session(parent_session, !fresh);
+        if let Some(name) = &subagent.name {
+            child_session.title = Some(name.clone());
+        }
         child_session.save(&self.sessions_dir)?;
 
         parent_session.add_child(child_session.id);
@@ -479,6 +511,7 @@ mod tests {
                 agent_system_prompt: None,
                 allowed_tools: None,
                 agent_type: None,
+                name: None,
             })
             .unwrap();
 
@@ -499,6 +532,7 @@ mod tests {
                 agent_system_prompt: None,
                 allowed_tools: None,
                 agent_type: None,
+                name: None,
             })
             .unwrap();
 
@@ -524,6 +558,7 @@ mod tests {
                     agent_system_prompt: None,
                     allowed_tools: None,
                     agent_type: None,
+                    name: None,
                 },
             )
             .unwrap();
@@ -558,6 +593,7 @@ mod tests {
                     agent_system_prompt: None,
                     allowed_tools: None,
                     agent_type: None,
+                    name: None,
                 },
             )
             .unwrap();
@@ -586,6 +622,7 @@ mod tests {
                     agent_system_prompt: None,
                     allowed_tools: None,
                     agent_type: None,
+                    name: None,
                 },
             )
             .unwrap();
@@ -628,6 +665,7 @@ mod tests {
                     agent_system_prompt: None,
                     allowed_tools: None,
                     agent_type: None,
+                    name: None,
                 },
             )
             .unwrap();
@@ -658,6 +696,7 @@ mod tests {
                 agent_system_prompt: None,
                 allowed_tools: None,
                 agent_type: None,
+                name: None,
             })
             .unwrap();
 
@@ -681,6 +720,7 @@ mod tests {
                     agent_system_prompt: None,
                     allowed_tools: None,
                     agent_type: None,
+                    name: None,
                 },
             )
             .unwrap();
@@ -715,6 +755,7 @@ mod tests {
                     agent_system_prompt: None,
                     allowed_tools: None,
                     agent_type: None,
+                    name: None,
                 },
             )
             .unwrap();

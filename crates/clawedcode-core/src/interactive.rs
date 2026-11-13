@@ -560,6 +560,7 @@ impl TuiContext {
                 agent_system_prompt: None,
                 allowed_tools: None,
                 agent_type: None,
+                name: None,
             },
         )
     }
@@ -582,6 +583,7 @@ impl TuiContext {
                 agent_system_prompt: None,
                 allowed_tools: None,
                 agent_type: None,
+                name: None,
             },
         )
     }

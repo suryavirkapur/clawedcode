@@ -135,7 +135,7 @@ pub fn load_output_style(cwd: &Path) -> Option<String> {
     Some(format!("Output style: {style_name}"))
 }
 
-fn discover_skills(cwd: &Path) -> Result<Vec<SkillDescriptor>> {
+pub fn discover_skills(cwd: &Path) -> Result<Vec<SkillDescriptor>> {
     let mut paths: Vec<(PathBuf, bool)> = Vec::new();
 
     if let Some(home) = claude_home() {
