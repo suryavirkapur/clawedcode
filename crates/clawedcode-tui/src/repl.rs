@@ -433,6 +433,7 @@ const BUILTIN_COMMANDS: &[&str] = &[
     "/btw",
     "/copy",
     "/diff",
+    "/files",
     "/doctor",
     "/rewind",
     "/plan",
@@ -6500,6 +6501,45 @@ PR number: {args}"#
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
+                "/files" => {
+                    // Files the model has read this session, like the
+                    // reference's `/files` context listing.
+                    let session = ctx.session();
+                    let cwd = session.cwd.clone();
+                    let mut seen = std::collections::HashSet::new();
+                    let files: Vec<String> = session
+                        .messages
+                        .iter()
+                        .flat_map(|m| m.content_blocks.iter())
+                        .filter_map(|b| match b {
+                            clawedcode_core::content::ContentBlock::ToolUse {
+                                name,
+                                input,
+                                ..
+                            } if name == "read_file" => input
+                                .get("path")
+                                .and_then(|p| p.as_str())
+                                .map(str::to_string),
+                            _ => None,
+                        })
+                        .filter(|p| seen.insert(p.clone()))
+                        .collect();
+                    let lines = if files.is_empty() {
+                        vec!["No files in context".to_string()]
+                    } else {
+                        let mut lines = vec!["Files in context:".to_string()];
+                        lines.extend(files.iter().map(|p| {
+                            std::path::Path::new(p)
+                                .strip_prefix(&cwd)
+                                .map(|rel| rel.display().to_string())
+                                .unwrap_or_else(|_| p.clone())
+                        }));
+                        lines
+                    };
+                    handler.show_panel("Files".to_string(), lines);
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
                 "/doctor" => {
                     let mut lines = vec![
                         format!("ClawedCode v{}", env!("CARGO_PKG_VERSION")),
@@ -7254,6 +7294,11 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
         CommandEntry {
             name: "/diff".to_string(),
             description: "Show uncommitted git changes".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/files".to_string(),
+            description: "List files the model has read this session".to_string(),
             source: CommandSource::BuiltIn,
         },
         CommandEntry {
