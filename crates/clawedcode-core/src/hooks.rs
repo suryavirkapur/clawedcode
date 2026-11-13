@@ -682,6 +682,40 @@ pub fn run_session_start_hooks(
     result
 }
 
+/// Run a simple event and collect `hookSpecificOutput.additionalContext`
+/// values from JSON stdout — used by PostToolUseFailure and Notification
+/// whose additionalContext is appended to the tool result.
+pub fn run_event_hooks_for_context(
+    config: &HooksConfig,
+    event: &str,
+    session_id: &str,
+    cwd: &Path,
+    extra: serde_json::Value,
+) -> Vec<String> {
+    if config.disabled {
+        return Vec::new();
+    }
+    let stdin = session_hook_input(event, session_id, cwd, extra);
+    let mut context = Vec::new();
+    for hook in hooks_for_event(config, event) {
+        let Ok(out) = run_hook_command(hook, cwd, &stdin) else {
+            continue;
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
+            if let Some(ctx) = json
+                .get("hookSpecificOutput")
+                .and_then(|o| o.get("additionalContext"))
+                .and_then(|c| c.as_str())
+                .filter(|c| !c.trim().is_empty())
+            {
+                context.push(ctx.to_string());
+            }
+        }
+    }
+    context
+}
+
 /// Run `SessionEnd` hooks — fire-and-forget (clear, resume-away, exit).
 pub fn run_session_end_hooks(config: &HooksConfig, session_id: &str, cwd: &Path, reason: &str) {
     if config.disabled {
@@ -851,16 +885,18 @@ pub fn run_permission_denied_hooks(
     }
 }
 
-/// Run `SubagentStart` hooks when a child agent begins — fire-and-forget.
+/// Run `SubagentStart` hooks when a child agent begins. Returns
+/// `hookSpecificOutput.additionalContext` for injection into the
+/// subagent's context, like the reference.
 pub fn run_subagent_start_hooks(
     config: &HooksConfig,
     session_id: &str,
     cwd: &Path,
     agent_id: &str,
     agent_type: Option<&str>,
-) {
+) -> Option<String> {
     if config.disabled {
-        return;
+        return None;
     }
     let stdin = session_hook_input(
         "SubagentStart",
@@ -872,8 +908,22 @@ pub fn run_subagent_start_hooks(
         }),
     );
     for hook in hooks_for_event(config, "SubagentStart") {
-        let _ = run_hook_command(hook, cwd, &stdin);
+        let Ok(out) = run_hook_command(hook, cwd, &stdin) else {
+            continue;
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
+            if let Some(ctx) = json
+                .get("hookSpecificOutput")
+                .and_then(|o| o.get("additionalContext"))
+                .and_then(|c| c.as_str())
+                .filter(|c| !c.trim().is_empty())
+            {
+                return Some(ctx.to_string());
+            }
+        }
     }
+    None
 }
 
 /// Run `Notification` hooks — fired when the UI would notify the user

@@ -2400,8 +2400,8 @@ impl Runtime {
         let failed = matches!(result, ContentBlock::ToolResult { is_error: true, .. });
         if failed {
             // PostToolUseFailure runs alongside PostToolUse on error
-            // results — fire-and-forget like the reference.
-            crate::hooks::run_simple_event_hooks(
+            // results; additionalContext is appended to the result.
+            let ctx = crate::hooks::run_event_hooks_for_context(
                 &hooks,
                 "PostToolUseFailure",
                 &session.id.to_string(),
@@ -2412,6 +2412,14 @@ impl Runtime {
                     "error": preview,
                 }),
             );
+            if !ctx.is_empty() {
+                if let ContentBlock::ToolResult { content, .. } = &mut result {
+                    *content = format!(
+                        "{content}\n\n[PostToolUseFailure hook]: {}",
+                        ctx.join("\n")
+                    );
+                }
+            }
         }
         let post = crate::hooks::run_post_tool_hooks(
             &hooks,
