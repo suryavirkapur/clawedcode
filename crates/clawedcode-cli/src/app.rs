@@ -375,7 +375,7 @@ pub async fn execute(boot: BootstrappedApp) -> Result<()> {
         ExecutionMode::Remote(remote_mode) => {
             execute_remote(cli, config, compatibility, remote_mode).await
         }
-        ExecutionMode::Mcp(action) => execute_mcp(&cli, &compatibility, action),
+        ExecutionMode::Mcp(action) => execute_mcp(&cli, &config, &compatibility, action),
         ExecutionMode::Doctor => execute_doctor(&cli, &config, &compatibility),
         ExecutionMode::Plugin(action) => execute_plugin(&cli, action),
         ExecutionMode::Agents => {
@@ -594,20 +594,51 @@ fn execute_doctor(
 }
 
 /// `clawedcode plugin` — list/validate plugins like the reference.
+/// Toggle `enabledPlugins` in the project `.claude/settings.json`.
+fn set_plugin_enabled(cwd: &Path, name: &str, enabled: bool) -> Result<()> {
+    let settings_path = cwd.join(".claude").join("settings.json");
+    let mut settings: serde_json::Value = std::fs::read_to_string(&settings_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let key = format!("{name}@local");
+    settings["enabledPlugins"][&key] = serde_json::json!(enabled);
+    if let Some(parent) = settings_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
+    Ok(())
+}
+
 fn execute_plugin(cli: &Cli, action: crate::cli::PluginAction) -> Result<()> {
     use crate::cli::PluginAction;
     match action {
         PluginAction::List => {
-            let plugins = compat::discover_plugins(&cli.cwd);
+            let plugins = compat::discover_plugins_all(&cli.cwd);
             if plugins.is_empty() {
                 println!("No plugins discovered.");
             } else {
                 for p in plugins {
                     let version = p.version.unwrap_or_default();
                     let desc = p.description.unwrap_or_default();
-                    println!("{}{} — {} [{}]", p.name, version, desc, p.path.display());
+                    let state = if p.enabled { "enabled" } else { "disabled" };
+                    println!(
+                        "{}{} — {} [{}] ({state})",
+                        p.name,
+                        version,
+                        desc,
+                        p.path.display()
+                    );
                 }
             }
+        }
+        PluginAction::Enable { plugin } => {
+            set_plugin_enabled(&cli.cwd, &plugin, true)?;
+            println!("Enabled '{plugin}'");
+        }
+        PluginAction::Disable { plugin } => {
+            set_plugin_enabled(&cli.cwd, &plugin, false)?;
+            println!("Disabled '{plugin}'");
         }
         PluginAction::Validate { path } => {
             let manifest_path = if path.is_dir() {
@@ -635,6 +666,7 @@ fn execute_plugin(cli: &Cli, action: crate::cli::PluginAction) -> Result<()> {
 /// reference's `claude mcp` subcommand.
 fn execute_mcp(
     cli: &Cli,
+    config: &AppConfig,
     compatibility: &compat::CompatibilitySnapshot,
     action: crate::cli::McpAction,
 ) -> Result<()> {
@@ -735,6 +767,89 @@ fn execute_mcp(
                 println!("No project MCP server choices to reset.");
             }
         }
+        McpAction::Serve => {
+            execute_mcp_serve(cli, config, compatibility)?;
+        }
+    }
+    Ok(())
+}
+
+/// `clawedcode mcp serve` — expose the tool surface as an MCP stdio
+/// server: initialize/tools/list/tools/call over Content-Length framing.
+fn execute_mcp_serve(
+    cli: &Cli,
+    config: &AppConfig,
+    compatibility: &compat::CompatibilitySnapshot,
+) -> Result<()> {
+    let runtime = Runtime::with_mode(
+        config.clone(),
+        resolve_prompt(None),
+        compatibility.clone(),
+        PermissionMode::Bypass,
+    );
+    let mut session = runtime.start_session_with_mode(cli.cwd.clone(), SessionMode::Headless);
+    let stdin = std::io::stdin();
+    let mut reader = std::io::BufReader::new(stdin.lock());
+    let mut out = std::io::stdout().lock();
+    while let Some(msg) = clawedcode_mcp::read_framed(&mut reader)? {
+        let method = msg["method"].as_str().unwrap_or_default();
+        let Some(id) = msg.get("id").cloned() else {
+            continue; // notifications have no id and no response
+        };
+        let result = match method {
+            "initialize" => serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}, "resources": {}},
+                "serverInfo": {"name": "clawedcode", "version": env!("CARGO_PKG_VERSION")},
+            }),
+            "tools/list" => serde_json::json!({
+                "tools": runtime
+                    .tool_specs()
+                    .iter()
+                    .map(|t| serde_json::json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "inputSchema": t.input_schema,
+                    }))
+                    .collect::<Vec<_>>(),
+            }),
+            "tools/call" => {
+                let name = msg["params"]["name"].as_str().unwrap_or_default();
+                let args = msg["params"]["arguments"].clone();
+                let block = runtime.execute_tool(
+                    msg["params"]["_meta"]["tool_use_id"]
+                        .as_str()
+                        .unwrap_or("mcp-call"),
+                    name,
+                    args,
+                    &mut session,
+                );
+                match block {
+                    clawedcode_core::content::ContentBlock::ToolResult {
+                        content, is_error, ..
+                    } => serde_json::json!({
+                        "content": [{"type": "text", "text": content}],
+                        "isError": is_error,
+                    }),
+                    _ => serde_json::json!({
+                        "content": [{"type": "text", "text": "ok"}],
+                        "isError": false,
+                    }),
+                }
+            }
+            "resources/list" => serde_json::json!({"resources": []}),
+            "ping" => serde_json::json!({}),
+            _ => serde_json::json!({
+                "code": -32601,
+                "message": format!("method not found: {method}"),
+            }),
+        };
+        let response = if result.get("code") == Some(&serde_json::json!(-32601)) {
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "error": result})
+        } else {
+            serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})
+        };
+        clawedcode_mcp::write_framed(&mut out, &response)?;
     }
     Ok(())
 }

@@ -375,6 +375,8 @@ pub enum McpAction {
     },
     /// Clear approved/rejected project-scoped (.mcp.json) servers for this cwd.
     ResetProjectChoices,
+    /// Start clawedcode as an MCP server over stdio.
+    Serve,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -383,6 +385,10 @@ pub enum PluginAction {
     List,
     /// Validate a plugin manifest (.claude-plugin/plugin.json or dir).
     Validate { path: PathBuf },
+    /// Enable a disabled plugin.
+    Enable { plugin: String },
+    /// Disable an enabled plugin.
+    Disable { plugin: String },
 }
 
 #[derive(Debug, Clone, Subcommand)]

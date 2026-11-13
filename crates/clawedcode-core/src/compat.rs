@@ -143,6 +143,8 @@ pub struct Plugin {
     pub name: String,
     pub description: Option<String>,
     pub version: Option<String>,
+    /// Reflects `settings.enabledPlugins` — `plugin enable/disable` toggles it.
+    pub enabled: bool,
     pub path: PathBuf,
     /// Roots searched as skill commands (`commands/`, manifest `commands`).
     pub command_dirs: Vec<PathBuf>,
@@ -186,11 +188,38 @@ fn manifest_paths(dir: &Path, value: &Option<serde_json::Value>) -> Vec<PathBuf>
 /// Discover plugins from `~/.claude/plugins/*/`, `<cwd>/.claude/plugins/*/`,
 /// and `CLAWEDCODE_PLUGIN_DIR` paths (the reference's `--plugin-dir` —
 /// session-only inline plugins).
+/// `settings.enabledPlugins` — `name@local`/`name` keys map to bool or an
+/// array of marketplaces. Missing entries default to enabled.
+fn plugin_enabled(settings: &Value, name: &str) -> bool {
+    let Some(map) = settings.get("enabledPlugins").and_then(|v| v.as_object()) else {
+        return true;
+    };
+    for key in [format!("{name}@local"), name.to_string()] {
+        match map.get(&key) {
+            Some(Value::Bool(b)) => return *b,
+            Some(Value::Array(_)) => return true,
+            Some(Value::Null) | None => {}
+            _ => {}
+        }
+    }
+    true
+}
+
+/// All plugins regardless of enabled state (used by `plugin list`).
+pub fn discover_plugins_all(cwd: &Path) -> Vec<Plugin> {
+    discover_plugins_impl(cwd, false)
+}
+
 pub fn discover_plugins(cwd: &Path) -> Vec<Plugin> {
+    discover_plugins_impl(cwd, true)
+}
+
+fn discover_plugins_impl(cwd: &Path, filter_enabled: bool) -> Vec<Plugin> {
     // `--bare`: minimal mode skips plugin discovery like the reference.
     if std::env::var_os("CLAWEDCODE_SIMPLE").is_some() {
         return Vec::new();
     }
+    let settings = discover_settings(cwd).map(|(_, v)| v).unwrap_or_default();
     let mut roots: Vec<PathBuf> = Vec::new();
     if let Some(home) = claude_home() {
         roots.push(home.join("plugins"));
@@ -251,19 +280,25 @@ pub fn discover_plugins(cwd: &Path) -> Vec<Plugin> {
             skill_dirs.push(dir.join("skills"));
         }
 
+        let name = manifest.name.unwrap_or_else(|| {
+            dir.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "plugin".to_string())
+        });
+        let enabled = plugin_enabled(&settings, &name);
         plugins.push(Plugin {
-            name: manifest.name.unwrap_or_else(|| {
-                dir.file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "plugin".to_string())
-            }),
+            name,
             description: manifest.description,
             version: manifest.version,
+            enabled,
             path: dir,
             command_dirs,
             agent_dirs,
             skill_dirs,
         });
+    }
+    if filter_enabled {
+        plugins.retain(|p| p.enabled);
     }
     plugins
 }

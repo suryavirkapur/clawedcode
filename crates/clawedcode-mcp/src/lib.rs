@@ -578,6 +578,43 @@ impl Drop for McpStdioClient {
 
 const MCP_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Write a JSON-RPC message with Content-Length framing (server side).
+pub fn write_framed(out: &mut impl std::io::Write, value: &Value) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(value).map_err(std::io::Error::other)?;
+    write!(out, "Content-Length: {}\r\n\r\n", bytes.len())?;
+    out.write_all(&bytes)?;
+    out.flush()
+}
+
+/// Read one Content-Length-framed JSON-RPC message; `Ok(None)` on clean EOF.
+pub fn read_framed(reader: &mut impl BufRead) -> std::io::Result<Option<Value>> {
+    let mut content_length = None;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            return Ok(None);
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some(v) = trimmed.strip_prefix("Content-Length:") {
+            content_length = Some(
+                v.trim()
+                    .parse::<usize>()
+                    .map_err(std::io::Error::other)?,
+            );
+        }
+    }
+    let n = content_length.ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "missing Content-Length")
+    })?;
+    let mut body = vec![0u8; n];
+    std::io::Read::read_exact(reader, &mut body)?;
+    serde_json::from_slice(&body).map(Some).map_err(std::io::Error::other)
+}
+
 /// Wait until `fd` is readable or `timeout` elapses. Uses `poll(2)` so a
 /// wedged child process can't block us forever on a pipe read.
 fn poll_fd_readable(fd: std::os::unix::io::RawFd, timeout: std::time::Duration) -> bool {
