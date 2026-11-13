@@ -874,6 +874,12 @@ struct ReplHandler {
     /// Bypass-mode acceptance dialog — shown once when bypass is entered
     /// without `skipDangerousModePermissionPrompt` accepted.
     bypass_confirm: bool,
+    /// "Yes, clear context" plan accept — the implement prompt to run on a
+    /// fresh session after the turn finishes.
+    plan_implement_pending: Option<String>,
+    /// ExitPlanMode tool_use ids seen — their ToolResult flips mode on the
+    /// auto-approved paths where no dialog ran.
+    plan_exit_ids: std::collections::HashSet<String>,
     turn_tokens: u64,
     total_input_tokens: u64,
     total_output_tokens: u64,
@@ -907,6 +913,8 @@ impl ReplHandler {
             copy_picker_text: String::new(),
             copy_picker_blocks: Vec::new(),
             bypass_confirm: false,
+            plan_implement_pending: None,
+            plan_exit_ids: std::collections::HashSet::new(),
             turn_tokens: 0,
             total_input_tokens: 0,
             total_output_tokens: 0,
@@ -1330,6 +1338,17 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
             &mut awaiting_approval,
             &mut bg_approval_owner,
         );
+        // "Yes, clear context" — fresh messages + the implement prompt
+        // queued once the accepting turn has finished.
+        if active_turn.is_none()
+            && let Some(implement) = handler.plan_implement_pending.take()
+        {
+            ctx.session_mut().messages.clear();
+            handler.clear_live_turn();
+            handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
+            let _ = ctx.save_session();
+            queued_prompts.insert(0, implement);
+        }
         maybe_submit_queued_prompt(
             ctx,
             &mut handler,
@@ -1442,6 +1461,13 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 Some(req) if is_question_request(req) => {
                     question_dialog_height(req, question_index, approval_amend.is_some())
                 }
+                Some(req) if is_plan_exit_request(req) => plan_exit_dialog_height(
+                    req,
+                    ctx,
+                    approval_amend.is_some(),
+                    approval_explain,
+                    approval_debug,
+                ),
                 _ => approval_selector_height(
                     awaiting_approval.as_ref(),
                     approval_selection,
@@ -1521,6 +1547,17 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
             }
 
             if awaiting_approval.is_some()
+                && approval_height > 0
+                && is_plan_exit_request(awaiting_approval.as_ref().unwrap())
+            {
+                render_plan_exit_selector(
+                    frame,
+                    chunks[2],
+                    awaiting_approval.as_ref().unwrap(),
+                    approval_selection,
+                    ctx,
+                );
+            } else if awaiting_approval.is_some()
                 && approval_height > 0
                 && is_question_request(awaiting_approval.as_ref().unwrap())
             {
@@ -2227,6 +2264,81 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                             }
                             _ => {}
                         }
+                        viewport.pinned_to_bottom = true;
+                        viewport.unseen_count = 0;
+                        continue;
+                    }
+
+                    // ExitPlanMode: the plan-accept dialog (reference
+                    // ExitPlanModePermissionRequest).
+                    if awaiting_approval
+                        .as_ref()
+                        .map(is_plan_exit_request)
+                        .unwrap_or(false)
+                    {
+                        let req = awaiting_approval.as_ref().unwrap().clone();
+                        let options =
+                            plan_exit_options(&req, plan_exit_show_clear(ctx), false);
+                        let last = options.len() - 1;
+                        match key.code {
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                approval_selection = approval_selection.saturating_sub(1);
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                approval_selection = (approval_selection + 1).min(last);
+                            }
+                            KeyCode::Enter => resolve_plan_exit(
+                                approval_selection.min(last),
+                                &options,
+                                ctx,
+                                &mut handler,
+                                &mut awaiting_approval,
+                                &active_turn,
+                                &background_turns,
+                                &mut bg_approval_owner,
+                            ),
+                            KeyCode::Char(c)
+                                if c.is_ascii_digit() && c != '0' =>
+                            {
+                                let idx = (c as usize) - ('1' as usize);
+                                if idx <= last {
+                                    resolve_plan_exit(
+                                        idx,
+                                        &options,
+                                        ctx,
+                                        &mut handler,
+                                        &mut awaiting_approval,
+                                        &active_turn,
+                                        &background_turns,
+                                        &mut bg_approval_owner,
+                                    );
+                                }
+                            }
+                            KeyCode::Char('y') | KeyCode::Char('Y') => resolve_plan_exit(
+                                approval_selection.min(last - 1),
+                                &options,
+                                ctx,
+                                &mut handler,
+                                &mut awaiting_approval,
+                                &active_turn,
+                                &background_turns,
+                                &mut bg_approval_owner,
+                            ),
+                            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                                resolve_plan_exit(
+                                    last,
+                                    &options,
+                                    ctx,
+                                    &mut handler,
+                                    &mut awaiting_approval,
+                                    &active_turn,
+                                    &background_turns,
+                                    &mut bg_approval_owner,
+                                );
+                            }
+                            _ => {}
+                        }
+                        approval_selection = approval_selection.min(last);
                         viewport.pinned_to_bottom = true;
                         viewport.unseen_count = 0;
                         continue;
@@ -3915,6 +4027,73 @@ fn approval_selector_height(
     11 + u16::from(amending) + u16::from(explain) + u16::from(debug) + diff_rows
 }
 
+/// Plan-accept dialog (reference ExitPlanModePermissionRequest): a bordered
+/// plan preview then the numbered accept options — clear-context when
+/// `showClearContextOnPlanAccept`, otherwise the keep-context set.
+fn render_plan_exit_selector(
+    frame: &mut Frame,
+    area: Rect,
+    request: &ApprovalRequest,
+    selected: usize,
+    ctx: &TuiContext,
+) {
+    let show_clear = plan_exit_show_clear(ctx);
+    let options = plan_exit_options(request, show_clear, false);
+    let border_width = area.width.saturating_sub(2) as usize;
+    frame.render_widget(
+        Paragraph::new(format!("╭{}╮", "─".repeat(border_width)))
+            .style(Style::default().fg(pal().permission_fg)),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                "Exit plan mode?",
+                Style::default()
+                    .fg(pal().permission_fg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+    ];
+    let plan = plan_exit_plan_text(request, ctx);
+    for line in plan.lines().take(MAX_PLAN_PREVIEW_ROWS) {
+        lines.push(Line::from(Span::styled(
+            format!(" {}", truncate_for_display(line, area.width as usize - 4)),
+            Style::default().fg(pal().text),
+        )));
+    }
+    if plan.lines().count() > MAX_PLAN_PREVIEW_ROWS {
+        lines.push(Line::from(Span::styled(
+            format!("  … +{} lines", plan.lines().count() - MAX_PLAN_PREVIEW_ROWS),
+            Style::default().fg(pal().muted),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " Would you like to proceed?".to_string(),
+        Style::default().fg(pal().dim),
+    )));
+
+    for (index, (option, _, _)) in options.iter().enumerate() {
+        let is_selected = index == selected;
+        let marker = if is_selected { "❯ " } else { "  " };
+        let style = if is_selected {
+            Style::default().fg(pal().permission_fg)
+        } else {
+            Style::default().fg(pal().dim)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {marker}"), style),
+            Span::styled(format!("{}. {}", index + 1, option), style),
+        ]));
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 /// Permission dialog: a top-only rounded border in `permission` blue, the
 /// tool title, the rendered input, "Do you want to proceed?", then the
 /// numbered options with a `❯` focus marker — matches PermissionDialog +
@@ -4131,6 +4310,133 @@ fn advance_question(
 /// ask_user_question requests render the reference's AskUserQuestion
 /// dialog (header chip + question + labeled options + "Other") instead
 /// of the Yes/No permission dialog.
+fn is_plan_exit_request(request: &ApprovalRequest) -> bool {
+    request.tool_name == "ExitPlanMode"
+}
+
+/// Reference ExitPlanModePermissionRequest options. Choice 0 is
+/// "clear context & accept edits" only when `showClearContextOnPlanAccept`
+/// is set; the rest keep context. Returns (label, clear, mode).
+fn plan_exit_options(
+    request: &ApprovalRequest,
+    show_clear: bool,
+    bypass_available: bool,
+) -> Vec<(String, bool, clawedcode_core::permissions::PermissionMode)> {
+    use clawedcode_core::permissions::PermissionMode;
+    let keep = if bypass_available {
+        PermissionMode::Bypass
+    } else {
+        PermissionMode::AcceptEdits
+    };
+    let mut options: Vec<(String, bool, PermissionMode)> = Vec::new();
+    if show_clear {
+        options.push(("Yes, clear context & auto-accept edits".to_string(), true, keep));
+    }
+    options.push(("Yes, auto-accept edits".to_string(), false, keep));
+    options.push((
+        "Yes, manually approve edits".to_string(),
+        false,
+        PermissionMode::Default,
+    ));
+    options.push(("No, keep planning".to_string(), false, PermissionMode::Plan));
+    let _ = request;
+    options
+}
+
+fn plan_exit_show_clear(ctx: &TuiContext) -> bool {
+    ctx.runtime
+        .compatibility()
+        .settings
+        .get("showClearContextOnPlanAccept")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+fn plan_exit_plan_text(request: &ApprovalRequest, ctx: &TuiContext) -> String {
+    request
+        .input
+        .get("plan")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            std::fs::read_to_string(clawedcode_core::plans::plan_file(
+                ctx.session(),
+                &ctx.runtime.compatibility().settings,
+            ))
+            .ok()
+        })
+        .unwrap_or_default()
+}
+
+const MAX_PLAN_PREVIEW_ROWS: usize = 10;
+
+/// Resolve a plan-accept dialog choice: apply the chosen permission mode,
+/// record the decision, and send the outcome — the reference's
+/// ExitPlanModePermissionRequest `handleResponse`. `clear` queues the
+/// implement prompt on a fresh context after the turn ends.
+#[allow(clippy::too_many_arguments)]
+fn resolve_plan_exit(
+    index: usize,
+    options: &[(String, bool, clawedcode_core::permissions::PermissionMode)],
+    ctx: &mut TuiContext,
+    handler: &mut ReplHandler,
+    awaiting_approval: &mut Option<ApprovalRequest>,
+    active_turn: &Option<ActiveTurn>,
+    background_turns: &[BackgroundTurn],
+    bg_approval_owner: &mut Option<usize>,
+) {
+    use clawedcode_core::permissions::PermissionMode;
+    let Some(req) = awaiting_approval.take() else {
+        return;
+    };
+    let last = options.len() - 1;
+    let approved = index < last;
+    let (clear, mode) = options
+        .get(index.min(last))
+        .map(|(_, c, m)| (*c, *m))
+        .unwrap_or((false, PermissionMode::Plan));
+    if approved {
+        ctx.set_permission_mode(mode);
+        if clear {
+            let plan = plan_exit_plan_text(&req, ctx);
+            handler.plan_implement_pending =
+                Some(format!("Implement the following plan:
+
+{plan}"));
+        }
+    }
+    handler.plan_exit_ids.remove(&req.tool_use_id);
+    handler.record_live_tool_approval_decision(&req.tool_use_id, approved);
+    let sender = match *bg_approval_owner {
+        Some(i) => background_turns.get(i).map(|bg| &bg.turn.approvals),
+        None => active_turn.as_ref().map(|turn| &turn.approvals),
+    };
+    *bg_approval_owner = None;
+    if let Some(sender) = sender {
+        let feedback = if approved {
+            None
+        } else {
+            Some("Plan not approved — keep planning.".to_string())
+        };
+        let _ = sender.send(ApprovalOutcome { approved, feedback });
+    }
+}
+
+/// Plan-accept dialog height — plan preview replaces the single input line
+/// and the option count varies with `showClearContextOnPlanAccept`.
+fn plan_exit_dialog_height(
+    request: &ApprovalRequest,
+    ctx: &TuiContext,
+    amending: bool,
+    explain: bool,
+    debug: bool,
+) -> u16 {
+    let preview = 1 + MAX_PLAN_PREVIEW_ROWS
+        .min(plan_exit_plan_text(request, ctx).lines().count()) as u16;
+    let options = if plan_exit_show_clear(ctx) { 4u16 } else { 3u16 };
+    10 + preview + options + u16::from(amending) + u16::from(explain) + u16::from(debug)
+}
+
 fn is_question_request(request: &ApprovalRequest) -> bool {
     request.tool_name == clawedcode_tools::ASK_USER_QUESTION_TOOL_NAME
 }
@@ -6328,11 +6634,29 @@ fn drain_turn_events(
                 TurnWorkerEvent::Ui(event) => {
                     // Plan-mode tools flip the session's permission mode —
                     // the runtime can't mutate its own mode from `&self`.
+                    if let TuiEvent::ToolResult {
+                        tool_use_id,
+                        is_error,
+                        ..
+                    } = &event
+                        && !*is_error
+                        && handler.plan_exit_ids.contains(tool_use_id)
+                        && ctx.permission_mode()
+                            == clawedcode_core::permissions::PermissionMode::Plan
+                    {
+                        ctx.set_permission_mode(
+                            clawedcode_core::permissions::PermissionMode::Default,
+                        );
+                    }
                     if let TuiEvent::ToolUse { name, .. } = &event {
                         use clawedcode_core::permissions::PermissionMode;
                         match name.as_str() {
                             "EnterPlanMode" => ctx.set_permission_mode(PermissionMode::Plan),
-                            "ExitPlanMode" => ctx.set_permission_mode(PermissionMode::Default),
+                            "ExitPlanMode" => {
+                                if let TuiEvent::ToolUse { id, .. } = &event {
+                                    handler.plan_exit_ids.insert(id.clone());
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -11504,6 +11828,30 @@ mod command_policy_tests {
 
         let multiline = wrap_input("a\nb", 10);
         assert_eq!(multiline, vec!["> a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn plan_exit_options_match_reference_choices() {
+        let request = ApprovalRequest {
+            tool_use_id: "t1".to_string(),
+            tool_name: "ExitPlanMode".to_string(),
+            input: serde_json::json!({}),
+        };
+        assert!(is_plan_exit_request(&request));
+        use clawedcode_core::permissions::PermissionMode;
+        // Without showClearContextOnPlanAccept: 3 keep-context options.
+        let options = plan_exit_options(&request, false, false);
+        assert_eq!(options.len(), 3);
+        assert_eq!(options[0].2, PermissionMode::AcceptEdits);
+        assert_eq!(options[1].2, PermissionMode::Default);
+        assert_eq!(options[2].2, PermissionMode::Plan);
+        assert!(options[0].0.contains("auto-accept"));
+        // With the setting: the clear-context option leads.
+        let options = plan_exit_options(&request, true, false);
+        assert_eq!(options.len(), 4);
+        assert!(options[0].1, "clear-context option should clear");
+        assert!(options[0].0.contains("clear context"));
+        assert_eq!(options[3].2, PermissionMode::Plan);
     }
 
     #[test]

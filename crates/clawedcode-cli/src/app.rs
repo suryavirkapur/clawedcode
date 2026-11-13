@@ -1556,6 +1556,11 @@ fn build_approval_fn(yes: bool) -> ApprovalFn {
         Box::new(|_, _, _| true.into())
     } else {
         Box::new(|_tool_use_id, tool_name, input| {
+            if tool_name == "ExitPlanMode" {
+                // Headless has no plan-accept dialog — approve so the plan
+                // reaches the transcript like the reference's print mode.
+                return true.into();
+            }
             let input_preview = serde_json::to_string(input).unwrap_or_default();
             eprintln!(
                 "\n[approval] Tool '{}' requested. Input: {}",

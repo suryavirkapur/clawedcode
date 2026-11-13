@@ -2471,6 +2471,12 @@ impl Runtime {
             d
         } else if let Some(d) = rule_decision.clone() {
             d
+        } else if tool_name == "ExitPlanMode"
+            && self.permission_engine.mode() != PermissionMode::Bypass
+        {
+            // Reference: ExitPlanMode is always a user-decision prompt —
+            // the plan-accept dialog — outside bypass mode.
+            PermissionDecision::Ask
         } else {
             self.permission_engine.decide(needs_approval, write_like)
         };
@@ -3738,6 +3744,80 @@ mod tests {
         assert_eq!(parse_pr_reference("feature/x"), None);
         assert_eq!(parse_pr_reference("#abc"), None);
         assert_eq!(parse_pr_reference(""), None);
+    }
+
+    fn make_plan_runtime() -> Runtime {
+        let config = AppConfig::default();
+        let prompt_spec = PromptSpec {
+            name: "test",
+            summary: "test",
+            body: "You are a test assistant. Use tools when needed.",
+        };
+        let compat = CompatibilitySnapshot {
+            settings_files: vec![],
+            settings: serde_json::Value::Null,
+            skills: vec![],
+            memory_files: vec![],
+            memory: String::new(),
+            mcp_servers: std::collections::BTreeMap::new(),
+        };
+        Runtime::with_provider(
+            config,
+            prompt_spec,
+            compat,
+            PermissionMode::Plan,
+            Box::new(MockToolProvider),
+        )
+    }
+
+    #[test]
+    fn exit_plan_mode_asks_in_plan_mode() {
+        let runtime = make_plan_runtime();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut session = runtime.start_session(tmp.path().to_path_buf());
+        // Write a plan file so the tool has content to present.
+        let plan_file = crate::plans::ensure_plan_file(&session, &serde_json::Value::Null);
+        fs::write(&plan_file, "1. do the thing").unwrap();
+
+        // Denied → the tool result is an error and the plan is not
+        // "submitted" — the model keeps planning.
+        let asked = std::sync::atomic::AtomicBool::new(false);
+        let denied = runtime.execute_tool_with_approval(
+            "tu1",
+            "ExitPlanMode",
+            serde_json::json!({}),
+            &mut session,
+            &|_, _, _| {
+                asked.store(true, std::sync::atomic::Ordering::Relaxed);
+                ApprovalOutcome {
+                    approved: false,
+                    feedback: None,
+                }
+            },
+        );
+        assert!(
+            asked.load(std::sync::atomic::Ordering::Relaxed),
+            "ExitPlanMode must prompt in plan mode"
+        );
+        let text = match &denied {
+            ContentBlock::ToolResult { content, .. } => content.clone(),
+            other => panic!("expected ToolResult, got {other:?}"),
+        };
+        assert!(text.contains("denied"), "unexpected result: {text}");
+
+        // Approved → the plan contents come back for the record.
+        let approved = runtime.execute_tool_with_approval(
+            "tu2",
+            "ExitPlanMode",
+            serde_json::json!({}),
+            &mut session,
+            &|_, _, _| true.into(),
+        );
+        let text = match &approved {
+            ContentBlock::ToolResult { content, .. } => content.clone(),
+            other => panic!("expected ToolResult, got {other:?}"),
+        };
+        assert!(text.contains("do the thing"), "unexpected result: {text}");
     }
 
     fn make_runtime() -> Runtime {
