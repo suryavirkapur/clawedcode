@@ -345,7 +345,7 @@ impl TaskStore {
             .map_err(|err| format!("Failed to create {}: {err}", self.tasks_dir().display()))
     }
 
-    fn tasks_dir(&self) -> PathBuf {
+    pub fn tasks_dir(&self) -> PathBuf {
         self.root.join(sanitize_path_component(&self.task_list_id))
     }
 

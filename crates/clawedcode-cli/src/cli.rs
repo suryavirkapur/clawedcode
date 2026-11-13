@@ -315,6 +315,23 @@ pub enum Command {
         #[command(subcommand)]
         action: PluginAction,
     },
+    /// Manage task list tasks.
+    Task {
+        #[command(subcommand)]
+        action: TaskAction,
+    },
+    /// Manage authentication.
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
+    /// Export a conversation transcript to a text file.
+    Export {
+        /// Session ID, or path to a session JSON file.
+        source: String,
+        /// Output file path for the exported text.
+        output: PathBuf,
+    },
     /// Connect to a remote orchestrator.
     Remote {
         #[arg(long)]
@@ -368,6 +385,72 @@ pub enum PluginAction {
     Validate { path: PathBuf },
 }
 
+#[derive(Debug, Clone, Subcommand)]
+pub enum TaskAction {
+    /// Create a new task.
+    Create {
+        subject: String,
+        #[arg(short = 'd', long)]
+        description: Option<String>,
+        /// Task list ID (defaults to "tasklist").
+        #[arg(short = 'l', long)]
+        list: Option<String>,
+    },
+    /// List all tasks.
+    List {
+        #[arg(short = 'l', long)]
+        list: Option<String>,
+        /// Show only pending tasks.
+        #[arg(long)]
+        pending: bool,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Get details of a task.
+    Get {
+        id: String,
+        #[arg(short = 'l', long)]
+        list: Option<String>,
+    },
+    /// Update a task.
+    Update {
+        id: String,
+        #[arg(short = 'l', long)]
+        list: Option<String>,
+        /// Set status (pending, in_progress, completed).
+        #[arg(short = 's', long)]
+        status: Option<String>,
+        #[arg(long)]
+        subject: Option<String>,
+        #[arg(short = 'd', long)]
+        description: Option<String>,
+        #[arg(long)]
+        owner: Option<String>,
+        #[arg(long)]
+        clear_owner: bool,
+    },
+    /// Show the tasks directory path.
+    Dir {
+        #[arg(short = 'l', long)]
+        list: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum AuthAction {
+    /// Sign in (requires Anthropic account access).
+    Login,
+    /// Show authentication status.
+    Status {
+        /// Human-readable output instead of JSON.
+        #[arg(long)]
+        text: bool,
+    },
+    /// Sign out.
+    Logout,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Intent {
     Interactive,
@@ -415,6 +498,9 @@ impl Cli {
             Some(Command::Mcp { .. }) => Intent::Mcp,
             Some(Command::Doctor) | Some(Command::Plugin { .. }) => Intent::Interactive,
             Some(Command::Agents) | Some(Command::Completion { .. }) => Intent::Interactive,
+            Some(Command::Task { .. })
+            | Some(Command::Auth { .. })
+            | Some(Command::Export { .. }) => Intent::Interactive,
             None => Intent::Interactive,
         }
     }

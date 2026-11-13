@@ -400,7 +400,172 @@ pub async fn execute(boot: BootstrappedApp) -> Result<()> {
             clap_complete::generate(shell, &mut cmd, "clawedcode", &mut std::io::stdout());
             Ok(())
         }
+        ExecutionMode::Task(action) => execute_task(&cli, action),
+        ExecutionMode::Auth(action) => execute_auth(&cli, action),
+        ExecutionMode::Export { source, output } => execute_export(&cli, &source, &output),
     }
+}
+
+/// `clawedcode task` — backed by the same TaskStore the TodoWrite/Task
+/// tools use (<data-dir>/tasks/<list-id>/).
+fn execute_task(cli: &Cli, action: crate::cli::TaskAction) -> Result<()> {
+    use clawedcode_core::tasks::{TaskPatch, TaskStatus, TaskStore};
+    let list_id = match &action {
+        crate::cli::TaskAction::Create { list, .. }
+        | crate::cli::TaskAction::List { list, .. }
+        | crate::cli::TaskAction::Get { list, .. }
+        | crate::cli::TaskAction::Update { list, .. }
+        | crate::cli::TaskAction::Dir { list } => list.clone().unwrap_or_else(|| "tasklist".into()),
+    };
+    let root = cli
+        .data_dir
+        .clone()
+        .or_else(clawedcode_core::config::default_data_dir)
+        .context("no task data directory available")?
+        .join("tasks");
+    let store = TaskStore::new(root, list_id);
+
+    match action {
+        crate::cli::TaskAction::Create {
+            subject,
+            description,
+            ..
+        } => {
+            let task = store
+                .create_task(subject, description.unwrap_or_default(), None, None)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            println!("Created task #{}: {}", task.id, task.subject);
+        }
+        crate::cli::TaskAction::List { pending, json, .. } => {
+            let mut tasks = store.list_tasks().map_err(|e| anyhow::anyhow!(e))?;
+            if pending {
+                tasks.retain(|t| t.status != TaskStatus::Completed);
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&tasks)?);
+            } else if tasks.is_empty() {
+                println!("No tasks found.");
+            } else {
+                for t in tasks {
+                    println!("#{} [{}] {}", t.id, serde_json::to_value(&t.status).unwrap().as_str().unwrap_or("?"), t.subject);
+                }
+            }
+        }
+        crate::cli::TaskAction::Get { id, .. } => {
+            let task = store
+                .get_task(&id)
+                .map_err(|e| anyhow::anyhow!(e))?
+                .with_context(|| format!("Task #{id} not found"))?;
+            println!("{}", serde_json::to_string_pretty(&task)?);
+        }
+        crate::cli::TaskAction::Update {
+            id,
+            status,
+            subject,
+            description,
+            owner,
+            clear_owner,
+            ..
+        } => {
+            let status = match status.as_deref() {
+                None => None,
+                Some("pending") => Some(Some(TaskStatus::Pending)),
+                Some("in_progress") => Some(Some(TaskStatus::InProgress)),
+                Some("completed") => Some(Some(TaskStatus::Completed)),
+                Some(other) => anyhow::bail!("unknown task status: {other}"),
+            };
+            let patch = TaskPatch {
+                subject,
+                description,
+                status: if clear_owner && status.is_none() {
+                    None
+                } else {
+                    status
+                },
+                owner: if clear_owner {
+                    Some(String::new())
+                } else {
+                    owner
+                },
+                ..Default::default()
+            };
+            store
+                .update_task(&id, patch)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            println!("Updated task #{id}");
+        }
+        crate::cli::TaskAction::Dir { .. } => {
+            println!("{}", store.tasks_dir().display());
+        }
+    }
+    Ok(())
+}
+
+/// `clawedcode auth` — status reports configured credentials; login/logout
+/// require Anthropic account flows we don't implement locally.
+fn execute_auth(_cli: &Cli, action: crate::cli::AuthAction) -> Result<()> {
+    match action {
+        crate::cli::AuthAction::Status { text } => {
+            let api_key = std::env::var("ANTHROPIC_API_KEY").ok();
+            let oauth = std::env::var("CLAUDE_CODE_OAUTH_TOKEN").ok();
+            let source = if api_key.is_some() {
+                "ANTHROPIC_API_KEY"
+            } else if oauth.is_some() {
+                "CLAUDE_CODE_OAUTH_TOKEN"
+            } else {
+                "none"
+            };
+            if text {
+                println!("Authenticated: {}", api_key.is_some() || oauth.is_some());
+                println!("Auth source:  {source}");
+            } else {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "authenticated": api_key.is_some() || oauth.is_some(),
+                        "authSource": source,
+                    })
+                );
+            }
+        }
+        crate::cli::AuthAction::Login | crate::cli::AuthAction::Logout => {
+            anyhow::bail!(
+                "auth login/logout requires Anthropic account access;                  set ANTHROPIC_API_KEY instead"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `clawedcode export <source> <output>` — session transcript to text.
+fn execute_export(cli: &Cli, source: &str, output: &std::path::Path) -> Result<()> {
+    let session = if std::path::Path::new(source).exists() {
+        let raw = std::fs::read_to_string(source)?;
+        serde_json::from_str::<clawedcode_core::session::Session>(&raw)
+            .context("failed to parse session file")?
+    } else {
+        let sessions_dir = session_store_dir(cli.data_dir.clone())
+            .context("no session data directory available")?;
+        clawedcode_core::session::Session::load_by_id(&sessions_dir, source)?
+    };
+    let mut text = String::new();
+    for msg in &session.messages {
+        let role = format!("{:?}", msg.role);
+        if let Some(body) = msg.primary_text() {
+            text.push_str(&format!("=== {role} ===
+{body}
+
+"));
+        }
+    }
+    std::fs::write(output, &text)
+        .with_context(|| format!("failed to write {}", output.display()))?;
+    println!(
+        "Exported {} messages to {}",
+        session.messages.len(),
+        output.display()
+    );
+    Ok(())
 }
 
 /// `clawedcode doctor` — environment health check like the reference.

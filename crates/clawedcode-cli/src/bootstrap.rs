@@ -31,6 +31,9 @@ pub enum ExecutionMode {
     Mcp(crate::cli::McpAction),
     Doctor,
     Plugin(crate::cli::PluginAction),
+    Task(crate::cli::TaskAction),
+    Auth(crate::cli::AuthAction),
+    Export { source: String, output: PathBuf },
     Agents,
     Completion(clap_complete::Shell),
 }
@@ -402,6 +405,9 @@ pub fn resolve_mode(cli: &Cli) -> Result<ExecutionMode> {
         Command::Agents => Ok(ExecutionMode::Agents),
         Command::Completion { shell } => Ok(ExecutionMode::Completion(shell)),
         Command::Plugin { action } => Ok(ExecutionMode::Plugin(action)),
+        Command::Task { action } => Ok(ExecutionMode::Task(action)),
+        Command::Auth { action } => Ok(ExecutionMode::Auth(action)),
+        Command::Export { source, output } => Ok(ExecutionMode::Export { source, output }),
     }
 }
 
