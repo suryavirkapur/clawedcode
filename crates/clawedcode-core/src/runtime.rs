@@ -1151,6 +1151,33 @@ impl Runtime {
             }
 
             if !turn_result.has_tool_use {
+                // API-error endings fire StopFailure instead of Stop hooks —
+                // hooks evaluating an error message create a death spiral.
+                if let Some(err) = &turn_result.stream_error {
+                    let kind = match err {
+                        clawedcode_api::ProviderError::Api { status, .. } => match status {
+                            401 | 403 => "authentication_failed",
+                            402 => "billing_error",
+                            429 => "rate_limit",
+                            400 | 404 | 422 => "invalid_request",
+                            _ => "server_error",
+                        },
+                        clawedcode_api::ProviderError::RetryExhausted { .. } => "rate_limit",
+                        _ => "unknown",
+                    };
+                    crate::hooks::run_simple_event_hooks(
+                        &hook_configs,
+                        "StopFailure",
+                        &session.id.to_string(),
+                        &session.cwd,
+                        serde_json::json!({
+                            "error": kind,
+                            "error_details": err.to_string(),
+                            "last_assistant_message": turn_result.text,
+                        }),
+                    );
+                    break;
+                }
                 // Stop hooks: a blocking hook feeds its reason back to the
                 // model as a user message and the turn continues.
                 match crate::hooks::run_stop_hooks(

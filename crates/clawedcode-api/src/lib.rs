@@ -429,6 +429,40 @@ fn mock_summarize_cargo_toml(contents: &str) -> String {
     }
 }
 
+/// A provider that immediately fails with a rate-limit API error — exercises
+/// StopFailure hooks and --fallback-model retry paths.
+#[derive(Debug, Default, Clone)]
+pub struct MockFailProvider;
+
+impl Provider for MockFailProvider {
+    fn complete(
+        &self,
+        _request: &CompletionRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<CompletionResponse, ProviderError>> + Send + '_>> {
+        Box::pin(async move {
+            Err(ProviderError::Api {
+                status: 429,
+                message: "mock rate limit".to_string(),
+            })
+        })
+    }
+
+    fn stream(&self, _request: &CompletionRequest) -> EventStream {
+        let (tx, rx) = mpsc::channel::<Result<ApiEvent, ProviderError>>(32);
+        tokio::spawn(async move {
+            let _ = tx
+                .send(Err(ProviderError::Api {
+                    status: 429,
+                    message: "mock rate limit".to_string(),
+                }))
+                .await;
+        });
+        Box::pin(futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        }))
+    }
+}
+
 // --- MockToolProvider: deterministic provider for tests that triggers a tool call ---
 
 /// A mock provider that, on the first call, emits a `read_file` ToolUse for
@@ -1825,6 +1859,10 @@ pub fn create_provider() -> BoxedProvider {
             "mock_agent" => {
                 tracing::info!("Using mock agent provider");
                 return Box::new(MockAgentProvider);
+            }
+            "mock_fail" => {
+                tracing::info!("Using mock fail provider");
+                return Box::new(MockFailProvider);
             }
             #[cfg(feature = "openai")]
             "deepseek" => {
