@@ -174,6 +174,28 @@ pub fn resolve_mode(cli: &Cli) -> Result<ExecutionMode> {
         }));
     }
 
+    // --resume-session-at / --rewind-files require --resume like the reference.
+    let resumable = matches!(
+        cli.resume.as_deref(),
+        Some(id) if !id.is_empty()
+    ) || matches!(cli.command, Some(Command::Resume { .. }));
+    if cli.resume_session_at.is_some() && !resumable {
+        anyhow::bail!("--resume-session-at requires --resume");
+    }
+    if cli.rewind_files.is_some() && !resumable {
+        anyhow::bail!("--rewind-files requires --resume");
+    }
+    let subcommand_prompt = matches!(
+        &cli.command,
+        Some(Command::Resume {
+            prompt: Some(_),
+            ..
+        })
+    );
+    if cli.rewind_files.is_some() && (cli.prompt.is_some() || cli.print || subcommand_prompt) {
+        anyhow::bail!("--rewind-files is a standalone operation and cannot be used with a prompt");
+    }
+
     // Reference-style top-level flags: `clawedcode -p "x"` prints,
     // `clawedcode -c` continues, `clawedcode -r <id>` resumes.
     if cli.print {
@@ -507,6 +529,8 @@ mod tests {
             print: false,
             continue_session: false,
             resume: None,
+            resume_session_at: None,
+            rewind_files: None,
         }
     }
 
@@ -756,6 +780,8 @@ mod tests {
             print: false,
             continue_session: false,
             resume: None,
+            resume_session_at: None,
+            rewind_files: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Tui));
@@ -794,6 +820,8 @@ mod tests {
             print: false,
             continue_session: false,
             resume: None,
+            resume_session_at: None,
+            rewind_files: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -832,6 +860,8 @@ mod tests {
             print: false,
             continue_session: false,
             resume: None,
+            resume_session_at: None,
+            rewind_files: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));
@@ -873,6 +903,8 @@ mod tests {
             print: false,
             continue_session: false,
             resume: None,
+            resume_session_at: None,
+            rewind_files: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::DirectConnect(_)));
@@ -914,6 +946,8 @@ mod tests {
             print: false,
             continue_session: false,
             resume: None,
+            resume_session_at: None,
+            rewind_files: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Ssh(_)));
@@ -962,6 +996,8 @@ mod tests {
             print: false,
             continue_session: false,
             resume: None,
+            resume_session_at: None,
+            rewind_files: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -1014,6 +1050,8 @@ mod tests {
             print: false,
             continue_session: false,
             resume: None,
+            resume_session_at: None,
+            rewind_files: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));

@@ -212,6 +212,32 @@ impl Session {
         }
     }
 
+    /// Restore files to the state captured at/after `message_index` —
+    /// checkpoints are applied newest-first then pruned. Returns the number
+    /// of file writes/removals performed.
+    pub fn restore_checkpoints_at(&mut self, message_index: usize) -> usize {
+        let checkpoints = std::mem::take(&mut self.checkpoints);
+        let mut restored = 0usize;
+        for cp in checkpoints
+            .iter()
+            .rev()
+            .filter(|c| c.message_index >= message_index)
+        {
+            for snap in &cp.files {
+                match &snap.contents {
+                    Some(bytes) if std::fs::write(&snap.path, bytes).is_ok() => restored += 1,
+                    None if std::fs::remove_file(&snap.path).is_ok() => restored += 1,
+                    _ => {}
+                }
+            }
+        }
+        self.checkpoints = checkpoints
+            .into_iter()
+            .filter(|c| c.message_index < message_index)
+            .collect();
+        restored
+    }
+
     pub fn fork_from(existing: &Session) -> Self {
         let now = Utc::now();
         Self {

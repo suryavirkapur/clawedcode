@@ -91,6 +91,14 @@ pub struct Cli {
     /// Resume a session by id; bare --resume opens the session picker.
     #[arg(short = 'r', long, num_args = 0..=1, default_missing_value = "")]
     pub resume: Option<String>,
+    /// With --resume: resume the session at a message index (truncates later
+    /// conversation). Analogous to the reference's --resume-session-at.
+    #[arg(long)]
+    pub resume_session_at: Option<usize>,
+    /// With --resume: restore files to the checkpoint state at a message
+    /// index, then exit. Standalone — cannot be combined with a prompt.
+    #[arg(long)]
+    pub rewind_files: Option<usize>,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -318,6 +326,8 @@ mod tests {
             print: false,
             continue_session: false,
             resume: None,
+            resume_session_at: None,
+            rewind_files: None,
         }
     }
 
@@ -359,6 +369,8 @@ mod tests {
             print: false,
             continue_session: false,
             resume: None,
+            resume_session_at: None,
+            rewind_files: None,
         }
     }
 

@@ -1750,33 +1750,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                                 // after the rewind point are applied newest-
                                 // first then dropped, like the reference's
                                 // code+conversation rewind.
-                                let checkpoints =
-                                    std::mem::take(&mut ctx.session_mut().checkpoints);
-                                let mut restored = 0usize;
-                                for cp in checkpoints
-                                    .iter()
-                                    .rev()
-                                    .filter(|c| c.message_index >= msg_index)
-                                {
-                                    for snap in &cp.files {
-                                        match &snap.contents {
-                                            Some(bytes) => {
-                                                if std::fs::write(&snap.path, bytes).is_ok() {
-                                                    restored += 1;
-                                                }
-                                            }
-                                            None => {
-                                                if std::fs::remove_file(&snap.path).is_ok() {
-                                                    restored += 1;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                ctx.session_mut().checkpoints = checkpoints
-                                    .into_iter()
-                                    .filter(|c| c.message_index < msg_index)
-                                    .collect();
+                                let restored = ctx.session_mut().restore_checkpoints_at(msg_index);
                                 ctx.session_mut().messages.truncate(msg_index);
                                 handler.overlay_rows.clear();
                                 handler.clear_live_turn();

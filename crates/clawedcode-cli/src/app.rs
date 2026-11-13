@@ -169,6 +169,22 @@ pub async fn execute(boot: BootstrappedApp) -> Result<()> {
         return Ok(());
     }
 
+    // `--rewind-files N`: standalone file restore at a message index, then exit.
+    if let Some(msg_index) = cli.rewind_files {
+        let sessions_dir =
+            session_store_dir(cli.data_dir.clone()).context("no sessions directory available")?;
+        let session_id =
+            resume_target_id(&cli).context("--rewind-files requires --resume with a session id")?;
+        let mut session = Session::load_by_id(&sessions_dir, &session_id)
+            .with_context(|| format!("failed to load session {session_id}"))?;
+        session.restore_checkpoints_at(msg_index);
+        session
+            .save(&sessions_dir)
+            .context("failed to save session after rewinding files")?;
+        println!("Files rewound to state at message {msg_index}");
+        return Ok(());
+    }
+
     match mode {
         ExecutionMode::Tui => {
             let sessions_dir = session_store_dir(cli.data_dir.clone())
@@ -194,6 +210,15 @@ pub async fn execute(boot: BootstrappedApp) -> Result<()> {
                 } else {
                     ctx.session = Session::load_by_id(&sessions_dir, resume)
                         .with_context(|| format!("failed to load session {resume}"))?;
+                    if let Some(at) = cli.resume_session_at {
+                        if at > ctx.session.messages.len() {
+                            anyhow::bail!(
+                                "--resume-session-at {at} is beyond session length {}",
+                                ctx.session.messages.len()
+                            );
+                        }
+                        ctx.session.messages.truncate(at);
+                    }
                 }
             }
             if let Some(prompt) = cli.prompt.clone() {
@@ -537,6 +562,15 @@ async fn execute_resume(
         session_store_dir(data_dir.clone()).context("no sessions directory available")?;
     let mut session = Session::load_by_id(&sessions_dir, &resume_mode.session_id)
         .with_context(|| format!("failed to load session {}", resume_mode.session_id))?;
+    if let Some(at) = cli.resume_session_at {
+        if at > session.messages.len() {
+            anyhow::bail!(
+                "--resume-session-at {at} is beyond session length {}",
+                session.messages.len()
+            );
+        }
+        session.messages.truncate(at);
+    }
     if cli.fork_session {
         session = Session::fork_from(&session);
     }
@@ -1912,6 +1946,17 @@ fn session_store_dir(explicit_data_dir: Option<PathBuf>) -> Option<PathBuf> {
         .map(|dir| dir.join("sessions"))
 }
 
+/// Session id targeted by `-r <id>` or the `resume <id>` subcommand.
+fn resume_target_id(cli: &Cli) -> Option<String> {
+    if let Some(id) = cli.resume.as_deref().filter(|id| !id.is_empty()) {
+        return Some(id.to_string());
+    }
+    if let Some(crate::cli::Command::Resume { session_id, .. }) = &cli.command {
+        return Some(session_id.clone());
+    }
+    None
+}
+
 fn find_latest_session(sessions_dir: &PathBuf) -> Result<Session> {
     let entries = std::fs::read_dir(sessions_dir).with_context(|| {
         format!(
@@ -2876,6 +2921,8 @@ mod tests {
             print: false,
             continue_session: false,
             resume: None,
+            resume_session_at: None,
+            rewind_files: None,
         }
     }
 
