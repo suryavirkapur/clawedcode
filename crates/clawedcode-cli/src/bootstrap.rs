@@ -155,6 +155,10 @@ pub fn resolve_mode(cli: &Cli) -> Result<ExecutionMode> {
     }
     let prompt_payload = prompt_payload_from_command(cli.command.as_ref());
 
+    if cli.update {
+        return Ok(ExecutionMode::Update);
+    }
+
     if cli.headless {
         return Ok(ExecutionMode::Headless(HeadlessMode {
             prompt: prompt_payload.prompt.unwrap_or_default(),
@@ -617,6 +621,7 @@ mod tests {
             maintenance: false,
             thinking: None,
             bare: false,
+            update: false,
             name: None,
             agents: None,
             setting_sources: None,
@@ -902,6 +907,7 @@ mod tests {
             maintenance: false,
             thinking: None,
             bare: false,
+            update: false,
             name: None,
             agents: None,
             setting_sources: None,
@@ -976,6 +982,7 @@ mod tests {
             maintenance: false,
             thinking: None,
             bare: false,
+            update: false,
             name: None,
             agents: None,
             setting_sources: None,
@@ -1050,6 +1057,7 @@ mod tests {
             maintenance: false,
             thinking: None,
             bare: false,
+            update: false,
             name: None,
             agents: None,
             setting_sources: None,
@@ -1127,6 +1135,7 @@ mod tests {
             maintenance: false,
             thinking: None,
             bare: false,
+            update: false,
             name: None,
             agents: None,
             setting_sources: None,
@@ -1204,6 +1213,7 @@ mod tests {
             maintenance: false,
             thinking: None,
             bare: false,
+            update: false,
             name: None,
             agents: None,
             setting_sources: None,
@@ -1288,6 +1298,7 @@ mod tests {
             maintenance: false,
             thinking: None,
             bare: false,
+            update: false,
             name: None,
             agents: None,
             setting_sources: None,
@@ -1376,6 +1387,7 @@ mod tests {
             maintenance: false,
             thinking: None,
             bare: false,
+            update: false,
             name: None,
             agents: None,
             setting_sources: None,

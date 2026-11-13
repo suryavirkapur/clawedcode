@@ -144,6 +144,9 @@ pub struct Cli {
     /// Minimal mode: skip hooks, plugins, and CLAUDE.md auto-discovery.
     #[arg(long, global = true)]
     pub bare: bool,
+    /// Self-update and exit (alias: --upgrade).
+    #[arg(long, alias = "upgrade", global = true)]
+    pub update: bool,
     /// Display name for this session (shown in /resume).
     #[arg(short = 'n', long, global = true)]
     pub name: Option<String>,
@@ -253,6 +256,7 @@ pub enum Command {
     /// Inspect compatibility discovery for config, skills, and MCP servers.
     Compat,
     /// Update clawedcode using the package manager that installed it.
+    #[command(alias = "upgrade")]
     Update,
     /// Headless batch execution mode (reads from stdin if no --prompt).
     Headless {
@@ -623,6 +627,7 @@ mod tests {
             maintenance: false,
             thinking: None,
             bare: false,
+            update: false,
             name: None,
             agents: None,
             setting_sources: None,
@@ -700,6 +705,7 @@ mod tests {
             maintenance: false,
             thinking: None,
             bare: false,
+            update: false,
             name: None,
             agents: None,
             setting_sources: None,

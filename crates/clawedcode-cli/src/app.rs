@@ -4253,6 +4253,7 @@ mod tests {
             maintenance: false,
             thinking: None,
             bare: false,
+            update: false,
             name: None,
             agents: None,
             setting_sources: None,
