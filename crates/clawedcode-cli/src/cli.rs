@@ -177,6 +177,11 @@ pub enum Command {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+    /// Manage MCP server configuration (.mcp.json).
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
+    },
     /// Connect to a remote orchestrator.
     Remote {
         #[arg(long)]
@@ -194,6 +199,26 @@ pub enum Command {
     },
 }
 
+#[derive(Debug, Clone, Subcommand)]
+pub enum McpAction {
+    /// List configured MCP servers.
+    List,
+    /// Show one server's configuration.
+    Get { name: String },
+    /// Add a stdio MCP server to .mcp.json.
+    Add {
+        name: String,
+        command: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+        /// Write to the user-level ~/.claude.json-style scope instead.
+        #[arg(long)]
+        user: bool,
+    },
+    /// Remove a server from .mcp.json.
+    Remove { name: String },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Intent {
     Interactive,
@@ -206,6 +231,7 @@ pub enum Intent {
     Remote,
     DirectConnect,
     Ssh,
+    Mcp,
 }
 
 impl Cli {
@@ -237,6 +263,7 @@ impl Cli {
             Some(Command::DirectConnect { .. }) => Intent::DirectConnect,
             Some(Command::Ssh { .. }) => Intent::Ssh,
             Some(Command::Remote { .. }) => Intent::Remote,
+            Some(Command::Mcp { .. }) => Intent::Mcp,
             None => Intent::Interactive,
         }
     }

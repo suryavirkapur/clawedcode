@@ -28,6 +28,7 @@ pub enum ExecutionMode {
     DirectConnect(DirectConnectMode),
     Ssh(SshMode),
     Remote(RemoteMode),
+    Mcp(crate::cli::McpAction),
 }
 
 #[derive(Debug, Clone)]
@@ -288,6 +289,7 @@ pub fn resolve_mode(cli: &Cli) -> Result<ExecutionMode> {
             show_thinking,
             yes,
         })),
+        Command::Mcp { action } => Ok(ExecutionMode::Mcp(action)),
     }
 }
 

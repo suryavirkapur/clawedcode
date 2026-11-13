@@ -260,7 +260,72 @@ pub async fn execute(boot: BootstrappedApp) -> Result<()> {
         ExecutionMode::Remote(remote_mode) => {
             execute_remote(cli, config, compatibility, remote_mode).await
         }
+        ExecutionMode::Mcp(action) => execute_mcp(&cli, &compatibility, action),
     }
+}
+
+/// `clawedcode mcp` — manage `.mcp.json` server entries like the
+/// reference's `claude mcp` subcommand.
+fn execute_mcp(
+    cli: &Cli,
+    compatibility: &compat::CompatibilitySnapshot,
+    action: crate::cli::McpAction,
+) -> Result<()> {
+    use crate::cli::McpAction;
+    let path = cli.cwd.join(".mcp.json");
+    let mut doc: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if doc.get("mcpServers").is_none() {
+        doc["mcpServers"] = serde_json::json!({});
+    }
+
+    match action {
+        McpAction::List => {
+            if compatibility.mcp_servers.is_empty() {
+                println!("No MCP servers configured.");
+            } else {
+                for (name, server) in &compatibility.mcp_servers {
+                    println!("{}: {}", name, serde_json::to_string(server)?);
+                }
+            }
+        }
+        McpAction::Get { name } => {
+            let server = compatibility
+                .mcp_servers
+                .get(&name)
+                .ok_or_else(|| anyhow::anyhow!("No MCP server named '{name}' is configured"))?;
+            println!("{}: {}", name, serde_json::to_string_pretty(server)?);
+        }
+        McpAction::Add {
+            name,
+            command,
+            args,
+            user: _,
+        } => {
+            doc["mcpServers"][&name] = serde_json::json!({
+                "command": command,
+                "args": args,
+            });
+            std::fs::write(&path, serde_json::to_string_pretty(&doc)?)
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            println!("Added MCP server '{name}' to {}", path.display());
+        }
+        McpAction::Remove { name } => {
+            let removed = doc["mcpServers"]
+                .as_object_mut()
+                .map(|m| m.remove(&name).is_some())
+                .unwrap_or(false);
+            if !removed {
+                anyhow::bail!("No MCP server named '{name}' in {}", path.display());
+            }
+            std::fs::write(&path, serde_json::to_string_pretty(&doc)?)
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            println!("Removed MCP server '{name}' from {}", path.display());
+        }
+    }
+    Ok(())
 }
 
 fn execute_update() -> Result<()> {
