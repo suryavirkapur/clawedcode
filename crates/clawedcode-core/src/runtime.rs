@@ -2898,6 +2898,17 @@ pub fn create_session_worktree(
     slug: &str,
     session_id: &str,
 ) -> Result<(PathBuf, Option<String>), String> {
+    // PR references (`#123`, bare number, or a `/pull/N` URL) resolve to a
+    // `pr-N` worktree name before slug validation like the reference.
+    let pr = parse_pr_reference(slug);
+    let resolved;
+    let slug = match pr {
+        Some(n) => {
+            resolved = format!("pr-{n}");
+            resolved.as_str()
+        }
+        None => slug,
+    };
     let valid = slug.len() <= 64
         && slug.split('/').all(|seg| {
             !seg.is_empty()
@@ -2931,6 +2942,30 @@ pub fn create_session_worktree(
             ));
         }
     };
+
+    // PR worktrees fetch pull/N/head and detach at FETCH_HEAD.
+    if let Some(pr) = pr {
+        let flat = format!("pr-{pr}");
+        let path = root.join(".claude/worktrees").join(&flat);
+        run_git(&["fetch", "origin", &format!("pull/{pr}/head")], &root).map_err(|e| {
+            format!(
+                "Failed to fetch PR #{pr}: {}",
+                if e.is_empty() {
+                    "PR may not exist or the repository may not have a remote named \"origin\""
+                        .to_string()
+                } else {
+                    e
+                }
+            )
+        })?;
+        run_git(
+            &["worktree", "add", &path.to_string_lossy(), "FETCH_HEAD"],
+            &root,
+        )
+        .map_err(|e| format!("Failed to create worktree: {e}"))?;
+        return Ok((path, Some("FETCH_HEAD".to_string())));
+    }
+
     let flat = slug.replace('/', "-");
     let path = root.join(".claude/worktrees").join(&flat);
     let branch = format!("worktree-{flat}");
@@ -2940,6 +2975,27 @@ pub fn create_session_worktree(
     )
     .map_err(|e| format!("Failed to create worktree: {e}"))?;
     Ok((path, Some(branch)))
+}
+
+/// Parse a PR reference like the reference's `parsePRReference`: `#123`,
+/// a bare number, or a `…/pull/N` URL.
+fn parse_pr_reference(input: &str) -> Option<u64> {
+    let trimmed = input.trim();
+    if let Some(num) = trimmed.strip_prefix('#') {
+        return num.parse().ok();
+    }
+    if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit()) {
+        return trimmed.parse().ok();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        let no_fragment = lower.split(['?', '#']).next().unwrap_or(&lower);
+        let segs: Vec<&str> = no_fragment.trim_end_matches('/').split('/').collect();
+        if segs.len() >= 7 && segs[segs.len() - 2] == "pull" {
+            return segs[segs.len() - 1].parse().ok();
+        }
+    }
+    None
 }
 
 fn is_agent_tool(tool_name: &str) -> bool {
@@ -3055,6 +3111,23 @@ mod tests {
         thread,
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn parse_pr_reference_accepts_hash_number_and_url() {
+        assert_eq!(parse_pr_reference("#42"), Some(42));
+        assert_eq!(parse_pr_reference("123"), Some(123));
+        assert_eq!(
+            parse_pr_reference("https://github.com/o/r/pull/77"),
+            Some(77)
+        );
+        assert_eq!(
+            parse_pr_reference("https://github.com/o/r/pull/9?diff=unified#x"),
+            Some(9)
+        );
+        assert_eq!(parse_pr_reference("feature/x"), None);
+        assert_eq!(parse_pr_reference("#abc"), None);
+        assert_eq!(parse_pr_reference(""), None);
+    }
 
     fn make_runtime() -> Runtime {
         let config = AppConfig::default();
