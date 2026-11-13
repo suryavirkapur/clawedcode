@@ -535,6 +535,15 @@ pub fn run_pre_tool_hooks(
 
 /// Run `PostToolUse` hooks. Exit 2 appends stderr to the tool result (the
 /// reference feeds hook stderr back to the model); other failures warn.
+/// Result of `PostToolUse` hooks — `feedback` is appended to the tool
+/// result, `updated_mcp_output` replaces an MCP tool's output entirely
+/// (reference: hookSpecificOutput.updatedMCPToolOutput).
+#[derive(Debug, Default)]
+pub struct PostToolHookResult {
+    pub feedback: Vec<String>,
+    pub updated_mcp_output: Option<serde_json::Value>,
+}
+
 pub fn run_post_tool_hooks(
     config: &HooksConfig,
     session_id: &str,
@@ -542,11 +551,12 @@ pub fn run_post_tool_hooks(
     tool_name: &str,
     input: &serde_json::Value,
     tool_response_preview: &str,
-) -> Option<String> {
+) -> PostToolHookResult {
+    let mut result = PostToolHookResult::default();
     if config.disabled {
-        return None;
+        return result;
     }
-    let mut feedback = Vec::new();
+    let feedback = &mut result.feedback;
     for hook in hooks_for_event(config, "PostToolUse") {
         if !matcher_matches(hook.matcher.as_deref(), tool_name) {
             continue;
@@ -583,16 +593,18 @@ pub fn run_post_tool_hooks(
                         .to_string(),
                 );
             }
+            if let Some(updated) = json
+                .get("hookSpecificOutput")
+                .and_then(|o| o.get("updatedMCPToolOutput"))
+            {
+                result.updated_mcp_output = Some(updated.clone());
+            }
         }
         if out.status.code() == Some(2) && !stderr.is_empty() {
             feedback.push(stderr);
         }
     }
-    if feedback.is_empty() {
-        None
-    } else {
-        Some(feedback.join("\n"))
-    }
+    result
 }
 
 fn session_hook_input(

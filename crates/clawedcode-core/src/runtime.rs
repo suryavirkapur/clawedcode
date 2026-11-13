@@ -2406,14 +2406,26 @@ impl Runtime {
                 }),
             );
         }
-        if let Some(feedback) = crate::hooks::run_post_tool_hooks(
+        let post = crate::hooks::run_post_tool_hooks(
             &hooks,
             &session.id.to_string(),
             &session.cwd,
             tool_name,
             &input,
             &preview,
-        ) {
+        );
+        // MCP tools: a hook's updatedMCPToolOutput replaces the output.
+        if tool_name.starts_with("mcp__") {
+            if let Some(updated) = post.updated_mcp_output {
+                if let ContentBlock::ToolResult { content, .. } = &mut result {
+                    *content = match updated {
+                        serde_json::Value::String(t) => t,
+                        other => other.to_string(),
+                    };
+                }
+            }
+        }
+        if !post.feedback.is_empty() {
             if let ContentBlock::ToolResult {
                 tool_use_id: id,
                 content,
@@ -2422,7 +2434,10 @@ impl Runtime {
             {
                 return ContentBlock::ToolResult {
                     tool_use_id: id,
-                    content: format!("{content}\n\n[PostToolUse hook]: {feedback}"),
+                    content: format!(
+                        "{content}\n\n[PostToolUse hook]: {}",
+                        post.feedback.join("\n")
+                    ),
                     is_error,
                 };
             }
