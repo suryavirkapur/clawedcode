@@ -795,7 +795,118 @@ impl Runtime {
     }
 
     pub fn set_permission_mode(&mut self, mode: PermissionMode) {
-        self.permission_engine = PermissionEngine::new(mode);
+        self.permission_engine.set_mode(mode);
+    }
+
+    /// Apply a hook-provided `updatedPermissions` entry — `session`/`cliArg`
+    /// destinations land on the session, file destinations rewrite the
+    /// matching settings file like the reference.
+    fn apply_permission_update(
+        &self,
+        update: crate::permissions::PermissionUpdate,
+        session: &mut Session,
+    ) {
+        use crate::permissions::{PermissionUpdate, RuleAction};
+        match update {
+            PermissionUpdate::SetMode { mode, destination } => {
+                let parsed = match mode.as_str() {
+                    "default" | "defaultMode" => Some(PermissionMode::Default),
+                    "acceptEdits" => Some(PermissionMode::AcceptEdits),
+                    "plan" => Some(PermissionMode::Plan),
+                    "bypassPermissions" | "bypass" => Some(PermissionMode::Bypass),
+                    _ => None,
+                };
+                if let Some(mode) = parsed {
+                    match destination.as_str() {
+                        "session" | "cliArg" => self.permission_engine.set_mode(mode),
+                        _ => {
+                            let Some(path) = crate::permissions::destination_path(
+                                &destination,
+                                &session.cwd,
+                            ) else {
+                                return;
+                            };
+                            crate::permissions::write_settings_value(
+                                &path,
+                                "permissions.defaultMode",
+                                serde_json::Value::String(
+                                    match mode {
+                                        PermissionMode::Default => "default",
+                                        PermissionMode::AcceptEdits => "acceptEdits",
+                                        PermissionMode::Plan => "plan",
+                                        PermissionMode::Bypass => "bypassPermissions",
+                                    }
+                                    .to_string(),
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+            PermissionUpdate::Rules {
+                action,
+                rules,
+                behavior,
+                destination,
+            } => {
+                let list = match behavior.as_str() {
+                    "deny" => &mut session.session_permission_rules.deny,
+                    "ask" => &mut session.session_permission_rules.ask,
+                    _ => &mut session.session_permission_rules.allow,
+                };
+                match destination.as_str() {
+                    "session" | "cliArg" => match action {
+                        RuleAction::Add => list.extend(rules),
+                        RuleAction::Replace => *list = rules,
+                        RuleAction::Remove => list.retain(|r| !rules.contains(r)),
+                    },
+                    _ => {
+                        let Some(path) = crate::permissions::destination_path(
+                            &destination,
+                            &session.cwd,
+                        ) else {
+                            return;
+                        };
+                        crate::permissions::update_rule_list(
+                            &path,
+                            &format!("permissions.{behavior}"),
+                            action,
+                            &rules,
+                        );
+                    }
+                }
+            }
+            PermissionUpdate::Directories {
+                add,
+                dirs,
+                destination,
+            } => match destination.as_str() {
+                "session" | "cliArg" => {
+                    if add {
+                        session
+                            .additional_allowed_dirs
+                            .extend(dirs.iter().map(std::path::PathBuf::from));
+                    } else {
+                        session
+                            .additional_allowed_dirs
+                            .retain(|d| !dirs.iter().any(|p| d == &std::path::PathBuf::from(p)));
+                    }
+                }
+                _ => {
+                    let Some(path) = crate::permissions::destination_path(
+                        &destination,
+                        &session.cwd,
+                    ) else {
+                        return;
+                    };
+                    crate::permissions::update_dir_list(
+                        &path,
+                        add,
+                        &dirs,
+                    );
+                }
+            },
+        }
     }
 
     fn run_in_runtime<F, T>(&self, f: F) -> T
@@ -2272,7 +2383,16 @@ impl Runtime {
         // the hook decision and the mode decision: deny rules are hard
         // blocks (even under bypass), then hook ask, ask rules, allow rules,
         // then the permission mode.
-        let rules = crate::permissions::load_permission_rules(&session.cwd);
+        let mut rules = crate::permissions::load_permission_rules(&session.cwd);
+        rules
+            .allow
+            .extend(session.session_permission_rules.allow.iter().cloned());
+        rules
+            .deny
+            .extend(session.session_permission_rules.deny.iter().cloned());
+        rules
+            .ask
+            .extend(session.session_permission_rules.ask.iter().cloned());
         let rule_decision = rules.check(tool_name, &input, &session.cwd);
         let decision = if rule_decision == Some(PermissionDecision::Deny) {
             PermissionDecision::Deny
@@ -2314,7 +2434,13 @@ impl Runtime {
                     tool_name,
                     &input,
                 ) {
-                    Some(crate::hooks::PermissionHookDecision::Allow { updated_input }) => {
+                    Some(crate::hooks::PermissionHookDecision::Allow {
+                        updated_input,
+                        updates,
+                    }) => {
+                        for update in updates {
+                            self.apply_permission_update(update, session);
+                        }
                         let input = updated_input.unwrap_or(input);
                         return self.execute_tool_hooked(
                             tool_use_id,

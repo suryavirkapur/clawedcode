@@ -52,6 +52,10 @@ pub struct Session {
     /// Extra directories the session's file tools may touch (/add-dir).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub additional_allowed_dirs: Vec<std::path::PathBuf>,
+    /// Session-scoped permission rules added by hook `updatedPermissions`
+    /// updates (destination `session`/`cliArg`).
+    #[serde(default)]
+    pub session_permission_rules: crate::permissions::PermissionRules,
     /// Cwd the session was in before `EnterWorktree` switched it — restores
     /// on `ExitWorktree` even for hook-based worktrees outside `.claude/worktrees`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -183,6 +187,7 @@ impl Session {
             tag: None,
             prompt_color: None,
             additional_allowed_dirs: Vec::new(),
+            session_permission_rules: Default::default(),
             worktree_origin: None,
             checkpoints: Vec::new(),
             loaded_memory: Vec::new(),
@@ -221,6 +226,7 @@ impl Session {
             tag: None,
             prompt_color: None,
             additional_allowed_dirs: Vec::new(),
+            session_permission_rules: Default::default(),
             worktree_origin: None,
             checkpoints: Vec::new(),
             loaded_memory: Vec::new(),
@@ -271,6 +277,7 @@ impl Session {
             tag: None,
             prompt_color: None,
             additional_allowed_dirs: Vec::new(),
+            session_permission_rules: Default::default(),
             worktree_origin: None,
             checkpoints: Vec::new(),
             loaded_memory: Vec::new(),
@@ -362,6 +369,7 @@ impl Session {
             tag: None,
             prompt_color: None,
             additional_allowed_dirs: Vec::new(),
+            session_permission_rules: Default::default(),
             worktree_origin: None,
             checkpoints: Vec::new(),
             loaded_memory: Vec::new(),

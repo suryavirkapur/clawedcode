@@ -34,16 +34,25 @@ pub enum PermissionDecision {
 /// Permission engine that decides whether a tool call may proceed.
 #[derive(Debug, Clone)]
 pub struct PermissionEngine {
-    mode: PermissionMode,
+    /// `Cell` so hook-driven `setMode` permission updates can change the
+    /// mode through the `&self` tool-execution path.
+    mode: std::cell::Cell<PermissionMode>,
 }
 
 impl PermissionEngine {
     pub fn new(mode: PermissionMode) -> Self {
-        Self { mode }
+        Self {
+            mode: std::cell::Cell::new(mode),
+        }
     }
 
     pub fn mode(&self) -> PermissionMode {
-        self.mode
+        self.mode.get()
+    }
+
+    /// Set the mode — `&self` because hook-driven updates apply mid-call.
+    pub fn set_mode(&self, mode: PermissionMode) {
+        self.mode.set(mode);
     }
 
     /// Decide whether a tool call is allowed.
@@ -51,7 +60,7 @@ impl PermissionEngine {
     /// - `needs_approval`: whether the tool declares it needs user approval.
     /// - `is_write_like`: whether the tool mutates state (edits, shell, etc.).
     pub fn decide(&self, needs_approval: bool, is_write_like: bool) -> PermissionDecision {
-        match self.mode {
+        match self.mode.get() {
             PermissionMode::Bypass => PermissionDecision::Allow,
             PermissionMode::Plan => {
                 if is_write_like {
@@ -158,7 +167,7 @@ mod tests {
 /// Permission rules from settings files — `permissions.allow`, `.deny`,
 /// `.ask` arrays of `"Tool"` or `"Tool(content)"` strings, like the
 /// reference's permission rule system.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PermissionRules {
     pub allow: Vec<String>,
     pub deny: Vec<String>,
@@ -529,5 +538,250 @@ mod rule_tests {
             rules.check("read_file", &serde_json::json!({"path": "x"}), &cwd()),
             None
         );
+    }
+}
+
+/// A `hookSpecificOutput.decision.updatedPermissions` entry — the
+/// reference discriminates on `type`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PermissionUpdate {
+    /// addRules/replaceRules/removeRules over `permissions.<behavior>` arrays.
+    Rules {
+        action: RuleAction,
+        rules: Vec<String>,
+        behavior: String,
+        destination: String,
+    },
+    /// setMode — `default`, `acceptEdits`, `plan`, `bypassPermissions`.
+    SetMode { mode: String, destination: String },
+    /// addDirectories/removeDirectories.
+    Directories {
+        add: bool,
+        dirs: Vec<String>,
+        destination: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleAction {
+    Add,
+    Replace,
+    Remove,
+}
+
+/// Serialize a {toolName, ruleContent} pair to `Tool(content)` form with
+/// the reference's escaping (`\` first, then `\(` `\)`).
+pub fn rule_to_string(tool_name: &str, rule_content: Option<&str>) -> String {
+    match rule_content {
+        None => tool_name.to_string(),
+        Some(content) => {
+            let escaped = content
+                .replace('\\', "\\")
+                .replace('(', "\\(")
+                .replace(')', "\\)");
+            format!("{tool_name}({escaped})")
+        }
+    }
+}
+
+/// Parse `updatedPermissions` from a PermissionRequest hook decision.
+pub fn parse_permission_updates(value: &serde_json::Value) -> Vec<PermissionUpdate> {
+    let mut out = Vec::new();
+    let Some(items) = value.as_array() else {
+        return out;
+    };
+    for item in items {
+        let ty = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let destination = item
+            .get("destination")
+            .and_then(|d| d.as_str())
+            .unwrap_or("localSettings")
+            .to_string();
+        match ty {
+            "addRules" | "replaceRules" | "removeRules" => {
+                let rules = item
+                    .get("rules")
+                    .and_then(|r| r.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|r| {
+                                r.get("toolName").and_then(|t| t.as_str()).map(|name| {
+                                    rule_to_string(
+                                        name,
+                                        r.get("ruleContent").and_then(|c| c.as_str()),
+                                    )
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let action = match ty {
+                    "addRules" => RuleAction::Add,
+                    "replaceRules" => RuleAction::Replace,
+                    _ => RuleAction::Remove,
+                };
+                out.push(PermissionUpdate::Rules {
+                    action,
+                    rules,
+                    behavior: item
+                        .get("behavior")
+                        .and_then(|b| b.as_str())
+                        .unwrap_or("allow")
+                        .to_string(),
+                    destination,
+                });
+            }
+            "setMode" => {
+                if let Some(mode) = item.get("mode").and_then(|m| m.as_str()) {
+                    out.push(PermissionUpdate::SetMode {
+                        mode: mode.to_string(),
+                        destination,
+                    });
+                }
+            }
+            "addDirectories" | "removeDirectories" => {
+                let dirs = item
+                    .get("directories")
+                    .and_then(|d| d.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|d| d.as_str())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                out.push(PermissionUpdate::Directories {
+                    add: ty == "addDirectories",
+                    dirs,
+                    destination,
+                });
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// crate-internal helpers for applying permission updates to settings files.
+pub(crate) use self::helpers::{
+    destination_path, update_dir_list, update_rule_list, write_settings_value,
+};
+
+mod helpers {
+    pub fn destination_path(
+        destination: &str,
+        cwd: &std::path::Path,
+    ) -> Option<std::path::PathBuf> {
+        match destination {
+            "userSettings" => crate::compat::claude_home().map(|h| h.join("settings.json")),
+            "projectSettings" => Some(cwd.join(".claude").join("settings.json")),
+            "localSettings" => Some(cwd.join(".claude").join("settings.local.json")),
+            _ => None,
+        }
+    }
+
+    fn load_or_empty(path: &std::path::Path) -> serde_json::Value {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_else(|| serde_json::json!({}))
+    }
+
+    fn save(path: &std::path::Path, json: &serde_json::Value) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(text) = serde_json::to_string_pretty(json) {
+            let _ = std::fs::write(path, text);
+        }
+    }
+
+    /// Ensure `json[key]` (a `a.b` dotted key) exists as an object; returns
+    /// a mutable object ref.
+    fn ensure_obj<'a>(
+        json: &'a mut serde_json::Value,
+        dotted: &str,
+    ) -> Option<&'a mut serde_json::Map<String, serde_json::Value>> {
+        let mut cur = json;
+        for part in dotted.split('.') {
+            let obj = cur.as_object_mut()?;
+            cur = obj
+                .entry(part.to_string())
+                .or_insert_with(|| serde_json::json!({}));
+        }
+        cur.as_object_mut()
+    }
+
+    pub fn write_settings_value(
+        path: &std::path::Path,
+        dotted: &str,
+        value: serde_json::Value,
+    ) {
+        let mut json = load_or_empty(path);
+        if let Some((parent, leaf)) = dotted.rsplit_once('.') {
+            if let Some(obj) = ensure_obj(&mut json, parent) {
+                obj.insert(leaf.to_string(), value);
+                save(path, &json);
+            }
+        }
+    }
+
+    pub fn update_rule_list(
+        path: &std::path::Path,
+        dotted: &str,
+        action: crate::permissions::RuleAction,
+        rules: &[String],
+    ) {
+        use crate::permissions::RuleAction;
+        let mut json = load_or_empty(path);
+        if let Some((parent, leaf)) = dotted.rsplit_once('.') {
+            if let Some(obj) = ensure_obj(&mut json, parent) {
+                let entry = obj
+                    .entry(leaf.to_string())
+                    .or_insert_with(|| serde_json::json!([]));
+                if let Some(arr) = entry.as_array_mut() {
+                    match action {
+                        RuleAction::Add => {
+                            for r in rules {
+                                if !arr.iter().any(|v| v.as_str() == Some(r.as_str())) {
+                                    arr.push(serde_json::Value::String(r.clone()));
+                                }
+                            }
+                        }
+                        RuleAction::Replace => {
+                            *arr = rules
+                                .iter()
+                                .map(|r| serde_json::Value::String(r.clone()))
+                                .collect();
+                        }
+                        RuleAction::Remove => {
+                            arr.retain(|v| v.as_str().map(|s| !rules.contains(&s.to_string())).unwrap_or(true));
+                        }
+                    }
+                }
+                save(path, &json);
+            }
+        }
+    }
+
+    pub fn update_dir_list(path: &std::path::Path, add: bool, dirs: &[String]) {
+        let mut json = load_or_empty(path);
+        if let Some(obj) = ensure_obj(&mut json, "permissions") {
+            let entry = obj
+                .entry("additionalDirectories".to_string())
+                .or_insert_with(|| serde_json::json!([]));
+            if let Some(arr) = entry.as_array_mut() {
+                if add {
+                    for d in dirs {
+                        if !arr.iter().any(|v| v.as_str() == Some(d.as_str())) {
+                            arr.push(serde_json::Value::String(d.clone()));
+                        }
+                    }
+                } else {
+                    arr.retain(|v| v.as_str().map(|s| !dirs.contains(&s.to_string())).unwrap_or(true));
+                }
+            }
+            save(path, &json);
+        }
     }
 }

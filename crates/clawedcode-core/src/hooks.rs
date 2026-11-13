@@ -891,6 +891,9 @@ pub enum PermissionHookDecision {
     /// (reference: hookSpecificOutput.decision.updatedInput).
     Allow {
         updated_input: Option<serde_json::Value>,
+        /// `decision.updatedPermissions` — rule/mode/directory updates to
+        /// apply when the decision allows.
+        updates: Vec<crate::permissions::PermissionUpdate>,
     },
     Deny,
     Ask,
@@ -934,6 +937,10 @@ pub fn run_permission_request_hooks(
                 Some("allow") => {
                     return Some(PermissionHookDecision::Allow {
                         updated_input: decision.get("updatedInput").cloned(),
+                        updates: decision
+                            .get("updatedPermissions")
+                            .map(crate::permissions::parse_permission_updates)
+                            .unwrap_or_default(),
                     })
                 }
                 Some("deny") => return Some(PermissionHookDecision::Deny),
@@ -944,6 +951,7 @@ pub fn run_permission_request_hooks(
             Some("allow") => {
                 return Some(PermissionHookDecision::Allow {
                     updated_input: None,
+                    updates: Vec::new(),
                 })
             }
             Some("deny") => return Some(PermissionHookDecision::Deny),
