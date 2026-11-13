@@ -5882,6 +5882,15 @@ fn drain_turn_events(
             match event {
                 TurnWorkerEvent::Ui(event) => handler.on_event(&event),
                 TurnWorkerEvent::ApprovalRequested(request) => {
+                    if turn.ephemeral {
+                        // Side questions cannot use tools — auto-deny rather
+                        // than surfacing an approval dialog.
+                        let _ = turn.approvals.send(ApprovalOutcome {
+                            approved: false,
+                            feedback: Some("Side questions cannot use tools".to_string()),
+                        });
+                        continue;
+                    }
                     handler.record_live_tool_pending_approval(&request.tool_use_id);
                     *awaiting_approval = Some(request);
                     handler.state = AppState::AwaitingApproval;
@@ -6141,8 +6150,18 @@ fn handle_slash_command(
                         return Ok(true);
                     }
                     handler.push_overlay(format!("/btw {question}"));
-                    let mut turn =
-                        spawn_turn_worker(ctx, question.to_string(), None, always_allowed.clone());
+                    // Reference wraps the question in a system-reminder that
+                    // forbids tool use and follow-up promises; tool calls the
+                    // model emits anyway are auto-denied below.
+                    let wrapped = format!(
+                        "<system-reminder>This is a side question from the user. You must answer this question directly in a single response.\n\nIMPORTANT CONTEXT:\n- You are a separate, lightweight agent spawned to answer this one question\n- The main agent is NOT interrupted - it continues working independently in the background\n- You share the conversation context but are a completely separate instance\n- Do NOT reference being interrupted or what you were \"previously doing\" - that framing is incorrect\n\nCRITICAL CONSTRAINTS:\n- You have NO tools available - you cannot read files, run commands, search, or take any actions\n- This is a one-off response - there will be no follow-up turns\n- You can ONLY provide information based on what you already know from the conversation context\n- NEVER say things like \"Let me try...\", \"I'll now...\", \"Let me check...\", or promise to take any action\n- If you don't know the answer, say so - do not offer to look it up or investigate\n\nSimply answer the question with the information you have.</system-reminder>\n\n{question}"
+                    );
+                    let mut turn = spawn_turn_worker(
+                        ctx,
+                        question.to_string(),
+                        Some(wrapped),
+                        always_allowed.clone(),
+                    );
                     turn.ephemeral = true;
                     *active_turn = Some(turn);
                     let _ = ctx.save_session();
