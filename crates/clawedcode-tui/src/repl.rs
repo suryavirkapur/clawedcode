@@ -749,7 +749,7 @@ pub fn run_with_context(mut ctx: TuiContext) -> Result<()> {
     execute!(
         stdout(),
         EnterAlternateScreen,
-        SetTitle("ClawedCode"),
+        SetTitle(terminal_title(&ctx)),
         EnableBracketedPaste
     )?;
     let terminal = ratatui::init();
@@ -1328,7 +1328,13 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
         active_turn = Some(spawn_turn_worker(ctx, prompt, None, always_allowed.clone()));
     }
 
+    let mut last_title = terminal_title(&ctx);
     loop {
+        let title = terminal_title(&ctx);
+        if title != last_title {
+            let _ = execute!(stdout(), SetTitle(title.clone()));
+            last_title = title;
+        }
         integrate_completed_subagents(ctx, &mut handler);
         drain_turn_events(ctx, &mut handler, &mut active_turn, &mut awaiting_approval);
         drain_background_turns(
@@ -6094,6 +6100,25 @@ fn maybe_submit_queued_prompt(
     }
 
     Ok(())
+}
+
+/// Terminal title — the reference's `terminalTitle`: session title when
+/// `terminalTitleFromRename` is enabled (default true), else the app name.
+fn terminal_title(ctx: &TuiContext) -> String {
+    let from_rename = ctx
+        .runtime
+        .compatibility()
+        .settings
+        .get("terminalTitleFromRename")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    if from_rename
+        && let Some(title) = ctx.session().title.as_deref()
+        && !title.trim().is_empty()
+    {
+        return title.trim().to_string();
+    }
+    "ClawedCode".to_string()
 }
 
 fn welcome_right_lines(ctx: &TuiContext, width: usize) -> Vec<Line<'static>> {
