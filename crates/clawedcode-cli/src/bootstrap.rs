@@ -551,6 +551,7 @@ mod tests {
             replay_user_messages: false,
             maintenance: false,
             thinking: None,
+            bare: false,
         }
     }
 
@@ -816,6 +817,7 @@ mod tests {
             replay_user_messages: false,
             maintenance: false,
             thinking: None,
+            bare: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Tui));
@@ -870,6 +872,7 @@ mod tests {
             replay_user_messages: false,
             maintenance: false,
             thinking: None,
+            bare: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -924,6 +927,7 @@ mod tests {
             replay_user_messages: false,
             maintenance: false,
             thinking: None,
+            bare: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));
@@ -981,6 +985,7 @@ mod tests {
             replay_user_messages: false,
             maintenance: false,
             thinking: None,
+            bare: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::DirectConnect(_)));
@@ -1038,6 +1043,7 @@ mod tests {
             replay_user_messages: false,
             maintenance: false,
             thinking: None,
+            bare: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Ssh(_)));
@@ -1102,6 +1108,7 @@ mod tests {
             replay_user_messages: false,
             maintenance: false,
             thinking: None,
+            bare: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -1170,6 +1177,7 @@ mod tests {
             replay_user_messages: false,
             maintenance: false,
             thinking: None,
+            bare: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));

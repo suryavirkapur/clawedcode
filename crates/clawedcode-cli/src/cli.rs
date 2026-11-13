@@ -141,6 +141,9 @@ pub struct Cli {
     /// Thinking mode: enabled, adaptive, or disabled.
     #[arg(long, global = true)]
     pub thinking: Option<String>,
+    /// Minimal mode: skip hooks, plugins, and CLAUDE.md auto-discovery.
+    #[arg(long, global = true)]
+    pub bare: bool,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -411,6 +414,7 @@ mod tests {
             replay_user_messages: false,
             maintenance: false,
             thinking: None,
+            bare: false,
         }
     }
 
@@ -468,6 +472,7 @@ mod tests {
             replay_user_messages: false,
             maintenance: false,
             thinking: None,
+            bare: false,
         }
     }
 

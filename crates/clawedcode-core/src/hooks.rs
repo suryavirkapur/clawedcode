@@ -58,6 +58,11 @@ struct HookSpec {
 /// settings precedence).
 pub fn load_hooks(cwd: &Path) -> HooksConfig {
     let mut config = HooksConfig::default();
+    // `--bare`: minimal mode skips hooks like the reference.
+    if std::env::var_os("CLAWEDCODE_SIMPLE").is_some() {
+        config.disabled = true;
+        return config;
+    }
     // `--settings <file>` / CLAWEDCODE_SETTINGS: extra settings file merged
     // last like the reference flag.
     let extra = std::env::var_os("CLAWEDCODE_SETTINGS").map(PathBuf::from);

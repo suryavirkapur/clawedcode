@@ -187,6 +187,10 @@ fn manifest_paths(dir: &Path, value: &Option<serde_json::Value>) -> Vec<PathBuf>
 /// and `CLAWEDCODE_PLUGIN_DIR` paths (the reference's `--plugin-dir` —
 /// session-only inline plugins).
 pub fn discover_plugins(cwd: &Path) -> Vec<Plugin> {
+    // `--bare`: minimal mode skips plugin discovery like the reference.
+    if std::env::var_os("CLAWEDCODE_SIMPLE").is_some() {
+        return Vec::new();
+    }
     let mut roots: Vec<PathBuf> = Vec::new();
     if let Some(home) = claude_home() {
         roots.push(home.join("plugins"));
@@ -313,6 +317,10 @@ pub fn discover_skills(cwd: &Path) -> Result<Vec<SkillDescriptor>> {
 }
 
 fn discover_memory(cwd: &Path) -> Result<(Vec<PathBuf>, String)> {
+    // `--bare`: minimal mode skips CLAUDE.md auto-discovery like the reference.
+    if std::env::var_os("CLAWEDCODE_SIMPLE").is_some() {
+        return Ok((Vec::new(), String::new()));
+    }
     let mut memory_files = Vec::new();
     let mut sections = Vec::new();
 

@@ -109,6 +109,10 @@ pub async fn run(cli: Cli) -> Result<()> {
     if cli.strict_mcp_config {
         unsafe { std::env::set_var("CLAWEDCODE_MCP_CONFIG_STRICT", "1") };
     }
+    if cli.bare {
+        // `--bare`: must be set before bootstrap() computes the compat snapshot.
+        unsafe { std::env::set_var("CLAWEDCODE_SIMPLE", "1") };
+    }
     if let Some(path) = &cli.settings {
         // The reference's `--settings <file-or-json>` accepts inline JSON —
         // write it to a temp file and point the settings override there.
@@ -3181,6 +3185,7 @@ mod tests {
             replay_user_messages: false,
             maintenance: false,
             thinking: None,
+            bare: false,
         }
     }
 
