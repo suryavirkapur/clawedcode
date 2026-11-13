@@ -1008,6 +1008,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     let mut last_ctrl_d: Option<std::time::Instant> = None;
     let mut undo_stack: Vec<(String, usize)> = Vec::new();
     let mut stashed_input: Option<(String, usize)> = None;
+    let mut pasted_images: Vec<std::path::PathBuf> = Vec::new();
     let mut last_approval_id: Option<String> = None;
     let always_allowed: Arc<Mutex<std::collections::HashSet<String>>> =
         Arc::new(Mutex::new(load_always_allowed(&ctx.session().cwd)));
@@ -2209,8 +2210,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         } else {
                             ctx.set_effort(Some("low"));
                             persist_runtime_key("effort", Some("low"));
-                            handler
-                                .push_overlay("[info] Fast mode on (effort: low)".to_string());
+                            handler.push_overlay("[info] Fast mode on (effort: low)".to_string());
                         }
                     }
                     KeyCode::Char('_') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2248,6 +2248,21 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                             cursor_pos = input_buffer.len();
                         }
                         let _ = terminal.clear();
+                    }
+                    // `ctrl+v` — chat:imagePaste in the reference: attach a
+                    // clipboard image (or an image file path) to the prompt.
+                    KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        match paste_clipboard_image() {
+                            Some(path) => {
+                                pasted_images.push(path);
+                                let marker = format!(" [Image #{}]", pasted_images.len());
+                                input_buffer.insert_str(cursor_pos, &marker);
+                                cursor_pos += marker.len();
+                            }
+                            None => {
+                                handler.push_overlay("[info] No image in clipboard".to_string());
+                            }
+                        }
                     }
                     #[cfg(unix)]
                     KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2636,10 +2651,16 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                             } else {
                                 handler.begin_live_turn(prompt.clone());
                                 turn_started_at = Some(std::time::Instant::now());
+                                let execution_prompt = with_image_references(
+                                    &prompt,
+                                    expand_at_mentions(&prompt, &ctx.session().cwd),
+                                    &pasted_images,
+                                );
+                                pasted_images.clear();
                                 active_turn = Some(spawn_turn_worker(
                                     ctx,
                                     prompt.clone(),
-                                    expand_at_mentions(&prompt, &ctx.session().cwd),
+                                    execution_prompt,
                                     always_allowed.clone(),
                                 ));
                             }
@@ -8570,6 +8591,83 @@ fn suspend_process() {
     unsafe { libc::raise(libc::SIGTSTP) };
     let _ = enable_raw_mode();
     let _ = execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste);
+}
+
+/// `chat:imagePaste` — pull an image out of the clipboard. An existing
+/// image-file path in clipboard text attaches directly; raw image data is
+/// written to a temp file like the reference's screenshot path.
+fn paste_clipboard_image() -> Option<std::path::PathBuf> {
+    const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
+    let shell = |cmd: &str| -> Option<String> {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).to_string())
+    };
+
+    // Clipboard text naming an existing image file attaches as-is.
+    for cmd in [
+        "wl-paste 2>/dev/null",
+        "xclip -selection clipboard -t text/plain -o 2>/dev/null",
+    ] {
+        if let Some(text) = shell(cmd) {
+            let path = std::path::PathBuf::from(text.trim().trim_matches('"'));
+            let is_image = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| IMAGE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+                .unwrap_or(false);
+            if path.is_file() && is_image {
+                return Some(path);
+            }
+        }
+    }
+
+    // Raw clipboard image → temp file (same idea as the reference's
+    // claude_cli_latest_screenshot.png).
+    let has_image =
+        shell("xclip -selection clipboard -t TARGETS -o 2>/dev/null | grep -q 'image/'").is_some()
+            || shell("wl-paste -l 2>/dev/null | grep -q 'image/'").is_some();
+    if !has_image {
+        return None;
+    }
+    let path = std::path::PathBuf::from("/tmp/clawed_cli_latest_screenshot.png");
+    let path_str = path.to_string_lossy().to_string();
+    let saved = shell(&format!(
+        "wl-paste --type image/png > '{path_str}' 2>/dev/null && test -s '{path_str}'"
+    ))
+    .is_some()
+        || shell(&format!(
+            "xclip -selection clipboard -t image/png -o > '{path_str}' 2>/dev/null && test -s '{path_str}'"
+        ))
+        .is_some();
+    saved.then_some(path)
+}
+
+/// Fold attached image markers into the execution prompt — the model gets
+/// paths it can inspect with file tools (providers here are text-only).
+fn with_image_references(
+    prompt: &str,
+    expanded: Option<String>,
+    images: &[std::path::PathBuf],
+) -> Option<String> {
+    if images.is_empty() {
+        return expanded;
+    }
+    let base = expanded.unwrap_or_else(|| prompt.to_string());
+    let refs = images
+        .iter()
+        .enumerate()
+        .map(|(i, p)| format!("[Image #{}] {}", i + 1, p.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!("{base}\n\n[Attached images]\n{refs}"))
 }
 
 /// Pipe text to the first available clipboard tool — mirrors `/copy`.
