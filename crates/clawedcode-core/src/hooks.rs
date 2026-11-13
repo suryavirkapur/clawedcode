@@ -28,6 +28,9 @@ pub struct HookCommand {
     /// Regex matched against the tool name. `None` matches everything.
     pub matcher: Option<String>,
     pub command: String,
+    /// Per-hook timeout override in milliseconds (settings `timeout` is
+    /// seconds, like the reference).
+    pub timeout_ms: Option<u64>,
     /// Settings file the hook came from (for display in `/hooks`).
     pub source: std::path::PathBuf,
 }
@@ -51,6 +54,8 @@ struct HookSpec {
     #[serde(rename = "type", default)]
     kind: Option<String>,
     command: Option<String>,
+    /// Timeout in seconds, like the reference's hook timeout field.
+    timeout: Option<u64>,
 }
 
 /// Load hooks from `.claude/settings.json` and `.claude/settings.local.json`
@@ -126,6 +131,7 @@ pub fn load_hooks(cwd: &Path) -> HooksConfig {
                         event: event.clone(),
                         matcher: group.matcher.clone(),
                         command,
+                        timeout_ms: spec.timeout.map(|secs| secs * 1000),
                         source: path.clone(),
                     });
                 }
@@ -279,11 +285,25 @@ fn hook_input_json(
     .to_string()
 }
 
+/// Event-specific default timeouts, matching the reference: SessionEnd
+/// hooks get 1.5s; everything else 10 minutes (tool-hook default).
+fn default_hook_timeout_ms(event: &str) -> u64 {
+    if event == "SessionEnd" {
+        1_500
+    } else {
+        10 * 60 * 1_000
+    }
+}
+
 fn run_hook_command(
-    command: &str,
+    hook: &HookCommand,
     cwd: &Path,
     stdin_json: &str,
 ) -> std::io::Result<std::process::Output> {
+    let command = hook.command.as_str();
+    let timeout_ms = hook
+        .timeout_ms
+        .unwrap_or_else(|| default_hook_timeout_ms(&hook.event));
     let parsed: serde_json::Value =
         serde_json::from_str(stdin_json).unwrap_or(serde_json::Value::Null);
     let hook_event = parsed["hook_event_name"].as_str().unwrap_or("unknown");
@@ -310,7 +330,52 @@ fn run_hook_command(
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(stdin_json.as_bytes());
     }
-    let out = child.wait_with_output()?;
+    // Drain pipes on threads so a hook writing lots of output can't
+    // deadlock on a full pipe while we poll for the deadline.
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let out_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stdout, &mut buf);
+        buf
+    });
+    let err_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stderr, &mut buf);
+        buf
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = out_thread.join();
+                let _ = err_thread.join();
+                emit_hook_lifecycle(&serde_json::json!({
+                    "stage": "response",
+                    "hook_id": hook_id,
+                    "hook_name": command,
+                    "hook_event": hook_event,
+                    "tool_name": tool_name,
+                    "session_id": session_id,
+                    "timed_out": true,
+                    "timeout_ms": timeout_ms,
+                }));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("hook `{command}` timed out after {timeout_ms}ms"),
+                ));
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    };
+    let out = std::process::Output {
+        status,
+        stdout: out_thread.join().unwrap_or_default(),
+        stderr: err_thread.join().unwrap_or_default(),
+    };
     emit_hook_lifecycle(&serde_json::json!({
         "stage": "response",
         "hook_id": hook_id,
@@ -364,7 +429,7 @@ pub fn run_pre_tool_hooks(
             continue;
         }
         let stdin = hook_input_json("PreToolUse", tool_name, input, session_id, cwd);
-        let Ok(out) = run_hook_command(&hook.command, cwd, &stdin) else {
+        let Ok(out) = run_hook_command(hook, cwd, &stdin) else {
             continue;
         };
         // JSON stdout can carry a programmatic permission decision, like
@@ -495,7 +560,7 @@ pub fn run_post_tool_hooks(
         ))
         .unwrap_or_default();
         stdin_json["tool_response"] = tool_response_preview.into();
-        let Ok(out) = run_hook_command(&hook.command, cwd, &stdin_json.to_string()) else {
+        let Ok(out) = run_hook_command(hook, cwd, &stdin_json.to_string()) else {
             continue;
         };
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
@@ -567,7 +632,7 @@ pub fn run_session_start_hooks(
     );
     let mut context = Vec::new();
     for hook in hooks_for_event(config, "SessionStart") {
-        let Ok(out) = run_hook_command(&hook.command, cwd, &stdin) else {
+        let Ok(out) = run_hook_command(hook, cwd, &stdin) else {
             continue;
         };
         let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -601,7 +666,7 @@ pub fn run_session_end_hooks(config: &HooksConfig, session_id: &str, cwd: &Path,
         serde_json::json!({ "reason": reason }),
     );
     for hook in hooks_for_event(config, "SessionEnd") {
-        let _ = run_hook_command(&hook.command, cwd, &stdin);
+        let _ = run_hook_command(hook, cwd, &stdin);
     }
 }
 
@@ -631,7 +696,7 @@ pub fn run_stop_hooks(
         serde_json::json!({ "stop_hook_active": stop_hook_active }),
     );
     for hook in hooks_for_event(config, "Stop") {
-        let Ok(out) = run_hook_command(&hook.command, cwd, &stdin) else {
+        let Ok(out) = run_hook_command(hook, cwd, &stdin) else {
             continue;
         };
         if out.status.code() == Some(2) {
@@ -658,7 +723,7 @@ pub fn run_subagent_stop_hooks(config: &HooksConfig, session_id: &str, cwd: &Pat
         serde_json::json!({ "agent_id": agent_id }),
     );
     for hook in hooks_for_event(config, "SubagentStop") {
-        let _ = run_hook_command(&hook.command, cwd, &stdin);
+        let _ = run_hook_command(hook, cwd, &stdin);
     }
 }
 
@@ -689,7 +754,7 @@ pub fn run_permission_request_hooks(
             continue;
         }
         let stdin = hook_input_json("PermissionRequest", tool_name, input, session_id, cwd);
-        let Ok(out) = run_hook_command(&hook.command, cwd, &stdin) else {
+        let Ok(out) = run_hook_command(hook, cwd, &stdin) else {
             continue;
         };
         let Ok(json) =
@@ -732,7 +797,7 @@ pub fn run_permission_denied_hooks(
         if !matcher_matches(hook.matcher.as_deref(), tool_name) {
             continue;
         }
-        let _ = run_hook_command(&hook.command, cwd, &stdin);
+        let _ = run_hook_command(hook, cwd, &stdin);
     }
 }
 
@@ -757,7 +822,7 @@ pub fn run_subagent_start_hooks(
         }),
     );
     for hook in hooks_for_event(config, "SubagentStart") {
-        let _ = run_hook_command(&hook.command, cwd, &stdin);
+        let _ = run_hook_command(hook, cwd, &stdin);
     }
 }
 
@@ -774,7 +839,7 @@ pub fn run_notification_hooks(config: &HooksConfig, session_id: &str, cwd: &Path
         serde_json::json!({ "message": message }),
     );
     for hook in hooks_for_event(config, "Notification") {
-        let _ = run_hook_command(&hook.command, cwd, &stdin);
+        let _ = run_hook_command(hook, cwd, &stdin);
     }
 }
 
@@ -792,7 +857,7 @@ pub fn run_simple_event_hooks(
     }
     let stdin = session_hook_input(event, session_id, cwd, extra);
     for hook in hooks_for_event(config, event) {
-        let _ = run_hook_command(&hook.command, cwd, &stdin);
+        let _ = run_hook_command(hook, cwd, &stdin);
     }
 }
 
@@ -816,7 +881,7 @@ pub fn run_output_hooks(
     }
     let stdin = session_hook_input(event, session_id, cwd, extra);
     for hook in hooks_for_event(config, event) {
-        if let Ok(out) = run_hook_command(&hook.command, cwd, &stdin) {
+        if let Ok(out) = run_hook_command(hook, cwd, &stdin) {
             if out.status.success() {
                 let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !stdout.is_empty() {
@@ -835,7 +900,7 @@ pub fn run_pre_compact_hooks(config: &HooksConfig, session_id: &str, cwd: &Path)
     }
     let stdin = session_hook_input("PreCompact", session_id, cwd, serde_json::json!({}));
     for hook in hooks_for_event(config, "PreCompact") {
-        let _ = run_hook_command(&hook.command, cwd, &stdin);
+        let _ = run_hook_command(hook, cwd, &stdin);
     }
 }
 
@@ -917,7 +982,7 @@ pub fn run_prompt_submit_hooks(
             "cwd": cwd.display().to_string(),
         })
         .to_string();
-        let Ok(out) = run_hook_command(&hook.command, cwd, &stdin) else {
+        let Ok(out) = run_hook_command(hook, cwd, &stdin) else {
             continue;
         };
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
