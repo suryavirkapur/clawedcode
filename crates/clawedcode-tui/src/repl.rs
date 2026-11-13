@@ -913,6 +913,14 @@ struct ActiveTurn {
     events: mpsc::Receiver<TurnWorkerEvent>,
     approvals: mpsc::Sender<ApprovalOutcome>,
     _join: thread::JoinHandle<()>,
+    /// Visible prompt for labels and background-task notices.
+    label: String,
+    /// `session.messages.len()` when the worker's session was cloned — the
+    /// merge point when a backgrounded turn finishes.
+    session_base_len: usize,
+    /// Per-turn cooperative interrupt flag so foregrounded interrupts never
+    /// kill backgrounded turns.
+    interrupt_flag: Arc<std::sync::atomic::AtomicBool>,
     compacting: bool,
     /// `/btw` side questions stream like a normal turn but never persist —
     /// the finished rows fold into the overlay instead of the session.
@@ -973,6 +981,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     let mut vim_register = String::new();
     let mut question_answers: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
     let mut active_turn: Option<ActiveTurn> = None;
+    let mut background_turns: Vec<BackgroundTurn> = Vec::new();
+    let mut bg_approval_owner: Option<usize> = None;
     let mut info_panel_scroll: usize = 0;
     let mut last_area = Rect::default();
     let mut last_body_height: usize = 0;
@@ -1006,6 +1016,13 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     loop {
         integrate_completed_subagents(ctx, &mut handler);
         drain_turn_events(ctx, &mut handler, &mut active_turn, &mut awaiting_approval);
+        drain_background_turns(
+            ctx,
+            &mut handler,
+            &mut background_turns,
+            &mut awaiting_approval,
+            &mut bg_approval_owner,
+        );
         maybe_submit_queued_prompt(
             ctx,
             &mut handler,
@@ -1236,6 +1253,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 exit_hint_active,
                 handler.vim_enabled,
                 handler.vim_insert,
+                background_turns.len(),
             );
 
             if let Some(panel) = &handler.info_panel {
@@ -1529,6 +1547,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                                   awaiting_approval: &mut Option<ApprovalRequest>,
                                   handler: &mut ReplHandler,
                                   active_turn: &Option<ActiveTurn>,
+                                  background_turns: &[BackgroundTurn],
+                                  bg_approval_owner: &mut Option<usize>,
                                   always_allowed: &Arc<
                         Mutex<std::collections::HashSet<String>>,
                     >| {
@@ -1541,8 +1561,13 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                                 }
                             }
                             handler.record_live_tool_approval_decision(&req.tool_use_id, approved);
-                            if let Some(turn) = active_turn {
-                                let _ = turn.approvals.send(ApprovalOutcome { approved, feedback });
+                            let sender = match *bg_approval_owner {
+                                Some(i) => background_turns.get(i).map(|bg| &bg.turn.approvals),
+                                None => active_turn.as_ref().map(|turn| &turn.approvals),
+                            };
+                            *bg_approval_owner = None;
+                            if let Some(sender) = sender {
+                                let _ = sender.send(ApprovalOutcome { approved, feedback });
                             }
                         }
                     };
@@ -1573,6 +1598,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                                         &mut approval_selection,
                                         &mut handler,
                                         &active_turn,
+                                        &background_turns,
+                                        &mut bg_approval_owner,
                                     );
                                 } else {
                                     choose(
@@ -1581,6 +1608,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                                         &mut awaiting_approval,
                                         &mut handler,
                                         &active_turn,
+                                        &background_turns,
+                                        &mut bg_approval_owner,
                                         &always_allowed,
                                     );
                                 }
@@ -1618,8 +1647,13 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                             KeyCode::Esc => {
                                 // Decline all remaining questions.
                                 awaiting_approval = None;
-                                if let Some(turn) = &active_turn {
-                                    let _ = turn.approvals.send(ApprovalOutcome {
+                                let sender = match bg_approval_owner {
+                                    Some(i) => background_turns.get(i).map(|bg| &bg.turn.approvals),
+                                    None => active_turn.as_ref().map(|turn| &turn.approvals),
+                                };
+                                bg_approval_owner = None;
+                                if let Some(sender) = sender {
+                                    let _ = sender.send(ApprovalOutcome {
                                         approved: false,
                                         feedback: None,
                                     });
@@ -1644,6 +1678,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                                         &mut approval_selection,
                                         &mut handler,
                                         &active_turn,
+                                        &background_turns,
+                                        &mut bg_approval_owner,
                                     );
                                 }
                             }
@@ -1688,6 +1724,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                             &mut awaiting_approval,
                             &mut handler,
                             &active_turn,
+                            &background_turns,
+                            &mut bg_approval_owner,
                             &always_allowed,
                         ),
                         KeyCode::Char('2') => choose(
@@ -1696,6 +1734,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                             &mut awaiting_approval,
                             &mut handler,
                             &active_turn,
+                            &background_turns,
+                            &mut bg_approval_owner,
                             &always_allowed,
                         ),
                         KeyCode::Char('3') | KeyCode::Char('n') | KeyCode::Char('N') => choose(
@@ -1704,6 +1744,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                             &mut awaiting_approval,
                             &mut handler,
                             &active_turn,
+                            &background_turns,
+                            &mut bg_approval_owner,
                             &always_allowed,
                         ),
                         KeyCode::Char('y') | KeyCode::Char('Y') => choose(
@@ -1712,6 +1754,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                             &mut awaiting_approval,
                             &mut handler,
                             &active_turn,
+                            &background_turns,
+                            &mut bg_approval_owner,
                             &always_allowed,
                         ),
                         KeyCode::Enter => choose(
@@ -1720,6 +1764,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                             &mut awaiting_approval,
                             &mut handler,
                             &active_turn,
+                            &background_turns,
+                            &mut bg_approval_owner,
                             &always_allowed,
                         ),
                         KeyCode::Esc => choose(
@@ -1728,6 +1774,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                             &mut awaiting_approval,
                             &mut handler,
                             &active_turn,
+                            &background_turns,
+                            &mut bg_approval_owner,
                             &always_allowed,
                         ),
                         _ => {}
@@ -2094,6 +2142,26 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                     KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         suspend_process();
                         let _ = terminal.clear();
+                    }
+                    // `ctrl+b` — park the running turn in the background, like
+                    // the reference's task:background.
+                    KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if awaiting_approval.is_none() {
+                            if let Some(turn) = active_turn.take() {
+                                let label = turn.label.clone();
+                                handler.clear_live_turn();
+                                handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
+                                background_turns.push(BackgroundTurn {
+                                    turn,
+                                    pending_approvals: std::collections::VecDeque::new(),
+                                    last_text: String::new(),
+                                });
+                                handler.push_overlay(format!(
+                                    "[info] {label} — moved to background ({} running)",
+                                    background_turns.len()
+                                ));
+                            }
+                        }
                     }
                     // `ctrl+x ctrl+e` chord — same external-editor action.
                     KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -3116,6 +3184,8 @@ fn advance_question(
     selection: &mut usize,
     handler: &mut ReplHandler,
     active_turn: &Option<ActiveTurn>,
+    background_turns: &[BackgroundTurn],
+    bg_approval_owner: &mut Option<usize>,
 ) {
     let Some(req) = awaiting_approval.as_ref() else {
         return;
@@ -3135,8 +3205,13 @@ fn advance_question(
     // All questions answered — ship the JSON map as the outcome feedback.
     let payload = serde_json::to_string(question_answers).unwrap_or_default();
     *awaiting_approval = None;
-    if let Some(turn) = active_turn {
-        let _ = turn.approvals.send(ApprovalOutcome {
+    let sender = match *bg_approval_owner {
+        Some(i) => background_turns.get(i).map(|bg| &bg.turn.approvals),
+        None => active_turn.as_ref().map(|turn| &turn.approvals),
+    };
+    *bg_approval_owner = None;
+    if let Some(sender) = sender {
+        let _ = sender.send(ApprovalOutcome {
             approved: !question_answers.is_empty(),
             feedback: Some(payload),
         });
@@ -3546,10 +3621,16 @@ fn render_hint_line(
     exit_hint: bool,
     vim_enabled: bool,
     vim_insert: bool,
+    background_count: usize,
 ) {
     let mode = ctx.permission_mode();
     let mode_text = permission_mode_label(mode);
 
+    let bg_part = if background_count > 0 {
+        format!(" · +{background_count} bg")
+    } else {
+        String::new()
+    };
     let left = if awaiting {
         "↑/↓ select · enter confirm · esc deny".to_string()
     } else if exit_hint {
@@ -3560,15 +3641,16 @@ fn render_hint_line(
         format!("{mode_text} · ? for shortcuts")
     } else {
         "? for shortcuts".to_string()
-    } + if vim_enabled {
-        if vim_insert {
-            " · vim: INSERT"
+    } + &bg_part
+        + if vim_enabled {
+            if vim_insert {
+                " · vim: INSERT"
+            } else {
+                " · vim: NORMAL"
+            }
         } else {
-            " · vim: NORMAL"
-        }
-    } else {
-        ""
-    };
+            ""
+        };
 
     let left_style = if history_search.is_some() || exit_hint {
         Style::default().fg(pal().permission_fg)
@@ -3650,7 +3732,11 @@ fn interrupt_active_turn(
     }
 
     handler.clear_live_turn();
-    *active_turn = None;
+    if let Some(turn) = active_turn.take() {
+        turn.interrupt_flag
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    // Shared flag too, for the external executor's cooperative interrupt.
     ctx.request_interrupt();
     handler.push_overlay("[warn] Interrupted by user");
     handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
@@ -4755,6 +4841,7 @@ fn append_message_blocks(
 /// Runs a `!cmd` bash-mode command directly, bypassing the model, and records
 /// `<bash-input>`/`<bash-output>` context in the session like Claude Code does.
 fn spawn_bash_worker(session: Session, command: String) -> ActiveTurn {
+    let label = format!("! {}", command.chars().take(58).collect::<String>());
     let (event_tx, event_rx) = mpsc::channel();
     let (approval_tx, _approval_rx) = mpsc::channel::<ApprovalOutcome>();
     let join = thread::spawn(move || {
@@ -4791,6 +4878,9 @@ fn spawn_bash_worker(session: Session, command: String) -> ActiveTurn {
         events: event_rx,
         approvals: approval_tx,
         _join: join,
+        label,
+        session_base_len: 0,
+        interrupt_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         compacting: false,
         ephemeral: false,
     }
@@ -4803,7 +4893,9 @@ fn spawn_turn_worker(
     always_allowed: Arc<Mutex<std::collections::HashSet<String>>>,
 ) -> ActiveTurn {
     ctx.clear_interrupt();
-    let runtime = ctx.replacement_runtime();
+    let mut runtime = ctx.replacement_runtime();
+    let interrupt_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    runtime.set_interrupt_flag(interrupt_flag.clone());
     let external_turn_executor = ctx.external_turn_executor();
     let permission_mode = ctx.permission_mode();
     // Plan mode pairs the engine's tool denial with a system reminder so the
@@ -4820,6 +4912,8 @@ fn spawn_turn_worker(
         execution_prompt
     };
     let mut session = ctx.cloned_session();
+    let label = visible_prompt.chars().take(60).collect::<String>();
+    let session_base_len = session.messages.len();
     let (event_tx, event_rx) = mpsc::channel();
     let (approval_tx, approval_rx) = mpsc::channel::<ApprovalOutcome>();
     let approval_rx = Arc::new(Mutex::new(approval_rx));
@@ -4985,6 +5079,9 @@ fn spawn_turn_worker(
         events: event_rx,
         approvals: approval_tx,
         _join: join,
+        label,
+        session_base_len,
+        interrupt_flag,
         compacting: false,
         ephemeral: false,
     }
@@ -5040,6 +5137,84 @@ fn drain_turn_events(
 
     if finished {
         *active_turn = None;
+    }
+}
+
+/// A turn parked with `Ctrl+B`: the worker keeps running, its events are
+/// drained without rendering live rows, and its session delta merges back
+/// when it finishes — the reference's `task:background`.
+struct BackgroundTurn {
+    turn: ActiveTurn,
+    pending_approvals: std::collections::VecDeque<ApprovalRequest>,
+    last_text: String,
+}
+
+fn drain_background_turns(
+    ctx: &mut TuiContext,
+    handler: &mut ReplHandler,
+    background_turns: &mut Vec<BackgroundTurn>,
+    awaiting_approval: &mut Option<ApprovalRequest>,
+    bg_approval_owner: &mut Option<usize>,
+) {
+    let mut finished: Vec<usize> = Vec::new();
+    for (index, bg) in background_turns.iter_mut().enumerate() {
+        while let Ok(event) = bg.turn.events.try_recv() {
+            match event {
+                // Live rows are foreground-only; the finished transcript is
+                // rebuilt from the merged session instead.
+                TurnWorkerEvent::Ui(TuiEvent::MessageDelta { text }) => {
+                    bg.last_text.push_str(&text);
+                }
+                TurnWorkerEvent::Ui(_) => {}
+                TurnWorkerEvent::ApprovalRequested(request) => {
+                    bg.pending_approvals.push_back(request);
+                }
+                TurnWorkerEvent::Finished(mut session) => {
+                    if !bg.turn.ephemeral {
+                        let base = bg.turn.session_base_len.min(session.messages.len());
+                        let new_messages = session.messages.split_off(base);
+                        ctx.session_mut().messages.extend(new_messages);
+                        let _ = ctx.save_session();
+                        handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
+                    }
+                    handler.push_overlay(format!(
+                        "[done] Background turn finished: {}",
+                        bg.turn.label
+                    ));
+                    finished.push(index);
+                    break;
+                }
+                TurnWorkerEvent::Failed(message) => {
+                    handler.push_overlay(format!("[error] Background turn failed: {message}"));
+                    finished.push(index);
+                    break;
+                }
+            }
+        }
+    }
+    for index in finished.into_iter().rev() {
+        if bg_approval_owner == &Some(index) {
+            *bg_approval_owner = None;
+        }
+        background_turns.remove(index);
+        // Keep the owner index valid after removal.
+        if let Some(owner) = bg_approval_owner {
+            if *owner > index {
+                *owner -= 1;
+            }
+        }
+    }
+    // Surface a queued background approval when the dialog is free.
+    if awaiting_approval.is_none() {
+        for (index, bg) in background_turns.iter_mut().enumerate() {
+            if let Some(request) = bg.pending_approvals.pop_front() {
+                handler.record_live_tool_pending_approval(&request.tool_use_id);
+                *awaiting_approval = Some(request);
+                *bg_approval_owner = Some(index);
+                handler.state = AppState::AwaitingApproval;
+                break;
+            }
+        }
     }
 }
 
