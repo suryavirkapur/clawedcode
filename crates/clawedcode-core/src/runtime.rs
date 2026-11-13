@@ -1857,7 +1857,7 @@ impl Runtime {
         match tool_name {
             TASK_OUTPUT_TOOL_NAME => Some((false, false)),
             TASK_STOP_TOOL_NAME => Some((true, true)),
-            "Skill" | "SendMessage" | "Sleep" | "EnterPlanMode" | "ExitPlanMode" => {
+            "Skill" | "SendMessage" | "Sleep" | "EnterPlanMode" | "ExitPlanMode" | "WebSearch" => {
                 Some((false, false))
             }
             "WebFetch" => Some((true, false)),
@@ -1973,6 +1973,15 @@ impl Runtime {
                 "Entered plan mode. You should now focus on researching the task \
                  and creating a plan. Do not make any edits until the user approves \
                  the plan."
+                    .to_string(),
+            );
+        }
+
+        if tool_name == "WebSearch" {
+            return ContentBlock::tool_error(
+                tool_use_id,
+                "WebSearch is unavailable: it requires a provider with \
+                 server-side web search (e.g. Anthropic's web_search tool)."
                     .to_string(),
             );
         }

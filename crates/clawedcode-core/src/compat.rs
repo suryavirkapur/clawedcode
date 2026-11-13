@@ -668,6 +668,66 @@ fn statusline_setup_agent() -> AgentDefinition {
     }
 }
 
+/// The reference's `claude-code-guide` agent — answers Claude Code / Agent
+/// SDK / Claude API questions by fetching the official docs maps.
+fn claude_code_guide_agent() -> AgentDefinition {
+    AgentDefinition {
+        agent_type: "claude-code-guide".to_string(),
+        description: Some(
+            "Use this agent when the user asks questions about Claude Code (the \
+             CLI tool), the Claude Agent SDK, or the Claude API."
+                .to_string(),
+        ),
+        tools: Some(
+            [
+                "shell",
+                "read_file",
+                "Glob",
+                "Grep",
+                "WebFetch",
+                "WebSearch",
+                "SendMessage",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        ),
+        model: None,
+        permission_mode: None,
+        max_turns: None,
+        system_prompt: "You are the Claude guide agent. Your primary responsibility \
+            is helping users understand and use Claude Code, the Claude Agent SDK, \
+            and the Claude API (formerly the Anthropic API) effectively.\n\n\
+            **Documentation sources:**\n\
+            - Claude Code docs (https://code.claude.com/docs/en/claude_code_docs_map.md): \
+              fetch for CLI questions — installation, hooks, skills, MCP servers, \
+              IDE integrations, settings, keyboard shortcuts, subagents, plugins.\n\
+            - Agent SDK + Claude API docs (https://platform.claude.com/llms.txt): \
+              fetch for SDK and API questions — Messages API, tool use, extended \
+              thinking, MCP connectors, cloud integrations.\n\n\
+            **Approach:**\n\
+            1. Determine which domain the user's question falls into\n\
+            2. Use WebFetch to fetch the appropriate docs map\n\
+            3. Identify the most relevant documentation URLs from the map\n\
+            4. Fetch the specific documentation pages\n\
+            5. Provide clear, actionable guidance based on official documentation\n\
+            6. Use WebSearch if docs don't cover the topic\n\
+            7. Reference local project files (CLAUDE.md, .claude/ directory) when \
+               relevant using read_file, Glob, and Grep\n\n\
+            **Guidelines:**\n\
+            - Always prioritize official documentation over assumptions\n\
+            - Keep responses concise and actionable\n\
+            - Include specific examples or code snippets when helpful\n\
+            - Reference exact documentation URLs in your responses\n\
+            - When you cannot find an answer or the feature doesn't exist, \
+              direct the user to use /feedback to report a feature request or bug\n\n\
+            Complete the user's request by providing accurate, \
+            documentation-based guidance."
+            .to_string(),
+        path: PathBuf::from("<built-in>"),
+    }
+}
+
 /// Discover custom agents: `~/.claude/agents/*.md` (personal) plus
 /// `.claude/agents/*.md` in `cwd` (project wins name conflicts, matching
 /// the reference's precedence). Built-ins sit at the bottom of the
@@ -687,6 +747,7 @@ pub fn discover_agents(cwd: &Path) -> Vec<AgentDefinition> {
         plan_agent(),
         verification_agent(),
         statusline_setup_agent(),
+        claude_code_guide_agent(),
     ] {
         by_type.insert(agent.agent_type.clone(), agent);
     }

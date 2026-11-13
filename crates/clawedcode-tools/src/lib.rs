@@ -773,6 +773,31 @@ pub fn builtin_tools() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: "WebSearch".to_string(),
+            description: "Search the web for current information.".to_string(),
+            needs_approval: false,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search query to use"
+                    },
+                    "allowed_domains": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Only include results from these domains"
+                    },
+                    "blocked_domains": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Never include results from these domains"
+                    }
+                },
+                "required": ["query"]
+            }),
+        },
+        ToolSpec {
             name: "EnterPlanMode".to_string(),
             description: "Transition into plan mode: research freely but make no edits until the user approves a plan.".to_string(),
             needs_approval: false,

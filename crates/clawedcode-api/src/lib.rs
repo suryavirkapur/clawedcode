@@ -548,34 +548,96 @@ impl Provider for MockAgentProvider {
         let (tx, rx) = mpsc::channel::<Result<ApiEvent, ProviderError>>(32);
 
         tokio::spawn(async move {
-            let events = if has_tool_result_message(&req) {
-                mock_tool_stream_events(&req)
+            // CLAWEDCODE_MOCK_TOOL_INPUT emits arbitrary tool calls for manual
+            // verification: either a single {"name","input"} object or an
+            // array of them consumed in order across stream() calls. Requests
+            // that already carry a tool call (e.g. forked child agents
+            // mid-tool-resolution) fall through so verification can't
+            // recurse unboundedly.
+            static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            // A forked child mid-tool-resolution carries a dangling tool_use
+            // with no tool_result yet — skip env emission there so
+            // verification can't recurse unboundedly.
+            let dangling_tool_use = req.messages.iter().any(|m| {
+                m.content
+                    .iter()
+                    .any(|b| matches!(b, ProviderContentBlock::ToolUse { .. }))
+            }) && !has_tool_result_message(&req);
+            let env_call: Option<(String, serde_json::Value)> = if dangling_tool_use {
+                None
             } else {
-                let agent_type = std::env::var("CLAWEDCODE_MOCK_AGENT_TYPE")
-                    .unwrap_or_else(|_| "tester".to_string());
-                vec![
-                    ApiEvent::ToolUse {
-                        tool_use: ToolUseEvent {
-                            id: "tool_agent_1".to_string(),
-                            name: "Task".to_string(),
-                            input: serde_json::json!({
-                                "description": "probe agent",
-                                "prompt": "say hello",
-                                "subagent_type": agent_type,
-                            })
-                            .to_string(),
+                std::env::var("CLAWEDCODE_MOCK_TOOL_INPUT")
+                    .ok()
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                    .and_then(|parsed| {
+                        let calls: Vec<serde_json::Value> = if parsed.is_array() {
+                            parsed.as_array().cloned().unwrap_or_default()
+                        } else {
+                            vec![parsed]
+                        };
+                        let index = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let call = calls.get(index.min(calls.len().saturating_sub(1)))?.clone();
+                        if index >= calls.len() {
+                            return None;
+                        }
+                        Some((
+                            call.get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("Task")
+                                .to_string(),
+                            call.get("input").cloned().unwrap_or_default(),
+                        ))
+                    })
+            };
+            let (name, input) = match env_call {
+                Some(call) => call,
+                None if has_tool_result_message(&req) => {
+                    ("__result__".to_string(), serde_json::json!({}))
+                }
+                None if dangling_tool_use => ("__none__".to_string(), serde_json::json!({})),
+                None => {
+                    let agent_type = std::env::var("CLAWEDCODE_MOCK_AGENT_TYPE")
+                        .unwrap_or_else(|_| "tester".to_string());
+                    (
+                        "Task".to_string(),
+                        serde_json::json!({
+                            "description": "probe agent",
+                            "prompt": "say hello",
+                            "subagent_type": agent_type,
+                        }),
+                    )
+                }
+            };
+            let events = {
+                if name == "__result__" {
+                    mock_tool_stream_events(&req)
+                } else if name == "__none__" {
+                    vec![
+                        ApiEvent::MessageDelta {
+                            text: "done".to_string(),
                         },
-                    },
-                    ApiEvent::Usage {
-                        usage: UsageEvent {
-                            input_tokens: 40,
-                            output_tokens: 25,
-                            cache_read_tokens: 0,
-                            cache_write_tokens: 0,
+                        ApiEvent::Completed,
+                    ]
+                } else {
+                    vec![
+                        ApiEvent::ToolUse {
+                            tool_use: ToolUseEvent {
+                                id: "tool_agent_1".to_string(),
+                                name,
+                                input: input.to_string(),
+                            },
                         },
-                    },
-                    ApiEvent::Completed,
-                ]
+                        ApiEvent::Usage {
+                            usage: UsageEvent {
+                                input_tokens: 40,
+                                output_tokens: 25,
+                                cache_read_tokens: 0,
+                                cache_write_tokens: 0,
+                            },
+                        },
+                        ApiEvent::Completed,
+                    ]
+                }
             };
             for (idx, event) in events.into_iter().enumerate() {
                 if idx > 0 {

@@ -472,8 +472,57 @@ const BUILTIN_COMMANDS: &[&str] = &[
     "/security-review",
 ];
 
+/// Reference commands that need platform services (accounts, mobile/desktop
+/// apps, voice, plugin marketplace) or Anthropic dev tooling. They resolve —
+/// like the reference's gated stubs — but report unavailability.
+const UNSUPPORTED_COMMANDS: &[&str] = &[
+    "/login",
+    "/logout",
+    "/teleport",
+    "/mobile",
+    "/desktop",
+    "/voice",
+    "/insights",
+    "/share",
+    "/summary",
+    "/upgrade",
+    "/extra-usage",
+    "/bridge",
+    "/chrome",
+    "/ide",
+    "/plugin",
+    "/reload-plugins",
+    "/install-github-app",
+    "/install-slack-app",
+    "/privacy-settings",
+    "/sandbox-toggle",
+    "/remote-env",
+    "/remote-setup",
+    "/thinkback",
+    "/ultraplan",
+    "/autofix-pr",
+    "/bughunter",
+    "/advisor",
+    "/break-cache",
+    "/backfill-sessions",
+    "/heapdump",
+    "/debug-tool-call",
+    "/ctx_viz",
+    "/passes",
+    "/perf-issue",
+    "/init-verifiers",
+    "/mock-limits",
+    "/oauth-refresh",
+    "/reset-limits",
+    "/terminal-setup",
+    "/stickers",
+    "/ant-trace",
+    "/install",
+    "/issue-report",
+];
+
 fn is_reserved_command(name: &str) -> bool {
-    BUILTIN_COMMANDS.contains(&name)
+    BUILTIN_COMMANDS.contains(&name) || UNSUPPORTED_COMMANDS.contains(&name)
 }
 
 fn is_valid_command_name(name: &str) -> bool {
@@ -7408,6 +7457,11 @@ PR number: {args}"#
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
+                name if UNSUPPORTED_COMMANDS.contains(&name) => {
+                    handler.push_overlay(format!(
+                        "[info] `{command}` requires platform services not available in this build."
+                    ));
+                }
                 _ => {
                     handler
                         .push_overlay(format!("[info] Unknown command `{command}`. Use `/help`."));
@@ -7773,6 +7827,14 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
                 .or_else(|| skill.when_to_use.clone())
                 .unwrap_or_else(|| "Discovered skill command".to_string()),
             source: CommandSource::Skill,
+        });
+    }
+
+    for name in UNSUPPORTED_COMMANDS {
+        entries.push(CommandEntry {
+            name: name.to_string(),
+            description: "Requires platform services (unavailable)".to_string(),
+            source: CommandSource::BuiltIn,
         });
     }
 
