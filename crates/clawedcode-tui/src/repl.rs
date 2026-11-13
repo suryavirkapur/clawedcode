@@ -413,6 +413,7 @@ const BUILTIN_COMMANDS: &[&str] = &[
     "/update",
     "/task",
     "/tasks",
+    "/bashes",
     "/sessions",
     "/fork",
     "/tools",
@@ -619,6 +620,7 @@ struct ReplHandler {
     quit_requested: bool,
     model_picker: Option<usize>,
     theme_picker: Option<usize>,
+    tasks_picker: Option<usize>,
     resume_picker: Option<usize>,
     resume_picker_query: String,
     vim_enabled: bool,
@@ -647,6 +649,7 @@ impl ReplHandler {
             quit_requested: false,
             model_picker: None,
             theme_picker: None,
+            tasks_picker: None,
             resume_picker: None,
             resume_picker_query: String::new(),
             vim_enabled: false,
@@ -1123,6 +1126,10 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
             }
             .max(model_picker_height(handler.model_picker, ctx))
             .max(theme_picker_height(handler.theme_picker))
+            .max(tasks_picker_height(
+                handler.tasks_picker,
+                task_entries(ctx, &background_turns).len(),
+            ))
             .max(resume_picker_height(
                 handler.resume_picker,
                 ctx,
@@ -1208,6 +1215,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 render_model_picker(frame, chunks[2], sel, ctx);
             } else if let Some(sel) = handler.theme_picker {
                 render_theme_picker(frame, chunks[2], sel);
+            } else if let Some(sel) = handler.tasks_picker {
+                render_tasks_picker(frame, chunks[2], sel, ctx, &background_turns);
             } else if let Some(sel) = handler.resume_picker {
                 render_resume_picker(frame, chunks[2], sel, ctx, &handler.resume_picker_query);
             } else if let Some(sel) = handler.rewind_picker {
@@ -1463,6 +1472,51 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         }
                         KeyCode::Esc => {
                             handler.theme_picker = None;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                if let Some(sel) = handler.tasks_picker {
+                    let entries = task_entries(ctx, &background_turns);
+                    let count = entries.len();
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            handler.tasks_picker = Some(sel.saturating_sub(1));
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if count > 0 {
+                                handler.tasks_picker = Some((sel + 1).min(count - 1));
+                            }
+                        }
+                        KeyCode::Enter => {
+                            handler.tasks_picker = None;
+                            if let Some(TaskEntry::Turn { index, label }) = entries.get(sel) {
+                                if active_turn.is_some() {
+                                    handler.push_overlay(
+                                        "[warn] A turn is already running".to_string(),
+                                    );
+                                } else {
+                                    let bg = background_turns.remove(*index);
+                                    handler.begin_live_turn(label.clone());
+                                    if !bg.last_text.is_empty() {
+                                        handler.on_event(&TuiEvent::MessageDelta {
+                                            text: bg.last_text,
+                                        });
+                                    }
+                                    turn_started_at = Some(std::time::Instant::now());
+                                    active_turn = Some(bg.turn);
+                                }
+                            }
+                        }
+                        KeyCode::Char('x') => {
+                            if let Some(TaskEntry::Shell { id, .. }) = entries.get(sel) {
+                                let _ = stop_background_task(id);
+                            }
+                        }
+                        KeyCode::Esc => {
+                            handler.tasks_picker = None;
                         }
                         _ => {}
                     }
@@ -6206,9 +6260,8 @@ PR number: {args}"#
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
-                "/tasks" => {
-                    let panel = tasks_panel(ctx);
-                    handler.show_panel(panel.title, panel.lines);
+                "/tasks" | "/bashes" => {
+                    handler.tasks_picker = Some(0);
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
@@ -6483,6 +6536,11 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
         CommandEntry {
             name: "/tasks".to_string(),
             description: "Show running and completed background tasks".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/bashes".to_string(),
+            description: "Alias for /tasks".to_string(),
             source: CommandSource::BuiltIn,
         },
         CommandEntry {
@@ -7064,37 +7122,6 @@ fn integrate_completed_subagents(ctx: &mut TuiContext, handler: &mut ReplHandler
     handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
 }
 
-fn background_task_lines(ctx: &TuiContext) -> Vec<String> {
-    let session_id = ctx.session().id.to_string();
-    let mut lines = Vec::new();
-
-    let mut shell_tasks: Vec<_> = list_background_tasks()
-        .into_iter()
-        .filter(|task| task.session_id == session_id)
-        .collect();
-    shell_tasks.sort_by_key(|task| task.created_at);
-
-    for task in shell_tasks {
-        lines.push(format!(
-            "[shell:{status}] {id} {desc}",
-            status = shell_task_status_name(task.status),
-            id = &task.id[..8.min(task.id.len())],
-            desc = truncate_for_display(&task.description, 48),
-        ));
-    }
-
-    let subagent_tasks = list_subagent_tasks_for_parent(ctx.session().id);
-    for task in subagent_tasks {
-        lines.push(format_subagent_task_line(&task));
-    }
-
-    if lines.is_empty() {
-        vec!["No background tasks".to_string()]
-    } else {
-        lines
-    }
-}
-
 fn shell_task_status_name(status: ShellTaskStatus) -> &'static str {
     match status {
         ShellTaskStatus::Pending => "pending",
@@ -7232,6 +7259,117 @@ fn apply_model_choice(ctx: &mut TuiContext, handler: &mut ReplHandler, model: &s
         }
     }
     handler.push_overlay(format!("[info] Model set to {model}"));
+}
+
+/// One row in the `/tasks` dialog — parked model turns (foregroundable),
+/// background shell tasks (killable with `x`), and sub-agent tasks.
+enum TaskEntry {
+    Turn { index: usize, label: String },
+    Shell { id: String, desc: String, status: String },
+    Agent { line: String },
+}
+
+fn task_entries(ctx: &TuiContext, background_turns: &[BackgroundTurn]) -> Vec<TaskEntry> {
+    let mut entries = Vec::new();
+    for (index, bg) in background_turns.iter().enumerate() {
+        entries.push(TaskEntry::Turn {
+            index,
+            label: bg.turn.label.clone(),
+        });
+    }
+    let session_id = ctx.session().id.to_string();
+    let mut shell_tasks: Vec<_> = list_background_tasks()
+        .into_iter()
+        .filter(|task| task.session_id == session_id)
+        .collect();
+    shell_tasks.sort_by_key(|task| task.created_at);
+    for task in shell_tasks {
+        entries.push(TaskEntry::Shell {
+            id: task.id.clone(),
+            desc: truncate_for_display(&task.description, 48),
+            status: shell_task_status_name(task.status).to_string(),
+        });
+    }
+    for task in list_subagent_tasks_for_parent(ctx.session().id) {
+        entries.push(TaskEntry::Agent {
+            line: format_subagent_task_line(&task),
+        });
+    }
+    entries
+}
+
+fn tasks_picker_height(picker: Option<usize>, count: usize) -> u16 {
+    if picker.is_none() {
+        return 0;
+    }
+    count.max(1) as u16 + 4
+}
+
+fn render_tasks_picker(
+    frame: &mut Frame,
+    area: Rect,
+    selected: usize,
+    ctx: &TuiContext,
+    background_turns: &[BackgroundTurn],
+) {
+    if area.height == 0 {
+        return;
+    }
+    let border_width = area.width.saturating_sub(2) as usize;
+    frame.render_widget(
+        Paragraph::new(format!("╭{}╮", "─".repeat(border_width)))
+            .style(Style::default().fg(pal().accent)),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    let entries = task_entries(ctx, background_turns);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            " Background tasks",
+            Style::default().fg(pal().accent),
+        )),
+        Line::from(""),
+    ];
+    if entries.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " No background tasks",
+            Style::default().fg(pal().muted),
+        )));
+    }
+    for (index, entry) in entries.iter().enumerate() {
+        let focused = index == selected;
+        let marker = if focused { "❯" } else { " " };
+        let style = if focused {
+            Style::default().fg(pal().accent)
+        } else {
+            Style::default().fg(pal().text)
+        };
+        let text = match entry {
+            TaskEntry::Turn { label, .. } => {
+                format!("[turn:running] {label}")
+            }
+            TaskEntry::Shell { id, desc, status } => {
+                format!("[shell:{status}] {} {desc}", &id[..8.min(id.len())])
+            }
+            TaskEntry::Agent { line } => line.clone(),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {marker}"), style),
+            Span::styled(text, style),
+        ]));
+    }
+    lines.push(Line::from(Span::styled(
+        " Enter foreground turn · x kill shell · Esc close",
+        Style::default().fg(pal().dim),
+    )));
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect::new(
+            area.x,
+            area.y + 1,
+            area.width,
+            area.height.saturating_sub(1),
+        ),
+    );
 }
 
 fn model_picker_height(picker: Option<usize>, ctx: &TuiContext) -> u16 {
@@ -8422,21 +8560,6 @@ fn status_panel(ctx: &TuiContext) -> InfoPanel {
     }
 }
 
-fn tasks_panel(ctx: &TuiContext) -> InfoPanel {
-    let shell_count = list_background_tasks()
-        .into_iter()
-        .filter(|task| task.session_id == ctx.session().id.to_string())
-        .count();
-    let agent_count = list_subagent_tasks_for_parent(ctx.session().id).len();
-    let mut lines = Vec::new();
-    append_panel_section(&mut lines, "Background tasks", background_task_lines(ctx));
-    InfoPanel {
-        title: "Background Tasks".to_string(),
-        status: Some(format!("shell {shell_count} · agent {agent_count}")),
-        lines,
-    }
-}
-
 fn tools_panel(ctx: &TuiContext) -> InfoPanel {
     let mut lines = vec![format!(
         "built-in={} · skills={} · mcp={}",
@@ -9377,8 +9500,6 @@ mod command_policy_tests {
         let help = help_panel(&ctx);
         let sessions = sessions_panel(&ctx);
         let tools = tools_panel(&ctx);
-        let tasks = tasks_panel(&ctx);
-
         assert_eq!(help.title, "Shortcuts and Commands");
         assert!(
             help.lines
@@ -9389,13 +9510,7 @@ mod command_policy_tests {
         assert!(sessions.lines.iter().any(|line| line.contains("Use /fork")));
         assert_eq!(tools.title, "Active Tools");
         assert!(tools.lines[0].contains("built-in="));
-        assert_eq!(tasks.title, "Background Tasks");
-        assert!(
-            tasks
-                .lines
-                .iter()
-                .any(|line| line.contains("No background tasks"))
-        );
+        assert!(task_entries(&ctx, &[]).is_empty());
 
         fs::remove_dir_all(root).ok();
     }
