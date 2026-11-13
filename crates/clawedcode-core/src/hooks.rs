@@ -624,6 +624,15 @@ fn session_hook_input(
     payload.to_string()
 }
 
+/// Result of `SessionStart` hooks — `context` becomes session context,
+/// `initial_user_message` (reference: hookSpecificOutput.initialUserMessage)
+/// optionally becomes the session's first user message.
+#[derive(Debug, Default)]
+pub struct SessionStartHookResult {
+    pub context: Vec<String>,
+    pub initial_user_message: Option<String>,
+}
+
 /// Run `SessionStart` hooks — stdout becomes additional context for the
 /// session, like the reference's `processSessionStartHooks`.
 pub fn run_session_start_hooks(
@@ -632,9 +641,10 @@ pub fn run_session_start_hooks(
     cwd: &Path,
     source: &str,
     model: &str,
-) -> Vec<String> {
+) -> SessionStartHookResult {
+    let mut result = SessionStartHookResult::default();
     if config.disabled {
-        return Vec::new();
+        return result;
     }
     let stdin = session_hook_input(
         "SessionStart",
@@ -642,28 +652,34 @@ pub fn run_session_start_hooks(
         cwd,
         serde_json::json!({ "source": source, "model": model }),
     );
-    let mut context = Vec::new();
     for hook in hooks_for_event(config, "SessionStart") {
         let Ok(out) = run_hook_command(hook, cwd, &stdin) else {
             continue;
         };
         let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
-            if let Some(ctx) = json
-                .get("hookSpecificOutput")
+            let hso = json.get("hookSpecificOutput");
+            if let Some(msg) = hso
+                .and_then(|o| o.get("initialUserMessage"))
+                .and_then(|m| m.as_str())
+                .filter(|m| !m.trim().is_empty())
+            {
+                result.initial_user_message = Some(msg.to_string());
+            }
+            if let Some(ctx) = hso
                 .and_then(|o| o.get("additionalContext"))
                 .and_then(|c| c.as_str())
                 .filter(|c| !c.trim().is_empty())
             {
-                context.push(ctx.to_string());
+                result.context.push(ctx.to_string());
                 continue;
             }
         }
         if !stdout.is_empty() {
-            context.push(stdout);
+            result.context.push(stdout);
         }
     }
-    context
+    result
 }
 
 /// Run `SessionEnd` hooks — fire-and-forget (clear, resume-away, exit).
@@ -741,9 +757,13 @@ pub fn run_subagent_stop_hooks(config: &HooksConfig, session_id: &str, cwd: &Pat
 
 /// Decision returned by `PermissionRequest` hooks — they can resolve a
 /// permission prompt programmatically via JSON stdout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PermissionHookDecision {
-    Allow,
+    /// Approved — `updated_input` replaces the tool input when present
+    /// (reference: hookSpecificOutput.decision.updatedInput).
+    Allow {
+        updated_input: Option<serde_json::Value>,
+    },
     Deny,
     Ask,
 }
@@ -774,12 +794,30 @@ pub fn run_permission_request_hooks(
         else {
             continue;
         };
-        match json
-            .get("hookSpecificOutput")
-            .and_then(|o| o.get("permissionDecision"))
-            .and_then(|d| d.as_str())
-        {
-            Some("allow") => return Some(PermissionHookDecision::Allow),
+        let hso = match json.get("hookSpecificOutput") {
+            Some(o) => o,
+            None => continue,
+        };
+        // Reference shape: hookSpecificOutput.decision.{behavior,
+        // updatedInput?, message?}. Fall back to permissionDecision for
+        // compatibility with hooks written against the PreToolUse shape.
+        if let Some(decision) = hso.get("decision") {
+            match decision.get("behavior").and_then(|b| b.as_str()) {
+                Some("allow") => {
+                    return Some(PermissionHookDecision::Allow {
+                        updated_input: decision.get("updatedInput").cloned(),
+                    })
+                }
+                Some("deny") => return Some(PermissionHookDecision::Deny),
+                _ => {}
+            }
+        }
+        match hso.get("permissionDecision").and_then(|d| d.as_str()) {
+            Some("allow") => {
+                return Some(PermissionHookDecision::Allow {
+                    updated_input: None,
+                })
+            }
             Some("deny") => return Some(PermissionHookDecision::Deny),
             Some("ask") => return Some(PermissionHookDecision::Ask),
             _ => {}

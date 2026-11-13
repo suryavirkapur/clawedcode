@@ -182,6 +182,10 @@ impl TuiContext {
         self.startup_prompt.take()
     }
 
+    pub fn has_startup_prompt(&self) -> bool {
+        self.startup_prompt.is_some()
+    }
+
     pub fn set_open_session_picker_at_start(&mut self, open: bool) {
         self.open_session_picker_at_start = open;
     }

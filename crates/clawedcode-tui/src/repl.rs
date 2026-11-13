@@ -1030,18 +1030,25 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
 
     // SessionStart hooks: stdout becomes one-shot context prepended to the
     // first submitted prompt, like the reference's processSessionStartHooks.
-    let start_context = clawedcode_core::hooks::run_session_start_hooks(
+    let start_hooks = clawedcode_core::hooks::run_session_start_hooks(
         &clawedcode_core::hooks::load_hooks(&ctx.session().cwd),
         &ctx.session().id.to_string(),
         &ctx.session().cwd,
         "startup",
         &ctx.model_name(),
     );
-    if !start_context.is_empty() {
+    if !start_hooks.context.is_empty() {
         ctx.set_pending_prompt_prefix(Some(format!(
             "<session-start-hook-context>\n{}\n</session-start-hook-context>",
-            start_context.join("\n\n")
+            start_hooks.context.join("\n\n")
         )));
+    }
+    // hookSpecificOutput.initialUserMessage seeds the input buffer when no
+    // startup prompt was given.
+    if let Some(msg) = start_hooks.initial_user_message {
+        if !ctx.has_startup_prompt() {
+            ctx.set_prefill_input(Some(msg));
+        }
     }
 
     let mut input_buffer = ctx.take_prefill_input().unwrap_or_default();
@@ -6210,6 +6217,7 @@ fn compact_session(session: &mut Session) -> Vec<String> {
         "compact",
         "compact",
     )
+    .context
 }
 
 fn handle_slash_command(
@@ -6263,7 +6271,8 @@ fn handle_slash_command(
                         &ctx.session().cwd,
                         "clear",
                         &ctx.model_name(),
-                    );
+                    )
+                    .context;
                     if !context.is_empty() {
                         ctx.set_pending_prompt_prefix(Some(format!(
                             "<session-start-hook-context>\n{}\n</session-start-hook-context>",
@@ -9583,7 +9592,8 @@ fn apply_resume_choice(ctx: &mut TuiContext, handler: &mut ReplHandler, prefix: 
                 &ctx.session().cwd,
                 "resume",
                 &ctx.model_name(),
-            );
+            )
+            .context;
             if !context.is_empty() {
                 ctx.set_pending_prompt_prefix(Some(format!(
                     "<session-start-hook-context>\n{}\n</session-start-hook-context>",

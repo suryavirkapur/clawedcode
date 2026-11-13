@@ -2299,8 +2299,15 @@ impl Runtime {
                     tool_name,
                     &input,
                 ) {
-                    Some(crate::hooks::PermissionHookDecision::Allow) => {
-                        return self.execute_tool_hooked(tool_use_id, tool_name, input, session, &pre_context);
+                    Some(crate::hooks::PermissionHookDecision::Allow { updated_input }) => {
+                        let input = updated_input.unwrap_or(input);
+                        return self.execute_tool_hooked(
+                            tool_use_id,
+                            tool_name,
+                            input,
+                            session,
+                            &pre_context,
+                        );
                     }
                     Some(crate::hooks::PermissionHookDecision::Deny) => {
                         let reason = format!("Tool '{tool_name}' denied by PermissionRequest hook");

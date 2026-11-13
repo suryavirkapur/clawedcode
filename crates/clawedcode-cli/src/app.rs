@@ -1609,13 +1609,23 @@ async fn execute_run(
         "startup",
         &model,
     );
-    let prompt = if start_context.is_empty() {
+    // hookSpecificOutput.initialUserMessage becomes the prompt when none was
+    // supplied on the command line.
+    let base_prompt = if run_mode.prompt.trim().is_empty() {
+        start_context
+            .initial_user_message
+            .clone()
+            .unwrap_or_else(|| run_mode.prompt.clone())
+    } else {
         run_mode.prompt.clone()
+    };
+    let prompt = if start_context.context.is_empty() {
+        base_prompt
     } else {
         format!(
             "<session-start-hook-context>\n{}\n</session-start-hook-context>\n\n{}",
-            start_context.join("\n\n"),
-            run_mode.prompt
+            start_context.context.join("\n\n"),
+            base_prompt
         )
     };
     let run_mode = crate::bootstrap::RunMode { prompt, ..run_mode };
@@ -2336,13 +2346,21 @@ async fn execute_headless(
         "startup",
         &model,
     );
-    let prompt = if start_context.is_empty() {
+    let base_prompt = if prompt.trim().is_empty() {
+        start_context
+            .initial_user_message
+            .clone()
+            .unwrap_or(prompt)
+    } else {
         prompt
+    };
+    let prompt = if start_context.context.is_empty() {
+        base_prompt
     } else {
         format!(
             "<session-start-hook-context>\n{}\n</session-start-hook-context>\n\n{}",
-            start_context.join("\n\n"),
-            prompt
+            start_context.context.join("\n\n"),
+            base_prompt
         )
     };
 
