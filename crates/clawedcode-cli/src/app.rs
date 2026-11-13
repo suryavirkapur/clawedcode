@@ -1774,6 +1774,7 @@ async fn execute_run(
         "startup",
         &model,
     );
+    clawedcode_core::hooks::start_file_watcher(session.cwd.clone(), session.id.to_string());
     // hookSpecificOutput.initialUserMessage becomes the prompt when none was
     // supplied on the command line.
     let base_prompt = if run_mode.prompt.trim().is_empty() {
@@ -2511,6 +2512,7 @@ async fn execute_headless(
         "startup",
         &model,
     );
+    clawedcode_core::hooks::start_file_watcher(session.cwd.clone(), session.id.to_string());
     let base_prompt = if prompt.trim().is_empty() {
         start_context
             .initial_user_message

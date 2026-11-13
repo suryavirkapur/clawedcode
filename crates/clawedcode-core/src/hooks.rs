@@ -718,6 +718,140 @@ fn interpolate_header_env(
 /// `--include-hook-events`: a process-global sink that receives
 /// hook-lifecycle records (`hook_started`/`hook_response`) so the
 /// stream-json protocol can forward them.
+/// Filesystem paths hooks asked us to watch (`hookSpecificOutput.
+/// watchPaths`) — polled by `start_file_watcher` to fire `FileChanged`.
+static WATCH_PATHS: std::sync::RwLock<std::collections::BTreeSet<String>> =
+    std::sync::RwLock::new(std::collections::BTreeSet::new());
+
+/// Replace the dynamic watch set, like the reference's updateWatchPaths.
+pub fn update_watch_paths(paths: Vec<String>) {
+    if let Ok(mut set) = WATCH_PATHS.write() {
+        *set = paths.into_iter().collect();
+    }
+}
+
+/// Current watch set.
+pub fn watch_paths() -> Vec<String> {
+    WATCH_PATHS
+        .read()
+        .map(|s| s.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Collect `hookSpecificOutput.watchPaths` from a hook's JSON output into
+/// the global watch set (union across hooks like the reference).
+fn note_watch_paths(json: &serde_json::Value) {
+    let Some(paths) = json
+        .get("hookSpecificOutput")
+        .and_then(|o| o.get("watchPaths"))
+        .and_then(|p| p.as_array())
+    else {
+        return;
+    };
+    let mut current = watch_paths();
+    current.extend(paths.iter().filter_map(|p| p.as_str()).map(str::to_string));
+    update_watch_paths(current);
+}
+
+/// Poll-based file watcher: scans `cwd` for files matching `watch_paths()`
+/// globs and fires `FileChanged` hooks on add/change/unlink. Runs until
+/// the process exits — spawn once per session.
+pub fn start_file_watcher(cwd: PathBuf, session_id: String) {
+    std::thread::spawn(move || {
+        let mut snapshot: std::collections::BTreeMap<PathBuf, std::time::SystemTime> =
+            std::collections::BTreeMap::new();
+        let mut primed = false;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            let patterns = watch_paths();
+            if patterns.is_empty() {
+                continue;
+            }
+            let mut current = std::collections::BTreeMap::new();
+            scan_watch_files(&cwd, &patterns, &cwd, &mut current, 0);
+            if primed {
+                for (path, mtime) in &current {
+                    match snapshot.get(path) {
+                        None => fire_file_changed(&cwd, &session_id, path, "add"),
+                        Some(prev) if prev != mtime => {
+                            fire_file_changed(&cwd, &session_id, path, "change")
+                        }
+                        _ => {}
+                    }
+                }
+                for path in snapshot.keys() {
+                    if !current.contains_key(path) {
+                        fire_file_changed(&cwd, &session_id, path, "unlink");
+                    }
+                }
+            }
+            snapshot = current;
+            primed = true;
+        }
+    });
+}
+
+fn scan_watch_files(
+    root: &Path,
+    patterns: &[String],
+    dir: &Path,
+    out: &mut std::collections::BTreeMap<PathBuf, std::time::SystemTime>,
+    depth: usize,
+) {
+    if depth > 12 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        if ft.is_dir() {
+            if name == ".git" || name == "node_modules" || name == "target" {
+                continue;
+            }
+            scan_watch_files(root, patterns, &path, out, depth + 1);
+        } else {
+            let rel = path
+                .strip_prefix(root)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| path.to_string_lossy().to_string());
+            let matches = patterns.iter().any(|pat| {
+                crate::compat::glob_match(pat, &rel) || crate::compat::glob_match(pat, &name)
+            });
+            if matches {
+                if let Ok(mtime) = path.metadata().and_then(|m| m.modified()) {
+                    out.insert(path, mtime);
+                }
+            }
+        }
+    }
+}
+
+fn fire_file_changed(root: &Path, session_id: &str, path: &Path, event: &str) {
+    let config = load_hooks(root);
+    if config.disabled {
+        return;
+    }
+    let abs = path
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()));
+    run_simple_event_hooks(
+        &config,
+        "FileChanged",
+        session_id,
+        root,
+        serde_json::json!({
+            "file_path": abs.to_string_lossy(),
+            "event": event,
+        }),
+    );
+}
+
 static HOOK_EVENT_SINK: std::sync::Mutex<Option<Box<dyn Fn(&serde_json::Value) + Send + Sync>>> =
     std::sync::Mutex::new(None);
 
@@ -900,6 +1034,7 @@ pub fn run_post_tool_hooks(
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
+            note_watch_paths(&json);
             if let Some(ctx) = json
                 .get("hookSpecificOutput")
                 .and_then(|o| o.get("additionalContext"))
@@ -982,6 +1117,7 @@ pub fn run_session_start_hooks(
         };
         let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
+            note_watch_paths(&json);
             let hso = json.get("hookSpecificOutput");
             if let Some(msg) = hso
                 .and_then(|o| o.get("initialUserMessage"))
@@ -1027,6 +1163,7 @@ pub fn run_event_hooks_for_context(
         };
         let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
+            note_watch_paths(&json);
             if let Some(ctx) = json
                 .get("hookSpecificOutput")
                 .and_then(|o| o.get("additionalContext"))

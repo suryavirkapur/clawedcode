@@ -1037,6 +1037,10 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
         "startup",
         &ctx.model_name(),
     );
+    clawedcode_core::hooks::start_file_watcher(
+        ctx.session().cwd.clone(),
+        ctx.session().id.to_string(),
+    );
     if !start_hooks.context.is_empty() {
         ctx.set_pending_prompt_prefix(Some(format!(
             "<session-start-hook-context>\n{}\n</session-start-hook-context>",

@@ -479,7 +479,7 @@ fn memory_search_paths(cwd: &Path, claude_home: Option<&Path>) -> Result<Vec<Pat
 }
 
 /// `**` spans directories; `*`/`?` stay within a segment.
-fn glob_match(pattern: &str, path: &str) -> bool {
+pub(crate) fn glob_match(pattern: &str, path: &str) -> bool {
     fn seg_match(pat: &[&str], parts: &[&str]) -> bool {
         match (pat.first(), parts.first()) {
             (None, None) => true,
