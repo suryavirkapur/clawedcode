@@ -192,6 +192,9 @@ impl Tool for ReadMcpResourceToolInstance {
 pub struct Runtime {
     pub(crate) config: AppConfig,
     pub(crate) system_prompt: PromptSpec,
+    /// Custom-agent system prompt (`.claude/agents/*.md` bodies) — set when a
+    /// `Task(subagent_type=...)` run selects an agent definition.
+    pub(crate) agent_prompt: Option<String>,
     pub(crate) tools: Vec<ToolSpec>,
     tool_instances: HashMap<String, Box<dyn Tool>>,
     pub(crate) compatibility: CompatibilitySnapshot,
@@ -478,6 +481,7 @@ impl Runtime {
         Self {
             config,
             system_prompt,
+            agent_prompt: None,
             tools,
             tool_instances,
             compatibility,
@@ -485,6 +489,10 @@ impl Runtime {
             permission_engine: PermissionEngine::new(mode),
             interrupt_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    pub fn set_agent_prompt(&mut self, prompt: Option<String>) {
+        self.agent_prompt = prompt;
     }
 
     pub fn start_session(&self, cwd: PathBuf) -> Session {
@@ -521,7 +529,7 @@ impl Runtime {
         result
     }
 
-    fn effective_system_prompt_body(&self, session: &Session) -> String {
+    pub(crate) fn effective_system_prompt_body(&self, session: &Session) -> String {
         let tool_names: Vec<String> = self.tools.iter().map(|tool| tool.name.clone()).collect();
         let mut body = render_system_prompt(
             &self.system_prompt,
@@ -532,6 +540,9 @@ impl Runtime {
                 compatibility: &self.compatibility,
             },
         );
+        if let Some(agent_prompt) = &self.agent_prompt {
+            body = format!("{agent_prompt}\n\n{body}");
+        }
         if let Some(style) = crate::compat::load_output_style(&session.cwd) {
             body.push_str("\n\n");
             body.push_str(&style);
@@ -1179,13 +1190,22 @@ impl Runtime {
                 continue;
             };
 
-            let config = self.config.clone();
+            let (config, permission_mode, max_turns, agent_system_prompt) = match self
+                .resolve_agent_run(&parsed, session)
+            {
+                Ok(run) => run,
+                Err(err) => {
+                    prepared.insert(
+                        tool_use_id.clone(),
+                        PreparedAgentExecution::Ready(ContentBlock::tool_error(tool_use_id, err)),
+                    );
+                    continue;
+                }
+            };
             let system_prompt = self.system_prompt.clone();
             let compatibility = self.compatibility.clone();
             let cwd = session.cwd.clone();
             let parent_snapshot = session.clone();
-            let permission_mode = self.permission_mode();
-            let max_turns = self.max_turns();
             let parsed_for_thread = parsed.clone();
 
             prepared.insert(
@@ -1205,6 +1225,7 @@ impl Runtime {
                                 prompt: parsed_for_thread.prompt.clone(),
                                 max_turns,
                                 permission_mode,
+                                agent_system_prompt,
                             },
                         )
                         .map_err(|err| err.to_string())?;
@@ -1247,6 +1268,52 @@ impl Runtime {
         None
     }
 
+    /// Resolve a `subagent_type` into run parameters — config, permission
+    /// mode, turn cap, and the agent's system prompt from
+    /// `.claude/agents/*.md`. Unknown types fail with the available list.
+    fn resolve_agent_run(
+        &self,
+        parsed: &AgentToolInput,
+        session: &Session,
+    ) -> Result<(AppConfig, PermissionMode, usize, Option<String>), String> {
+        let agents = crate::compat::discover_agents(&session.cwd);
+        let agent = match parsed.subagent_type.as_deref() {
+            None => None,
+            Some(kind) => match agents.iter().find(|a| a.agent_type == kind) {
+                Some(agent) => Some(agent),
+                None => {
+                    let names: Vec<&str> = agents.iter().map(|a| a.agent_type.as_str()).collect();
+                    let hint = if names.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" Available agents: {}", names.join(", "))
+                    };
+                    return Err(format!("Unknown agent type \"{kind}\".{hint}"));
+                }
+            },
+        };
+
+        let mut config = self.config.clone();
+        let mut permission_mode = self.permission_mode();
+        let mut max_turns = self.max_turns();
+        let mut agent_system_prompt = None;
+        if let Some(agent) = agent {
+            agent_system_prompt = Some(agent.system_prompt.clone());
+            if let Some(model) = &agent.model {
+                config.model = model.clone();
+            }
+            if let Some(mode) =
+                crate::compat::agent_permission_mode(agent.permission_mode.as_deref())
+            {
+                permission_mode = mode;
+            }
+            if let Some(turns) = agent.max_turns {
+                max_turns = turns;
+            }
+        }
+        Ok((config, permission_mode, max_turns, agent_system_prompt))
+    }
+
     fn execute_agent_tool(
         &self,
         tool_use_id: &str,
@@ -1269,8 +1336,14 @@ impl Runtime {
             );
         };
 
+        let (config, permission_mode, max_turns, agent_system_prompt) =
+            match self.resolve_agent_run(&parsed, session) {
+                Ok(run) => run,
+                Err(err) => return ContentBlock::tool_error(tool_use_id, err),
+            };
+
         let runtime = SubAgentRuntime::new(
-            self.config.clone(),
+            config,
             self.system_prompt.clone(),
             self.compatibility.clone(),
             sessions_dir,
@@ -1281,8 +1354,9 @@ impl Runtime {
             session,
             SubAgentConfig {
                 prompt: parsed.prompt.clone(),
-                max_turns: self.max_turns(),
-                permission_mode: self.permission_mode(),
+                max_turns,
+                permission_mode,
+                agent_system_prompt,
             },
         ) {
             Ok(result) => {

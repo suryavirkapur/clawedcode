@@ -5,7 +5,7 @@ use crate::{
     permissions::PermissionMode,
     prompt::PromptSpec,
     runtime::Runtime,
-    session::{Role, Session},
+    session::{Message, Role, Session},
 };
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -18,6 +18,9 @@ pub struct SubAgentConfig {
     pub prompt: String,
     pub max_turns: usize,
     pub permission_mode: PermissionMode,
+    /// Custom-agent system prompt from `.claude/agents/*.md` when the Task
+    /// call named a `subagent_type`.
+    pub agent_system_prompt: Option<String>,
 }
 
 impl Default for SubAgentConfig {
@@ -26,6 +29,7 @@ impl Default for SubAgentConfig {
             prompt: String::new(),
             max_turns: 10,
             permission_mode: PermissionMode::Bypass,
+            agent_system_prompt: None,
         }
     }
 }
@@ -136,6 +140,30 @@ impl SubAgentRuntime {
         Ok(result)
     }
 
+    /// Forked children inherit the parent's system prompt — swap it for
+    /// the agent's composed prompt when a `subagent_type` was resolved.
+    fn apply_agent_system_prompt(
+        runtime: &Runtime,
+        session: &mut Session,
+        subagent: &SubAgentConfig,
+    ) {
+        if subagent.agent_system_prompt.is_none() {
+            return;
+        }
+        let body = runtime.effective_system_prompt_body(session);
+        if session
+            .messages
+            .first()
+            .is_some_and(|m| m.role == Role::System)
+        {
+            session.messages[0] = Message::from_text(Role::System, body);
+        } else {
+            session
+                .messages
+                .insert(0, Message::from_text(Role::System, body));
+        }
+    }
+
     pub fn spawn_fork_from_parent(
         &self,
         parent_session: &Session,
@@ -143,6 +171,7 @@ impl SubAgentRuntime {
     ) -> Result<SubAgentResult> {
         let runtime = self.build_runtime(&subagent);
         let mut session = self.build_child_session_from_parent(parent_session);
+        Self::apply_agent_system_prompt(&runtime, &mut session, &subagent);
         let output = runtime.submit(&mut session, &subagent.prompt);
         session.save(&self.sessions_dir)?;
 
@@ -186,12 +215,14 @@ impl SubAgentRuntime {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut config = config;
                 config.runtime.max_turns = subagent.max_turns.min(u16::MAX as usize) as u16;
-                let runtime = Runtime::with_mode(
+                let mut runtime = Runtime::with_mode(
                     config,
                     system_prompt,
                     compatibility,
                     subagent.permission_mode,
                 );
+                runtime.set_agent_prompt(subagent.agent_system_prompt.clone());
+                Self::apply_agent_system_prompt(&runtime, &mut child_session, &subagent);
                 let output = runtime.submit(&mut child_session, &subagent.prompt);
                 let summary = summarize_output(&output.response, output.tools_executed);
                 let _ = child_session.save(&sessions_dir);
@@ -226,12 +257,14 @@ impl SubAgentRuntime {
     fn build_runtime(&self, subagent: &SubAgentConfig) -> Runtime {
         let mut config = self.config.clone();
         config.runtime.max_turns = subagent.max_turns.min(u16::MAX as usize) as u16;
-        Runtime::with_mode(
+        let mut runtime = Runtime::with_mode(
             config,
             self.system_prompt.clone(),
             self.compatibility.clone(),
             subagent.permission_mode,
-        )
+        );
+        runtime.set_agent_prompt(subagent.agent_system_prompt.clone());
+        runtime
     }
 
     fn build_child_session_from_parent(&self, parent_session: &Session) -> Session {
@@ -371,6 +404,7 @@ mod tests {
                 prompt: "Say hello in one word".to_string(),
                 max_turns: 5,
                 permission_mode: PermissionMode::Bypass,
+                agent_system_prompt: None,
             })
             .unwrap();
 
@@ -388,6 +422,7 @@ mod tests {
                 prompt: "Say hello in one word".to_string(),
                 max_turns: 5,
                 permission_mode: PermissionMode::Bypass,
+                agent_system_prompt: None,
             })
             .unwrap();
 
@@ -410,6 +445,7 @@ mod tests {
                     prompt: "Say hello in one word".to_string(),
                     max_turns: 5,
                     permission_mode: PermissionMode::Bypass,
+                    agent_system_prompt: None,
                 },
             )
             .unwrap();
@@ -441,6 +477,7 @@ mod tests {
                     prompt: "Say hello in one word".to_string(),
                     max_turns: 5,
                     permission_mode: PermissionMode::Bypass,
+                    agent_system_prompt: None,
                 },
             )
             .unwrap();
@@ -466,6 +503,7 @@ mod tests {
                     prompt: "Continue from the inherited context".to_string(),
                     max_turns: 5,
                     permission_mode: PermissionMode::Bypass,
+                    agent_system_prompt: None,
                 },
             )
             .unwrap();
@@ -505,6 +543,7 @@ mod tests {
                     prompt: "Do one thing".to_string(),
                     max_turns: 5,
                     permission_mode: PermissionMode::Bypass,
+                    agent_system_prompt: None,
                 },
             )
             .unwrap();
@@ -532,6 +571,7 @@ mod tests {
                 prompt: "Count to 100".to_string(),
                 max_turns: 1,
                 permission_mode: PermissionMode::Bypass,
+                agent_system_prompt: None,
             })
             .unwrap();
 
@@ -552,6 +592,7 @@ mod tests {
                     prompt: "Say hello in one word".to_string(),
                     max_turns: 5,
                     permission_mode: PermissionMode::Bypass,
+                    agent_system_prompt: None,
                 },
             )
             .unwrap();
@@ -583,6 +624,7 @@ mod tests {
                     prompt: "Say hello in one word".to_string(),
                     max_turns: 5,
                     permission_mode: PermissionMode::Bypass,
+                    agent_system_prompt: None,
                 },
             )
             .unwrap();

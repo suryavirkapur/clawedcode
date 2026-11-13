@@ -6037,12 +6037,28 @@ fn handle_slash_command(
                     return Ok(true);
                 }
                 "/agents" => {
+                    let agents = clawedcode_core::compat::discover_agents(&ctx.session().cwd);
                     let tasks = list_subagent_tasks_for_parent(ctx.session().id);
-                    let lines = if tasks.is_empty() {
-                        vec!["No sub-agent tasks for this session.".to_string()]
+                    let mut lines = Vec::new();
+                    if agents.is_empty() {
+                        lines.push("No custom agents — add .claude/agents/<name>.md.".to_string());
                     } else {
-                        tasks.iter().map(format_subagent_task_line).collect()
-                    };
+                        lines.push("Custom agents:".to_string());
+                        for agent in &agents {
+                            let desc = agent
+                                .description
+                                .clone()
+                                .unwrap_or_else(|| "(no description)".to_string());
+                            lines.push(format!("  {} — {}", agent.agent_type, desc));
+                        }
+                    }
+                    if tasks.is_empty() {
+                        lines.push("No sub-agent tasks for this session.".to_string());
+                    } else {
+                        lines.push(String::new());
+                        lines.push("Tasks:".to_string());
+                        lines.extend(tasks.iter().map(format_subagent_task_line));
+                    }
                     handler.show_panel("Agents".to_string(), lines);
                     let _ = ctx.save_session();
                     return Ok(true);

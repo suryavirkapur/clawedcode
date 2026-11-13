@@ -529,6 +529,70 @@ impl Provider for MockWriteProvider {
     }
 }
 
+/// Emits a `Task` tool call carrying `subagent_type` — exercises the
+/// custom-agent resolution path end to end. Type comes from
+/// `CLAWEDCODE_MOCK_AGENT_TYPE` (default `"tester"`).
+pub struct MockAgentProvider;
+
+impl Provider for MockAgentProvider {
+    fn complete(
+        &self,
+        request: &CompletionRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<CompletionResponse, ProviderError>> + Send + '_>> {
+        let response = mock_tool_complete_response(request);
+        Box::pin(async move { Ok(response) })
+    }
+
+    fn stream(&self, request: &CompletionRequest) -> EventStream {
+        let req = request.clone();
+        let (tx, rx) = mpsc::channel::<Result<ApiEvent, ProviderError>>(32);
+
+        tokio::spawn(async move {
+            let events = if has_tool_result_message(&req) {
+                mock_tool_stream_events(&req)
+            } else {
+                let agent_type = std::env::var("CLAWEDCODE_MOCK_AGENT_TYPE")
+                    .unwrap_or_else(|_| "tester".to_string());
+                vec![
+                    ApiEvent::ToolUse {
+                        tool_use: ToolUseEvent {
+                            id: "tool_agent_1".to_string(),
+                            name: "Task".to_string(),
+                            input: serde_json::json!({
+                                "description": "probe agent",
+                                "prompt": "say hello",
+                                "subagent_type": agent_type,
+                            })
+                            .to_string(),
+                        },
+                    },
+                    ApiEvent::Usage {
+                        usage: UsageEvent {
+                            input_tokens: 40,
+                            output_tokens: 25,
+                            cache_read_tokens: 0,
+                            cache_write_tokens: 0,
+                        },
+                    },
+                    ApiEvent::Completed,
+                ]
+            };
+            for (idx, event) in events.into_iter().enumerate() {
+                if idx > 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                if tx.send(Ok(event)).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        Box::pin(futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        }))
+    }
+}
+
 /// A mock provider that emits an `ask_user_question` ToolUse — exercising
 /// the interactive question dialog — then a final text response.
 #[derive(Debug, Default, Clone)]
@@ -1682,6 +1746,10 @@ pub fn create_provider() -> BoxedProvider {
             "mock_ask_multi" => {
                 tracing::info!("Using mock ask provider (multiSelect)");
                 return Box::new(MockAskProvider { multi_select: true });
+            }
+            "mock_agent" => {
+                tracing::info!("Using mock agent provider");
+                return Box::new(MockAgentProvider);
             }
             #[cfg(feature = "openai")]
             "deepseek" => {

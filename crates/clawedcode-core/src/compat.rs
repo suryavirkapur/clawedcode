@@ -123,7 +123,7 @@ pub fn load_output_style(cwd: &Path) -> Option<String> {
         if let Ok(body) = std::fs::read_to_string(&path) {
             // Reuse the frontmatter stripper so `description:` metadata does
             // not leak into the prompt.
-            let (_frontmatter, body) = parse_frontmatter_and_body(&body);
+            let (_frontmatter, body) = parse_frontmatter_and_body::<SkillFrontmatter>(&body);
             let body = body.trim();
             if !body.is_empty() {
                 return Some(body.to_string());
@@ -315,7 +315,7 @@ fn discover_skills_in_root(
 fn parse_skill(path: &Path, legacy_command: bool) -> Result<SkillDescriptor> {
     let raw =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let (frontmatter, body) = parse_frontmatter_and_body(&raw);
+    let (frontmatter, body) = parse_frontmatter_and_body::<SkillFrontmatter>(&raw);
     let fallback_name = if legacy_command {
         path.file_stem()
             .and_then(|name| name.to_str())
@@ -344,16 +344,19 @@ fn parse_skill(path: &Path, legacy_command: bool) -> Result<SkillDescriptor> {
     })
 }
 
-fn parse_frontmatter_and_body(raw: &str) -> (SkillFrontmatter, String) {
+fn parse_frontmatter_and_body<T>(raw: &str) -> (T, String)
+where
+    T: serde::de::DeserializeOwned + Default,
+{
     let mut lines = raw.lines();
     if lines.next() != Some("---") {
-        return (SkillFrontmatter::default(), raw.trim().to_string());
+        return (T::default(), raw.trim().to_string());
     }
 
     let mut yaml = String::new();
     while let Some(line) = lines.next() {
         if line == "---" {
-            let frontmatter = serde_yaml::from_str::<SkillFrontmatter>(&yaml).ok();
+            let frontmatter = serde_yaml::from_str::<T>(&yaml).ok();
             let body = lines.collect::<Vec<&str>>().join("\n").trim().to_string();
             return (frontmatter.unwrap_or_default(), body);
         }
@@ -361,7 +364,118 @@ fn parse_frontmatter_and_body(raw: &str) -> (SkillFrontmatter, String) {
         yaml.push('\n');
     }
 
-    (SkillFrontmatter::default(), raw.trim().to_string())
+    (T::default(), raw.trim().to_string())
+}
+
+/// A subagent definition from `.claude/agents/<name>.md` — the reference's
+/// custom agents (`Task(subagent_type=...)` selects one).
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentDefinition {
+    pub agent_type: String,
+    pub description: Option<String>,
+    pub tools: Vec<String>,
+    pub model: Option<String>,
+    pub permission_mode: Option<String>,
+    pub max_turns: Option<usize>,
+    pub system_prompt: String,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AgentFrontmatter {
+    name: Option<String>,
+    description: Option<String>,
+    tools: Option<serde_yaml::Value>,
+    model: Option<String>,
+    #[serde(rename = "permissionMode")]
+    permission_mode: Option<String>,
+    #[serde(rename = "maxTurns")]
+    max_turns: Option<usize>,
+}
+
+fn agent_tool_list(value: Option<serde_yaml::Value>) -> Vec<String> {
+    match value {
+        Some(serde_yaml::Value::String(text)) => text
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect(),
+        Some(serde_yaml::Value::Sequence(items)) => items
+            .iter()
+            .filter_map(|item| item.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Discover custom agents: `~/.claude/agents/*.md` (personal) plus
+/// `.claude/agents/*.md` in `cwd` (project wins name conflicts, matching
+/// the reference's precedence).
+pub fn discover_agents(cwd: &Path) -> Vec<AgentDefinition> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(home) = claude_home() {
+        dirs.push(home.join("agents"));
+    }
+    dirs.push(cwd.join(".claude").join("agents"));
+
+    let mut by_type: std::collections::BTreeMap<String, AgentDefinition> =
+        std::collections::BTreeMap::new();
+    for dir in dirs {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let Ok(raw) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let (frontmatter, body) = parse_frontmatter_and_body::<AgentFrontmatter>(&raw);
+            // A missing name falls back to the filename, like the reference.
+            let agent_type = frontmatter
+                .name
+                .clone()
+                .or_else(|| {
+                    path.file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            if agent_type.is_empty() || body.is_empty() {
+                continue;
+            }
+            by_type.insert(
+                agent_type.clone(),
+                AgentDefinition {
+                    agent_type,
+                    description: frontmatter.description,
+                    tools: agent_tool_list(frontmatter.tools),
+                    model: frontmatter.model,
+                    permission_mode: frontmatter.permission_mode,
+                    max_turns: frontmatter.max_turns,
+                    system_prompt: body,
+                    path,
+                },
+            );
+        }
+    }
+    by_type.into_values().collect()
+}
+
+/// Map an agent frontmatter `permissionMode` to a `PermissionMode` — the
+/// reference accepts the camelCase settings names.
+pub fn agent_permission_mode(value: Option<&str>) -> Option<crate::permissions::PermissionMode> {
+    match value? {
+        "default" => Some(crate::permissions::PermissionMode::Default),
+        "acceptEdits" | "accept_edits" => Some(crate::permissions::PermissionMode::AcceptEdits),
+        "plan" => Some(crate::permissions::PermissionMode::Plan),
+        "bypassPermissions" | "bypass" => Some(crate::permissions::PermissionMode::Bypass),
+        _ => None,
+    }
 }
 
 fn slash_command_from_name(name: &str) -> String {

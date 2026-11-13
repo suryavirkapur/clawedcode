@@ -545,6 +545,7 @@ impl TuiContext {
                 prompt: prompt.to_string(),
                 max_turns: self.runtime.max_turns(),
                 permission_mode: self.runtime.permission_mode(),
+                agent_system_prompt: None,
             },
         )
     }
@@ -564,6 +565,7 @@ impl TuiContext {
                 prompt: prompt.to_string(),
                 max_turns: self.runtime.max_turns(),
                 permission_mode: self.runtime.permission_mode(),
+                agent_system_prompt: None,
             },
         )
     }
