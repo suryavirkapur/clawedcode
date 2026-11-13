@@ -871,6 +871,9 @@ struct ReplHandler {
     copy_picker: Option<usize>,
     copy_picker_text: String,
     copy_picker_blocks: Vec<(Option<String>, String)>,
+    /// Bypass-mode acceptance dialog — shown once when bypass is entered
+    /// without `skipDangerousModePermissionPrompt` accepted.
+    bypass_confirm: bool,
     turn_tokens: u64,
     total_input_tokens: u64,
     total_output_tokens: u64,
@@ -903,6 +906,7 @@ impl ReplHandler {
             copy_picker: None,
             copy_picker_text: String::new(),
             copy_picker_blocks: Vec::new(),
+            bypass_confirm: false,
             turn_tokens: 0,
             total_input_tokens: 0,
             total_output_tokens: 0,
@@ -1208,6 +1212,13 @@ struct TranscriptModeState {
 
 fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     let mut handler = ReplHandler::new(ctx.show_thinking);
+    // Bypass mode entered without recorded acceptance → the reference's
+    // risk-acceptance dialog before the mode is usable.
+    if ctx.permission_mode() == clawedcode_core::permissions::PermissionMode::Bypass
+        && !clawedcode_core::compat::bypass_dialog_accepted(&ctx.session().cwd)
+    {
+        handler.bypass_confirm = true;
+    }
     handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
     maybe_mark_project_onboarding_complete(&ctx.session().cwd);
 
@@ -1455,6 +1466,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 &handler.resume_picker_query,
             ))
             .max(rewind_picker_height(handler.rewind_picker, ctx));
+            let bypass_height = if handler.bypass_confirm { 6 } else { 0 };
             let spinner_height = if active_turn.is_some() && awaiting_approval.is_none() {
                 2
             } else {
@@ -1473,6 +1485,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 Constraint::Length(approval_height),
                 Constraint::Length(queued_height),
                 Constraint::Length(spinner_height),
+                Constraint::Length(bypass_height),
                 Constraint::Length(input_height),
                 Constraint::Length(1),
             ])
@@ -1562,9 +1575,42 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 );
             }
 
+            if bypass_height > 0 {
+                frame.render_widget(
+                    Paragraph::new(vec![
+                        Line::from(Span::styled(
+                            "⚠ Bypass Permissions Mode",
+                            Style::default()
+                                .fg(pal().err_fg)
+                                .add_modifier(Modifier::BOLD),
+                        )),
+                        Line::from(Span::styled(
+                            "ClawedCode will not ask for approval before running potentially",
+                            Style::default().fg(pal().muted),
+                        )),
+                        Line::from(Span::styled(
+                            "dangerous commands. Only use this in a sandboxed environment.",
+                            Style::default().fg(pal().muted),
+                        )),
+                        Line::from(Span::styled(
+                            "By proceeding you accept all responsibility for actions taken.",
+                            Style::default().fg(pal().muted),
+                        )),
+                        Line::from(""),
+                        Line::from(vec![
+                            Span::styled("  y ", Style::default().add_modifier(Modifier::BOLD)),
+                            Span::styled("accept and continue in bypass mode", Style::default().fg(pal().muted)),
+                            Span::styled("   esc ", Style::default().add_modifier(Modifier::BOLD)),
+                            Span::styled("cancel (stay in normal mode)", Style::default().fg(pal().muted)),
+                        ]),
+                    ]),
+                    chunks[5],
+                );
+            }
+
             let cursor = render_input_box(
                 frame,
-                chunks[5],
+                chunks[6],
                 &display_input,
                 display_cursor,
                 active_turn.is_some(),
@@ -1584,7 +1630,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
             });
             render_hint_line(
                 frame,
-                chunks[6],
+                chunks[7],
                 ctx,
                 awaiting_approval.is_some(),
                 history_search.as_ref().map(|(query, _)| query.as_str()),
@@ -1924,6 +1970,29 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         KeyCode::Char(c) if key.modifiers.is_empty() => {
                             handler.resume_picker_query.push(c);
                             handler.resume_picker = Some(0);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                if handler.bypass_confirm {
+                    match key.code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') => {
+                            let _ = clawedcode_core::compat::persist_bypass_acceptance();
+                            handler.bypass_confirm = false;
+                            handler.push_overlay(
+                                "[info] Bypass permissions on — acceptance recorded".to_string(),
+                            );
+                        }
+                        KeyCode::Esc => {
+                            ctx.set_permission_mode(
+                                clawedcode_core::permissions::PermissionMode::Default,
+                            );
+                            handler.bypass_confirm = false;
+                            handler.push_overlay(
+                                "[info] Stayed in normal permission mode".to_string(),
+                            );
                         }
                         _ => {}
                     }

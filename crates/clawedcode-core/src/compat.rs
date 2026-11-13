@@ -43,6 +43,51 @@ struct RuleFrontmatter {
     paths: Option<Vec<String>>,
 }
 
+/// `skipDangerousModePermissionPrompt` — honored only from trusted sources
+/// (user, local, flag/policy) like the reference's
+/// hasSkipDangerousModePermissionPrompt: project settings are excluded so a
+/// malicious repo can't pre-accept the bypass dialog.
+pub fn bypass_dialog_accepted(cwd: &Path) -> bool {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    if let Some(home) = claude_home() {
+        paths.push(home.join("settings.json"));
+    }
+    paths.push(cwd.join(".claude").join("settings.local.json"));
+    if let Some(flag) = std::env::var_os("CLAWEDCODE_SETTINGS") {
+        paths.push(PathBuf::from(flag));
+    }
+    paths.iter().any(|path| {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|json| {
+                json.get("skipDangerousModePermissionPrompt")
+                    .and_then(|v| v.as_bool())
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Persist the bypass-dialog acceptance into user settings like the
+/// reference's saveSettings on dialog accept.
+pub fn persist_bypass_acceptance() -> Result<()> {
+    let Some(home) = claude_home() else {
+        anyhow::bail!("no config dir");
+    };
+    let path = home.join("settings.json");
+    let _ = std::fs::create_dir_all(home);
+    let mut json: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !json.is_object() {
+        json = serde_json::json!({});
+    }
+    json["skipDangerousModePermissionPrompt"] = serde_json::Value::Bool(true);
+    std::fs::write(&path, serde_json::to_string_pretty(&json)?)?;
+    Ok(())
+}
+
 pub fn discover(cwd: &Path) -> Result<CompatibilitySnapshot> {
     let (settings_files, settings) = discover_settings(cwd)?;
     let skills = discover_skills(cwd)?;
@@ -1511,8 +1556,12 @@ fn discover_mcp_servers(cwd: &Path, settings: &Value) -> Result<BTreeMap<String,
                 }
             }
         }
+        // Reference services/mcp/utils.ts: a recorded bypass-dialog
+        // acceptance (trusted sources only) auto-approves project servers —
+        // the flag itself means the user already opted out of prompts.
+        let bypass_accepted = bypass_dialog_accepted(cwd);
         for name in project_names {
-            let approved = (enabled_all || enabled.iter().any(|e| e == &name))
+            let approved = (enabled_all || bypass_accepted || enabled.iter().any(|e| e == &name))
                 && !disabled.iter().any(|d| d == &name);
             if !approved {
                 servers.remove(&name);
@@ -2609,6 +2658,30 @@ Some more content here.
                 slash_command_from_name("Multi Word Name"),
                 "/multi-word-name"
             );
+        }
+
+        #[test]
+        fn bypass_dialog_accepted_ignores_project_settings() {
+            let tmp = tempfile::tempdir().unwrap();
+            let cwd = tmp.path();
+            // Project settings must NOT count — a malicious repo could
+            // otherwise pre-accept the risk dialog.
+            let dot = cwd.join(".claude");
+            std::fs::create_dir_all(&dot).unwrap();
+            std::fs::write(
+                dot.join("settings.json"),
+                r#"{"skipDangerousModePermissionPrompt": true}"#,
+            )
+            .unwrap();
+            assert!(!super::bypass_dialog_accepted(cwd));
+
+            // Local settings DO count.
+            std::fs::write(
+                dot.join("settings.local.json"),
+                r#"{"skipDangerousModePermissionPrompt": true}"#,
+            )
+            .unwrap();
+            assert!(super::bypass_dialog_accepted(cwd));
         }
 
         #[test]
