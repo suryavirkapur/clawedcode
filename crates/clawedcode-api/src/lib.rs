@@ -867,6 +867,24 @@ pub mod anthropic_provider {
         }
     }
 
+    /// `ANTHROPIC_CUSTOM_HEADERS` — newline-separated `Name: Value` lines
+    /// added to API requests like the reference's getCustomHeaders.
+    fn anthropic_custom_headers() -> Vec<(String, String)> {
+        std::env::var("ANTHROPIC_CUSTOM_HEADERS")
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                let (name, value) = line.split_once(':')?;
+                let name = name.trim();
+                if name.is_empty() {
+                    return None;
+                }
+                Some((name.to_string(), value.trim().to_string()))
+            })
+            .collect()
+    }
+
     impl AnthropicProvider {
         pub fn from_env() -> Option<Self> {
             let api_key = std::env::var("ANTHROPIC_API_KEY")
@@ -997,6 +1015,9 @@ pub mod anthropic_provider {
                         .post(&endpoint)
                         .header("x-api-key", &api_key)
                         .header("anthropic-version", &anthropic_version);
+                    for (name, value) in anthropic_custom_headers() {
+                        req_b = req_b.header(name, value);
+                    }
                     if !req.betas.is_empty() {
                         req_b = req_b.header("anthropic-beta", req.betas.join(","));
                     }
@@ -1129,6 +1150,9 @@ pub mod anthropic_provider {
                     .post(&endpoint)
                     .header("x-api-key", &api_key)
                     .header("anthropic-version", &anthropic_version);
+                for (name, value) in anthropic_custom_headers() {
+                    req_b = req_b.header(name, value);
+                }
                 if !req.betas.is_empty() {
                     req_b = req_b.header("anthropic-beta", req.betas.join(","));
                 }
