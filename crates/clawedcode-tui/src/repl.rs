@@ -1004,7 +1004,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     let mut last_esc: Option<std::time::Instant> = None;
     let mut pending_ctrl_x = false;
     let mut last_ctrl_c: Option<std::time::Instant> = None;
-    let mut exit_hint: Option<std::time::Instant> = None;
+    let mut exit_hint: Option<(std::time::Instant, &'static str)> = None;
+    let mut last_ctrl_d: Option<std::time::Instant> = None;
     let mut undo_stack: Vec<(String, usize)> = Vec::new();
     let mut stashed_input: Option<(String, usize)> = None;
     let mut last_approval_id: Option<String> = None;
@@ -1253,16 +1254,16 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
             );
             frame.set_cursor_position(cursor);
 
-            let exit_hint_active = exit_hint
-                .map(|t| t.elapsed().as_millis() < 1500)
-                .unwrap_or(false);
+            let exit_hint_key = exit_hint
+                .filter(|(t, _)| t.elapsed().as_millis() < 1500)
+                .map(|(_, key)| key);
             render_hint_line(
                 frame,
                 chunks[6],
                 ctx,
                 awaiting_approval.is_some(),
                 history_search.as_ref().map(|(query, _)| query.as_str()),
-                exit_hint_active,
+                exit_hint_key,
                 handler.vim_enabled,
                 handler.vim_insert,
                 background_turns.len(),
@@ -2199,6 +2200,19 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                             if ctx.show_thinking { "on" } else { "off" }
                         ));
                     }
+                    // `alt+o` — chat:fastMode in the reference bindings.
+                    KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::ALT) => {
+                        if ctx.effort() == Some("low") {
+                            ctx.set_effort(None);
+                            persist_runtime_key("effort", None);
+                            handler.push_overlay("[info] Fast mode off".to_string());
+                        } else {
+                            ctx.set_effort(Some("low"));
+                            persist_runtime_key("effort", Some("low"));
+                            handler
+                                .push_overlay("[info] Fast mode on (effort: low)".to_string());
+                        }
+                    }
                     KeyCode::Char('_') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         if let Some((buffer, cursor)) = undo_stack.pop() {
                             input_buffer = buffer;
@@ -2450,13 +2464,23 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                             break;
                         }
                         last_ctrl_c = Some(now);
-                        exit_hint = Some(now);
+                        exit_hint = Some((now, "Ctrl+C"));
                     }
+                    // Double-press Ctrl+D to exit, like the reference's
+                    // app:exit — only on an empty buffer (EOF semantics).
                     KeyCode::Char('d')
                         if key.modifiers.contains(KeyModifiers::CONTROL)
                             && input_buffer.is_empty() =>
                     {
-                        break;
+                        let now = std::time::Instant::now();
+                        if last_ctrl_d
+                            .map(|t| now.duration_since(t).as_millis() < 1500)
+                            .unwrap_or(false)
+                        {
+                            break;
+                        }
+                        last_ctrl_d = Some(now);
+                        exit_hint = Some((now, "Ctrl+D"));
                     }
                     KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         input_buffer.drain(..cursor_pos);
@@ -3730,7 +3754,7 @@ fn render_hint_line(
     ctx: &TuiContext,
     awaiting: bool,
     history_search: Option<&str>,
-    exit_hint: bool,
+    exit_hint: Option<&'static str>,
     vim_enabled: bool,
     vim_insert: bool,
     background_count: usize,
@@ -3745,8 +3769,8 @@ fn render_hint_line(
     };
     let left = if awaiting {
         "↑/↓ select · enter confirm · esc deny".to_string()
-    } else if exit_hint {
-        "Press Ctrl+C again to exit".to_string()
+    } else if let Some(key) = exit_hint {
+        format!("Press {key} again to exit")
     } else if let Some(query) = history_search {
         format!("(reverse-i-search)`{query}`:")
     } else if mode != clawedcode_core::permissions::PermissionMode::Default {
@@ -3764,7 +3788,7 @@ fn render_hint_line(
             ""
         };
 
-    let left_style = if history_search.is_some() || exit_hint {
+    let left_style = if history_search.is_some() || exit_hint.is_some() {
         Style::default().fg(pal().permission_fg)
     } else if mode != clawedcode_core::permissions::PermissionMode::Default {
         Style::default().fg(permission_mode_color(mode))
