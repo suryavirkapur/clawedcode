@@ -406,6 +406,27 @@ pub enum PluginAction {
     Enable { plugin: String },
     /// Disable an enabled plugin.
     Disable { plugin: String },
+    /// Manage plugin marketplace sources.
+    Marketplace {
+        #[command(subcommand)]
+        action: MarketplaceAction,
+    },
+    /// Install a plugin from a marketplace: `plugin install name@marketplace`.
+    Install { spec: String },
+    /// Uninstall a marketplace-installed plugin.
+    Uninstall { spec: String },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum MarketplaceAction {
+    /// Add a marketplace source (local directory or marketplace.json path).
+    Add { source: String },
+    /// List registered marketplaces.
+    List,
+    /// Remove a marketplace.
+    Remove { name: String },
+    /// Refresh marketplace metadata (all, or the named one).
+    Update { name: Option<String> },
 }
 
 #[derive(Debug, Clone, Subcommand)]

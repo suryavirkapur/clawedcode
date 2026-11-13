@@ -658,7 +658,278 @@ fn execute_plugin(cli: &Cli, action: crate::cli::PluginAction) -> Result<()> {
                 None => anyhow::bail!("{} is missing a 'name' field", manifest_path.display()),
             }
         }
+        PluginAction::Marketplace { action } => {
+            execute_marketplace(cli, action)?;
+        }
+        PluginAction::Install { spec } => {
+            execute_plugin_install(cli, &spec)?;
+        }
+        PluginAction::Uninstall { spec } => {
+            execute_plugin_uninstall(cli, &spec)?;
+        }
     }
+    Ok(())
+}
+
+/// ~/.claude/plugins/known_marketplaces.json — the reference's registry of
+/// marketplace sources (we support the local-directory/file subset).
+fn known_marketplaces_path() -> Result<PathBuf> {
+    compat::claude_home()
+        .map(|h| h.join("plugins").join("known_marketplaces.json"))
+        .ok_or_else(|| anyhow::anyhow!("cannot determine ~/.claude path"))
+}
+
+fn load_known_marketplaces() -> Result<serde_json::Value> {
+    let path = known_marketplaces_path()?;
+    Ok(std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_else(|| serde_json::json!({})))
+}
+
+fn save_known_marketplaces(doc: &serde_json::Value) -> Result<()> {
+    let path = known_marketplaces_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(doc)?)?;
+    Ok(())
+}
+
+/// Locate a marketplace manifest for a local source: `<dir>/.claude-plugin/
+/// marketplace.json` for directories, the file itself for .json paths.
+/// Returns (manifest_path, manifest_json, base_dir_for_relative_sources).
+fn read_marketplace_manifest(
+    source_path: &Path,
+) -> Result<(PathBuf, serde_json::Value, PathBuf)> {
+    let (manifest_path, base) = if source_path.is_dir() {
+        (
+            source_path.join(".claude-plugin").join("marketplace.json"),
+            source_path.to_path_buf(),
+        )
+    } else {
+        let base = source_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        (source_path.to_path_buf(), base)
+    };
+    let raw = std::fs::read_to_string(&manifest_path).with_context(|| {
+        format!(
+            "no marketplace manifest found at {} — expected .claude-plugin/marketplace.json",
+            manifest_path.display()
+        )
+    })?;
+    let json: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("invalid JSON in {}", manifest_path.display()))?;
+    if json.get("name").and_then(|n| n.as_str()).is_none() {
+        anyhow::bail!("{} is missing a 'name' field", manifest_path.display());
+    }
+    if !json.get("plugins").and_then(|p| p.as_array()).is_some_and(|a| !a.is_empty()) {
+        anyhow::bail!("{} lists no plugins", manifest_path.display());
+    }
+    Ok((manifest_path, json, base))
+}
+
+fn execute_marketplace(cli: &Cli, action: crate::cli::MarketplaceAction) -> Result<()> {
+    use crate::cli::MarketplaceAction;
+    match action {
+        MarketplaceAction::Add { source } => {
+            let abs = std::fs::canonicalize(cli.cwd.join(&source))
+                .with_context(|| format!("marketplace source '{source}' not found"))?;
+            let (manifest_path, manifest, base) = read_marketplace_manifest(&abs)?;
+            let name = manifest["name"].as_str().unwrap().to_string();
+            let mut doc = load_known_marketplaces()?;
+            if doc.get(&name).is_some() {
+                anyhow::bail!("Marketplace '{name}' is already registered");
+            }
+            let install_location = if abs.is_dir() {
+                base.clone()
+            } else {
+                manifest_path.clone()
+            };
+            doc[&name] = serde_json::json!({
+                "source": { "source": "local", "path": abs },
+                "installLocation": install_location,
+                "lastUpdated": chrono_now(),
+            });
+            save_known_marketplaces(&doc)?;
+            let count = manifest["plugins"].as_array().map(|a| a.len()).unwrap_or(0);
+            println!("Added marketplace '{name}' ({count} plugin(s))");
+        }
+        MarketplaceAction::List => {
+            let doc = load_known_marketplaces()?;
+            let Some(map) = doc.as_object() else {
+                println!("No marketplaces registered.");
+                return Ok(());
+            };
+            if map.is_empty() {
+                println!("No marketplaces registered.");
+                return Ok(());
+            }
+            for (name, entry) in map {
+                let source = entry["source"]["path"]
+                    .as_str()
+                    .or_else(|| entry["source"]["url"].as_str())
+                    .or_else(|| entry["source"]["repo"].as_str())
+                    .unwrap_or("?");
+                let count = std::fs::canonicalize(entry["source"]["path"].as_str().unwrap_or(""))
+                    .ok()
+                    .and_then(|p| read_marketplace_manifest(&p).ok())
+                    .map(|(_, m, _)| m["plugins"].as_array().map(|a| a.len()).unwrap_or(0))
+                    .unwrap_or(0);
+                println!("{name}: {source} ({count} plugin(s))");
+            }
+        }
+        MarketplaceAction::Remove { name } => {
+            let mut doc = load_known_marketplaces()?;
+            let removed = doc
+                .as_object_mut()
+                .map(|m| m.remove(&name).is_some())
+                .unwrap_or(false);
+            if !removed {
+                anyhow::bail!("No marketplace named '{name}'");
+            }
+            save_known_marketplaces(&doc)?;
+            println!("Removed marketplace '{name}'");
+        }
+        MarketplaceAction::Update { name } => {
+            let doc = load_known_marketplaces()?;
+            let names: Vec<String> = match &name {
+                Some(n) => vec![n.clone()],
+                None => doc.as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default(),
+            };
+            let mut doc = doc;
+            for n in &names {
+                let Some(entry) = doc.get(n) else {
+                    anyhow::bail!("No marketplace named '{n}'");
+                };
+                let path = entry["source"]["path"]
+                    .as_str()
+                    .map(PathBuf::from)
+                    .ok_or_else(|| anyhow::anyhow!("marketplace '{n}' has no local path to refresh"))?;
+                let (_, manifest, _) = read_marketplace_manifest(&path)?;
+                doc[n]["lastUpdated"] = serde_json::json!(chrono_now());
+                let count = manifest["plugins"].as_array().map(|a| a.len()).unwrap_or(0);
+                println!("Updated '{n}' ({count} plugin(s))");
+            }
+            save_known_marketplaces(&doc)?;
+        }
+    }
+    Ok(())
+}
+
+fn chrono_now() -> String {
+    // Cheap RFC3339-ish timestamp without pulling in chrono.
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = secs / 86400;
+    let rem = secs % 86400;
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // Civil-from-days (Howard Hinnant).
+    let z = days as i64 + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let yr = if mo <= 2 { y + 1 } else { y };
+    format!("{yr:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let target = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
+/// `plugin install name@marketplace` — resolve a local marketplace entry and
+/// copy the plugin into ~/.claude/plugins/<name>, like the reference's
+/// install of a locally-sourced plugin.
+fn execute_plugin_install(cli: &Cli, spec: &str) -> Result<()> {
+    let (plugin_name, market_name) = spec
+        .rsplit_once('@')
+        .ok_or_else(|| anyhow::anyhow!("expected 'name@marketplace', e.g. plugin install fmt@tools"))?;
+    let doc = load_known_marketplaces()?;
+    let entry = doc
+        .get(market_name)
+        .ok_or_else(|| anyhow::anyhow!("No marketplace named '{market_name}'"))?;
+    let source_path = entry["source"]["path"]
+        .as_str()
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("marketplace '{market_name}' is not a local source"))?;
+    let (_, manifest, base) = read_marketplace_manifest(&source_path)?;
+    let plugins = manifest["plugins"].as_array().unwrap();
+    let entry = plugins
+        .iter()
+        .find(|p| {
+            p.get("name").and_then(|n| n.as_str()) == Some(plugin_name)
+                || p.get("id").and_then(|n| n.as_str()) == Some(plugin_name)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("Plugin '{plugin_name}' not found in marketplace '{market_name}'")
+        })?;
+    let rel = entry
+        .get("source")
+        .and_then(|s| s.as_str())
+        .ok_or_else(|| anyhow::anyhow!("plugin '{plugin_name}' has no source path"))?;
+    let plugin_dir = std::fs::canonicalize(base.join(rel))
+        .with_context(|| format!("plugin source '{rel}' not found in '{market_name}'"))?;
+
+    let home = compat::claude_home().ok_or_else(|| anyhow::anyhow!("no ~/.claude path"))?;
+    let dest = home.join("plugins").join(plugin_name);
+    if dest.exists() {
+        anyhow::bail!("Plugin '{plugin_name}' is already installed at {}", dest.display());
+    }
+    copy_dir_recursive(&plugin_dir, &dest)?;
+    // Record enablement like the reference: enabledPlugins["name@market"]=true
+    // in user settings.
+    let settings_path = home.join("settings.json");
+    let mut settings: serde_json::Value = std::fs::read_to_string(&settings_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    settings["enabledPlugins"][format!("{plugin_name}@{market_name}")] = serde_json::json!(true);
+    std::fs::create_dir_all(&home)?;
+    std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
+    println!("Installed '{plugin_name}' from '{market_name}' to {}", dest.display());
+    Ok(())
+}
+
+fn execute_plugin_uninstall(cli: &Cli, spec: &str) -> Result<()> {
+    let (plugin_name, market_name) = spec
+        .rsplit_once('@')
+        .ok_or_else(|| anyhow::anyhow!("expected 'name@marketplace'"))?;
+    let home = compat::claude_home().ok_or_else(|| anyhow::anyhow!("no ~/.claude path"))?;
+    let dest = home.join("plugins").join(plugin_name);
+    if !dest.exists() {
+        anyhow::bail!("Plugin '{plugin_name}' is not installed");
+    }
+    std::fs::remove_dir_all(&dest)?;
+    let settings_path = home.join("settings.json");
+    if let Ok(raw) = std::fs::read_to_string(&settings_path) {
+        if let Ok(mut settings) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(obj) = settings["enabledPlugins"].as_object_mut() {
+                obj.remove(&format!("{plugin_name}@{market_name}"));
+                obj.remove(&format!("{plugin_name}@local"));
+                std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
+            }
+        }
+    }
+    println!("Uninstalled '{plugin_name}'");
     Ok(())
 }
 

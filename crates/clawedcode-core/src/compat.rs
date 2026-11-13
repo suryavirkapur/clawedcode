@@ -211,6 +211,15 @@ fn plugin_enabled(settings: &Value, name: &str) -> bool {
             _ => {}
         }
     }
+    // Marketplace-installed plugins use `name@marketplace` keys.
+    let prefix = format!("{name}@");
+    for (key, value) in map {
+        if key.starts_with(&prefix) {
+            if let Value::Bool(b) = value {
+                return *b;
+            }
+        }
+    }
     true
 }
 
