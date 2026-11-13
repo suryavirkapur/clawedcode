@@ -62,6 +62,11 @@ pub fn render_system_prompt(spec: &PromptSpec, ctx: &PromptRenderContext<'_>) ->
         environment_section(ctx.session, ctx.model),
     ];
 
+    if let Some(section) = git_attribution_section(ctx.compatibility, ctx.session, ctx.model)
+    {
+        sections.push(section);
+    }
+
     if !ctx.compatibility.memory.trim().is_empty() {
         sections.push(format!(
             "## Loaded Memory\n{}",
@@ -257,6 +262,61 @@ fn environment_section(session: &Session, model: &str) -> String {
 
 fn section(title: &str, body: &str) -> String {
     format!("## {title}\n{body}")
+}
+
+/// Git-commit attribution guidance, mirroring the reference's
+/// getAttributionTexts: `attribution.commit`/`attribution.pr` override the
+/// defaults; deprecated `includeCoAuthoredBy: false` disables both. Only
+/// emitted inside git repositories.
+fn git_attribution_section(
+    compatibility: &CompatibilitySnapshot,
+    session: &Session,
+    model: &str,
+) -> Option<String> {
+    let is_git = session
+        .cwd
+        .ancestors()
+        .any(|ancestor| ancestor.join(".git").exists());
+    if !is_git {
+        return None;
+    }
+
+    let settings = &compatibility.settings;
+    let default_commit = format!("Co-Authored-By: {model} <noreply@anthropic.com>");
+    let default_pr = "Generated with [Claude Code](https://claude.com/claude-code)".to_string();
+
+    let (commit, pr) = if let Some(attr) = settings.get("attribution") {
+        (
+            attr.get("commit")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or(default_commit),
+            attr.get("pr")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or(default_pr),
+        )
+    } else if settings.get("includeCoAuthoredBy").and_then(|v| v.as_bool()) == Some(false) {
+        (String::new(), String::new())
+    } else {
+        (default_commit, default_pr)
+    };
+
+    if commit.is_empty() && pr.is_empty() {
+        return None;
+    }
+    let mut lines = vec!["## Git attribution".to_string()];
+    if !commit.is_empty() {
+        lines.push(format!(
+            "When you create git commits for the user, end the commit message with:\n\n{commit}"
+        ));
+    }
+    if !pr.is_empty() {
+        lines.push(format!(
+            "When you create pull requests for the user, end the description with:\n\n{pr}"
+        ));
+    }
+    Some(lines.join("\n"))
 }
 
 fn session_mode_label(mode: &crate::session::SessionMode) -> &'static str {
