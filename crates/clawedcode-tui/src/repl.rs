@@ -8923,16 +8923,19 @@ fn with_image_references(
     expanded: Option<String>,
     images: &[std::path::PathBuf],
 ) -> Option<String> {
-    if images.is_empty() {
-        return expanded;
-    }
-    let base = expanded.unwrap_or_else(|| prompt.to_string());
+    // Like the reference's removable chips: an image only stays attached
+    // while its `[Image #N]` marker survives in the prompt.
     let refs = images
         .iter()
         .enumerate()
+        .filter(|(i, _)| prompt.contains(&format!("[Image #{}]", i + 1)))
         .map(|(i, p)| format!("[Image #{}] {}", i + 1, p.display()))
         .collect::<Vec<_>>()
         .join("\n");
+    if refs.is_empty() {
+        return expanded;
+    }
+    let base = expanded.unwrap_or_else(|| prompt.to_string());
     Some(format!("{base}\n\n[Attached images]\n{refs}"))
 }
 
@@ -10664,6 +10667,36 @@ mod command_policy_tests {
             assert!(elapsed < Duration::from_secs(2), "elapsed: {elapsed:?}");
 
             fs::remove_dir_all(root).ok();
+        }
+
+        #[test]
+        fn image_references_follow_surviving_markers() {
+            let images = vec![PathBuf::from("/tmp/one.png"), PathBuf::from("/tmp/two.png")];
+            // Both markers present → both references, numbered like the chips.
+            let out = with_image_references(
+                "[Image #1] [Image #2] describe",
+                Some("[Image #1] [Image #2] describe".to_string()),
+                &images,
+            )
+            .unwrap();
+            assert!(out.contains("[Attached images]"));
+            assert!(out.contains("[Image #1] /tmp/one.png"));
+            assert!(out.contains("[Image #2] /tmp/two.png"));
+
+            // Marker #1 deleted → only image #2 stays attached.
+            let out = with_image_references(
+                "[Image #2] describe",
+                Some("[Image #2] describe".to_string()),
+                &images,
+            )
+            .unwrap();
+            assert!(!out.contains("one.png"));
+            assert!(out.contains("[Image #2] /tmp/two.png"));
+
+            // No markers → no attachment block at all.
+            let out =
+                with_image_references("describe", Some("describe".to_string()), &images).unwrap();
+            assert_eq!(out, "describe");
         }
     }
 }
