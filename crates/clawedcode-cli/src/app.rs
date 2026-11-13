@@ -210,6 +210,9 @@ pub async fn execute(boot: BootstrappedApp) -> Result<()> {
                 } else {
                     ctx.session = Session::load_by_id(&sessions_dir, resume)
                         .with_context(|| format!("failed to load session {resume}"))?;
+                    if cli.fork_session {
+                        ctx.session = Session::fork_from(&ctx.session);
+                    }
                     if let Some(at) = cli.resume_session_at {
                         if at > ctx.session.messages.len() {
                             anyhow::bail!(
