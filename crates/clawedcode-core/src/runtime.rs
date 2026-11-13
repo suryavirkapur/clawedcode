@@ -2053,8 +2053,19 @@ impl Runtime {
             match create_session_worktree(&session.cwd, &slug, &session.id.to_string()) {
                 Err(e) => ContentBlock::tool_error(tool_use_id, e),
                 Ok((path, branch)) => {
-                    session.worktree_origin = Some(session.cwd.clone());
+                    let old_cwd = session.cwd.clone();
+                    session.worktree_origin = Some(old_cwd.clone());
                     session.cwd = path.clone();
+                    crate::hooks::run_simple_event_hooks(
+                        &crate::hooks::load_hooks(&old_cwd),
+                        "CwdChanged",
+                        &session.id.to_string(),
+                        &session.cwd,
+                        serde_json::json!({
+                            "old_cwd": old_cwd.to_string_lossy(),
+                            "new_cwd": path.to_string_lossy(),
+                        }),
+                    );
                     let mut result = serde_json::json!({
                         "worktreePath": path.to_string_lossy(),
                     });
@@ -2092,7 +2103,18 @@ impl Runtime {
                         .unwrap_or(root)
                 }
             };
+            let old_cwd = session.cwd.clone();
             session.cwd = main;
+            crate::hooks::run_simple_event_hooks(
+                &crate::hooks::load_hooks(&session.cwd),
+                "CwdChanged",
+                &session.id.to_string(),
+                &session.cwd,
+                serde_json::json!({
+                    "old_cwd": old_cwd.to_string_lossy(),
+                    "new_cwd": session.cwd.to_string_lossy(),
+                }),
+            );
             // Hook-configured worktrees delegate removal to WorktreeRemove;
             // otherwise try git remove (dirty worktrees are left in place).
             let hooks = crate::hooks::load_hooks(&session.cwd);
