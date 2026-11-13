@@ -331,12 +331,33 @@ fn run_hook_command(
         let _ = stdin.write_all(stdin_json.as_bytes());
     }
     // Drain pipes on threads so a hook writing lots of output can't
-    // deadlock on a full pipe while we poll for the deadline.
+    // deadlock on a full pipe while we poll for the deadline. The stdout
+    // reader forwards the first line over a channel so we can detect
+    // `{"async": true}` markers, like the reference's async hooks.
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
+    let (first_tx, first_rx) = std::sync::mpsc::channel::<Vec<u8>>();
     let out_thread = std::thread::spawn(move || {
         let mut buf = Vec::new();
-        let _ = std::io::Read::read_to_end(&mut stdout, &mut buf);
+        let mut first_sent = false;
+        let mut chunk = [0u8; 4096];
+        loop {
+            match std::io::Read::read(&mut stdout, &mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if !first_sent {
+                        if let Some(pos) = buf.iter().position(|b| *b == b'\n') {
+                            let _ = first_tx.send(buf[..pos].to_vec());
+                            first_sent = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !first_sent {
+            let _ = first_tx.send(buf.clone());
+        }
         buf
     });
     let err_thread = std::thread::spawn(move || {
@@ -345,7 +366,56 @@ fn run_hook_command(
         buf
     });
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let mut first_checked = false;
     let status = loop {
+        // A hook emitting {"async": true} as its first stdout line runs
+        // detached — we return immediately and a waiter thread reaps it.
+        if !first_checked {
+            if let Ok(first) = first_rx.try_recv() {
+                first_checked = true;
+                if serde_json::from_str::<serde_json::Value>(
+                    &String::from_utf8_lossy(&first),
+                )
+                .ok()
+                .and_then(|j| j.get("async").and_then(|a| a.as_bool()))
+                == Some(true)
+                {
+                    let async_hook_id = hook_id.clone();
+                    let async_command = command.to_string();
+                    let async_event = hook_event.to_string();
+                    let async_tool = tool_name.to_string();
+                    let async_session = session_id.to_string();
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                        let _ = out_thread.join();
+                        let _ = err_thread.join();
+                        emit_hook_lifecycle(&serde_json::json!({
+                            "stage": "response",
+                            "hook_id": async_hook_id,
+                            "hook_name": async_command,
+                            "hook_event": async_event,
+                            "tool_name": async_tool,
+                            "session_id": async_session,
+                            "async_completed": true,
+                        }));
+                    });
+                    emit_hook_lifecycle(&serde_json::json!({
+                        "stage": "response",
+                        "hook_id": hook_id,
+                        "hook_name": command,
+                        "hook_event": hook_event,
+                        "tool_name": tool_name,
+                        "session_id": session_id,
+                        "async": true,
+                    }));
+                    return Ok(std::process::Output {
+                        status: std::process::ExitStatus::default(),
+                        stdout: first,
+                        stderr: Vec::new(),
+                    });
+                }
+            }
+        }
         match child.try_wait()? {
             Some(status) => break status,
             None if std::time::Instant::now() >= deadline => {
