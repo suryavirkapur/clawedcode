@@ -66,11 +66,29 @@ pub fn load_hooks(cwd: &Path) -> HooksConfig {
     // `--settings <file>` / CLAWEDCODE_SETTINGS: extra settings file merged
     // last like the reference flag.
     let extra = std::env::var_os("CLAWEDCODE_SETTINGS").map(PathBuf::from);
-    for path in ["settings.json", "settings.local.json"]
-        .iter()
-        .map(|n| cwd.join(".claude").join(n))
-        .chain(extra)
-    {
+    // `--setting-sources <list>` (CLAWEDCODE_SETTING_SOURCES): only load the
+    // listed sources — "project" is settings.json, "local" is
+    // settings.local.json, "user" is a hypothetical ~/.claude source.
+    let sources: Option<Vec<String>> = std::env::var("CLAWEDCODE_SETTING_SOURCES")
+        .ok()
+        .map(|raw| raw.split(',').map(|s| s.trim().to_string()).collect());
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let source_for = |name: &str| match name {
+        "settings.json" => "project",
+        "settings.local.json" => "local",
+        _ => "project",
+    };
+    for name in ["settings.json", "settings.local.json"] {
+        if sources
+            .as_ref()
+            .map(|s| s.iter().any(|x| x == source_for(name)))
+            .unwrap_or(true)
+        {
+            paths.push(cwd.join(".claude").join(name));
+        }
+    }
+    paths.extend(extra);
+    for path in paths {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };

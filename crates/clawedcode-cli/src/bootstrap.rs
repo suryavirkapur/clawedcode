@@ -552,6 +552,10 @@ mod tests {
             maintenance: false,
             thinking: None,
             bare: false,
+            name: None,
+            agents: None,
+            setting_sources: None,
+            allow_dangerously_skip_permissions: false,
         }
     }
 
@@ -818,6 +822,10 @@ mod tests {
             maintenance: false,
             thinking: None,
             bare: false,
+            name: None,
+            agents: None,
+            setting_sources: None,
+            allow_dangerously_skip_permissions: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Tui));
@@ -873,6 +881,10 @@ mod tests {
             maintenance: false,
             thinking: None,
             bare: false,
+            name: None,
+            agents: None,
+            setting_sources: None,
+            allow_dangerously_skip_permissions: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -928,6 +940,10 @@ mod tests {
             maintenance: false,
             thinking: None,
             bare: false,
+            name: None,
+            agents: None,
+            setting_sources: None,
+            allow_dangerously_skip_permissions: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));
@@ -986,6 +1002,10 @@ mod tests {
             maintenance: false,
             thinking: None,
             bare: false,
+            name: None,
+            agents: None,
+            setting_sources: None,
+            allow_dangerously_skip_permissions: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::DirectConnect(_)));
@@ -1044,6 +1064,10 @@ mod tests {
             maintenance: false,
             thinking: None,
             bare: false,
+            name: None,
+            agents: None,
+            setting_sources: None,
+            allow_dangerously_skip_permissions: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Ssh(_)));
@@ -1109,6 +1133,10 @@ mod tests {
             maintenance: false,
             thinking: None,
             bare: false,
+            name: None,
+            agents: None,
+            setting_sources: None,
+            allow_dangerously_skip_permissions: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -1178,6 +1206,10 @@ mod tests {
             maintenance: false,
             thinking: None,
             bare: false,
+            name: None,
+            agents: None,
+            setting_sources: None,
+            allow_dangerously_skip_permissions: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));

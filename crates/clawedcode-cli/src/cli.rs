@@ -144,6 +144,18 @@ pub struct Cli {
     /// Minimal mode: skip hooks, plugins, and CLAUDE.md auto-discovery.
     #[arg(long, global = true)]
     pub bare: bool,
+    /// Display name for this session (shown in /resume).
+    #[arg(short = 'n', long, global = true)]
+    pub name: Option<String>,
+    /// JSON object defining custom agents for this session.
+    #[arg(long, global = true)]
+    pub agents: Option<String>,
+    /// Comma-separated settings sources to load (user, project, local).
+    #[arg(long, global = true, value_delimiter = ',')]
+    pub setting_sources: Option<Vec<String>>,
+    /// Allow permission bypass as an option without enabling it.
+    #[arg(long, global = true)]
+    pub allow_dangerously_skip_permissions: bool,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -415,6 +427,10 @@ mod tests {
             maintenance: false,
             thinking: None,
             bare: false,
+            name: None,
+            agents: None,
+            setting_sources: None,
+            allow_dangerously_skip_permissions: false,
         }
     }
 
@@ -473,6 +489,10 @@ mod tests {
             maintenance: false,
             thinking: None,
             bare: false,
+            name: None,
+            agents: None,
+            setting_sources: None,
+            allow_dangerously_skip_permissions: false,
         }
     }
 

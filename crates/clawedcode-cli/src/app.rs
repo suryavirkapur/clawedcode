@@ -113,6 +113,13 @@ pub async fn run(cli: Cli) -> Result<()> {
         // `--bare`: must be set before bootstrap() computes the compat snapshot.
         unsafe { std::env::set_var("CLAWEDCODE_SIMPLE", "1") };
     }
+    if let Some(json) = &cli.agents {
+        // Inline agent defs merge into discover_agents like the reference.
+        unsafe { std::env::set_var("CLAWEDCODE_AGENTS_JSON", json) };
+    }
+    if let Some(sources) = &cli.setting_sources {
+        unsafe { std::env::set_var("CLAWEDCODE_SETTING_SOURCES", sources.join(",")) };
+    }
     if let Some(path) = &cli.settings {
         // The reference's `--settings <file-or-json>` accepts inline JSON —
         // write it to a temp file and point the settings override there.
@@ -686,6 +693,9 @@ fn apply_cli_session_overrides(
     }
     if cli.no_session_persistence {
         session.persist = false;
+    }
+    if let Some(name) = &cli.name {
+        session.title = Some(name.clone());
     }
     Ok(())
 }
@@ -3186,6 +3196,10 @@ mod tests {
             maintenance: false,
             thinking: None,
             bare: false,
+            name: None,
+            agents: None,
+            setting_sources: None,
+            allow_dangerously_skip_permissions: false,
         }
     }
 

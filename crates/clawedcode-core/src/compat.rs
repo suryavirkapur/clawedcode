@@ -971,6 +971,50 @@ pub fn discover_agents(cwd: &Path) -> Vec<AgentDefinition> {
             );
         }
     }
+    // `--agents <json>` (CLAWEDCODE_AGENTS_JSON): inline agent defs take
+    // precedence over every file/discovered agent, like the reference.
+    if let Ok(raw) = std::env::var("CLAWEDCODE_AGENTS_JSON") {
+        if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(&raw) {
+            for (agent_type, def) in map {
+                let prompt = def
+                    .get("prompt")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if prompt.is_empty() {
+                    continue;
+                }
+                by_type.insert(
+                    agent_type.clone(),
+                    AgentDefinition {
+                        agent_type,
+                        description: def
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        tools: def.get("tools").and_then(|v| {
+                            v.as_array().map(|arr| {
+                                arr.iter()
+                                    .filter_map(|t| t.as_str().map(str::to_string))
+                                    .collect()
+                            })
+                        }),
+                        model: def
+                            .get("model")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        permission_mode: None,
+                        max_turns: def
+                            .get("maxTurns")
+                            .and_then(|v| v.as_u64())
+                            .map(|n| n as usize),
+                        system_prompt: prompt,
+                        path: PathBuf::from("--agents"),
+                    },
+                );
+            }
+        }
+    }
     by_type.into_values().collect()
 }
 
