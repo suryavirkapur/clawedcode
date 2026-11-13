@@ -761,6 +761,24 @@ pub fn run_stop_hooks(
         let Ok(out) = run_hook_command(hook, cwd, &stdin) else {
             continue;
         };
+        // JSON stdout: decision:block or continue:false stops the loop
+        // from ending, with reason/stopReason fed back to the model.
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
+            let reason = || {
+                json.get("reason")
+                    .or_else(|| json.get("stopReason"))
+                    .and_then(|r| r.as_str())
+                    .filter(|r| !r.trim().is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("blocked by Stop hook `{}`", hook.command))
+            };
+            if json.get("decision").and_then(|d| d.as_str()) == Some("block")
+                || json.get("continue").and_then(|v| v.as_bool()) == Some(false)
+            {
+                return StopHookOutcome::Block(reason());
+            }
+        }
         if out.status.code() == Some(2) {
             let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
             return StopHookOutcome::Block(if stderr.is_empty() {
@@ -984,9 +1002,22 @@ pub fn run_output_hooks(
         if let Ok(out) = run_hook_command(hook, cwd, &stdin) {
             if out.status.success() {
                 let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !stdout.is_empty() {
-                    return Some(stdout);
+                if stdout.is_empty() {
+                    continue;
                 }
+                // JSON output: hookSpecificOutput carries the value under
+                // event-specific keys (e.g. WorktreeCreate.worktreePath).
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
+                    if let Some(v) = json
+                        .get("hookSpecificOutput")
+                        .and_then(|o| o.get("worktreePath"))
+                        .and_then(|p| p.as_str())
+                        .filter(|p| !p.trim().is_empty())
+                    {
+                        return Some(v.to_string());
+                    }
+                }
+                return Some(stdout);
             }
         }
     }

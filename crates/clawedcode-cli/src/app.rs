@@ -207,13 +207,22 @@ pub async fn execute(boot: BootstrappedApp) -> Result<()> {
             "init"
         };
         let hooks = clawedcode_core::hooks::load_hooks(&cli.cwd);
-        clawedcode_core::hooks::run_simple_event_hooks(
+        let setup_ctx = clawedcode_core::hooks::run_event_hooks_for_context(
             &hooks,
             "Setup",
             "cli",
             &cli.cwd,
             serde_json::json!({ "trigger": trigger }),
         );
+        if !setup_ctx.is_empty() {
+            // Setup.additionalContext prefixes the session's first prompt.
+            unsafe {
+                std::env::set_var(
+                    "CLAWEDCODE_SETUP_HOOK_CONTEXT",
+                    setup_ctx.join("\n\n"),
+                )
+            };
+        }
         if cli.init_only {
             clawedcode_core::hooks::run_simple_event_hooks(
                 &hooks,
@@ -294,6 +303,13 @@ pub async fn execute(boot: BootstrappedApp) -> Result<()> {
                 ctx.set_startup_prompt(Some(
                     "Analyze this codebase and create a CLAUDE.md file in the project root. It should document the build and test commands, code layout, conventions, and anything an agent should know to work effectively here.".to_string(),
                 ));
+            }
+            if let Ok(setup_ctx) = std::env::var("CLAWEDCODE_SETUP_HOOK_CONTEXT") {
+                if !setup_ctx.trim().is_empty() {
+                    ctx.set_pending_prompt_prefix(Some(format!(
+                        "<setup-hook-context>\n{setup_ctx}\n</setup-hook-context>"
+                    )));
+                }
             }
             if let Some(prefill) = cli.prefill.clone() {
                 ctx.set_prefill_input(Some(prefill));
