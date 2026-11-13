@@ -1523,7 +1523,8 @@ fn apply_cli_config_overrides(config: &mut AppConfig, cli: &Cli) {
     }
     // settings.json `model`/`effortLevel` apply when the flags aren't
     // given — later files win like settings precedence.
-    if cli.model.is_none() || cli.effort.is_none() {
+    if cli.model.is_none() || cli.effort.is_none() || cli.thinking.is_none() {
+        let mut thinking_enabled: Option<bool> = None;
         for path in clawedcode_core::hooks::settings_file_paths(&cli.cwd) {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
@@ -1541,6 +1542,16 @@ fn apply_cli_config_overrides(config: &mut AppConfig, cli: &Cli) {
                     config.runtime.effort = Some(effort.to_string());
                 }
             }
+            // alwaysThinkingEnabled: last file wins like merged settings.
+            if let Some(v) = json.get("alwaysThinkingEnabled").and_then(|v| v.as_bool()) {
+                thinking_enabled = Some(v);
+            }
+        }
+        // alwaysThinkingEnabled: false disables thinking unless --thinking
+        // overrides, like the reference's settings check.
+        if cli.thinking.is_none() && thinking_enabled == Some(false) {
+            config.runtime.effort = None;
+            config.runtime.thinking_budget = None;
         }
     }
     if let Some(turns) = cli.max_turns {

@@ -38,6 +38,10 @@ pub struct HookCommand {
     pub headers: std::collections::BTreeMap<String, String>,
     /// Env vars that may be interpolated into `headers`.
     pub allowed_env_vars: Vec<String>,
+    /// Permission-rule-syntax precondition (`"if": "Bash(git *)"`) —
+    /// evaluated against the payload's tool_name/tool_input; hooks with a
+    /// non-matching condition are skipped before spawning.
+    pub if_condition: Option<String>,
     /// Settings file the hook came from (for display in `/hooks`).
     pub source: std::path::PathBuf,
 }
@@ -67,6 +71,9 @@ struct HookSpec {
     headers: std::collections::BTreeMap<String, String>,
     #[serde(default, rename = "allowedEnvVars")]
     allowed_env_vars: Vec<String>,
+    /// Permission-rule-syntax precondition, like the reference's `if`.
+    #[serde(rename = "if", default)]
+    if_condition: Option<String>,
     /// Timeout in seconds, like the reference's hook timeout field.
     timeout: Option<u64>,
 }
@@ -161,6 +168,7 @@ pub fn load_hooks(cwd: &Path) -> HooksConfig {
                         url: if is_http { spec.url.clone() } else { None },
                         headers: spec.headers.clone(),
                         allowed_env_vars: spec.allowed_env_vars.clone(),
+                        if_condition: spec.if_condition.clone(),
                         source: path.clone(),
                     });
                 }
@@ -348,6 +356,29 @@ fn run_hook_command(
         .unwrap_or_else(|| default_hook_timeout_ms(&hook.event));
     let parsed: serde_json::Value =
         serde_json::from_str(stdin_json).unwrap_or(serde_json::Value::Null);
+    // `"if"` precondition: permission-rule syntax matched against the
+    // payload's tool_name/tool_input. Hooks on non-tool events (no
+    // tool_name in the payload) with a condition never run.
+    if let Some(cond) = &hook.if_condition {
+        let matched = parsed["tool_name"]
+            .as_str()
+            .is_some_and(|tool_name| {
+                crate::permissions::rule_matches(
+                    cond,
+                    tool_name,
+                    &parsed["tool_input"],
+                    cwd,
+                )
+            });
+        if !matched {
+            return Ok(HookOutput {
+                code: Some(0),
+                success: true,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            });
+        }
+    }
     let hook_event = parsed["hook_event_name"].as_str().unwrap_or("unknown");
     let tool_name = parsed["tool_name"].as_str().unwrap_or_default();
     let session_id = parsed["session_id"].as_str().unwrap_or_default();
