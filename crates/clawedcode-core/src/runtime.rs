@@ -244,6 +244,8 @@ struct TurnResult {
     has_tool_use: bool,
     tools_executed: usize,
     tool_use_records: Vec<ToolUseRecord>,
+    /// Provider error seen mid-stream, if any — used by --fallback-model.
+    stream_error: Option<clawedcode_api::ProviderError>,
 }
 
 const REPEATED_TOOL_LOOP_LIMIT: usize = 4;
@@ -1017,17 +1019,44 @@ impl Runtime {
         }
 
         let mut stop_hook_used = false;
+        let mut fallback_used = false;
+        let mut active_fallback_model: Option<String> = None;
         for _turn in 0..self.max_turns() {
             if self.interrupted() {
                 break;
             }
-            let request =
+            let mut request =
                 self.build_request_with_prompt_override(session, effective_override.as_deref());
+            if let Some(fallback) = &active_fallback_model {
+                request.model = fallback.clone();
+            }
             let stream = self.provider.stream(&request);
 
             let turn_result = self
                 .process_stream_turn(session, stream, on_event, approval_fn)
                 .await;
+
+            // `--fallback-model`: retry the turn once on overload errors.
+            if !fallback_used {
+                if let Some(err) = &turn_result.stream_error {
+                    let overloaded =
+                        matches!(
+                            err,
+                            clawedcode_api::ProviderError::Api { status, .. }
+                                if matches!(status, 429 | 500 | 502 | 503 | 529)
+                        ) || matches!(err, clawedcode_api::ProviderError::RetryExhausted { .. });
+                    if overloaded {
+                        if let Some(fallback) = self.config.runtime.fallback_model.clone() {
+                            fallback_used = true;
+                            on_event(&ApiEvent::MessageDelta {
+                                text: format!("\n[retrying with fallback model {fallback}]\n"),
+                            });
+                            active_fallback_model = Some(fallback);
+                            continue;
+                        }
+                    }
+                }
+            }
 
             if let Some(signature) = repeated_tool_call_signature(&turn_result) {
                 if repeated_tool_signature.as_deref() == Some(signature.as_str()) {
@@ -1110,6 +1139,7 @@ impl Runtime {
         let mut thinking_accum = String::new();
         let mut tool_uses: Vec<(String, String, serde_json::Value)> = Vec::new();
         let mut tool_use_records: Vec<ToolUseRecord> = Vec::new();
+        let mut stream_error: Option<clawedcode_api::ProviderError> = None;
         let mut s = stream;
 
         while let Some(event) = s.next().await {
@@ -1120,6 +1150,7 @@ impl Runtime {
                 Ok(e) => e,
                 Err(e) => {
                     tracing::error!("Provider stream error: {e}");
+                    stream_error = Some(e);
                     break;
                 }
             };
@@ -1179,6 +1210,7 @@ impl Runtime {
                 has_tool_use: false,
                 tools_executed: 0,
                 tool_use_records,
+                stream_error,
             };
         }
 
@@ -1242,6 +1274,7 @@ impl Runtime {
             has_tool_use: true,
             tools_executed,
             tool_use_records,
+            stream_error,
         }
     }
 

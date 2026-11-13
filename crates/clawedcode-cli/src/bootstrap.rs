@@ -239,6 +239,24 @@ pub fn resolve_mode(cli: &Cli) -> Result<ExecutionMode> {
                 yes: false,
             }));
         }
+        // `--file`: prepend file contents as context like the reference.
+        let prompt = if cli.file.is_empty() {
+            prompt
+        } else {
+            let mut context = String::new();
+            for path in &cli.file {
+                match std::fs::read_to_string(path) {
+                    Ok(contents) => {
+                        context.push_str(&format!(
+                            "Contents of {}:\n```\n{contents}\n```\n\n",
+                            path.display()
+                        ));
+                    }
+                    Err(e) => anyhow::bail!("failed to read --file {}: {e}", path.display()),
+                }
+            }
+            format!("{context}{prompt}")
+        };
         return Ok(ExecutionMode::Run(RunMode {
             prompt,
             system_prompt: cli.append_system_prompt.clone(),
@@ -558,6 +576,9 @@ mod tests {
             agents: None,
             setting_sources: None,
             allow_dangerously_skip_permissions: false,
+            fallback_model: None,
+            workload: None,
+            file: Vec::new(),
         }
     }
 
@@ -828,6 +849,9 @@ mod tests {
             agents: None,
             setting_sources: None,
             allow_dangerously_skip_permissions: false,
+            fallback_model: None,
+            workload: None,
+            file: Vec::new(),
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Tui));
@@ -887,6 +911,9 @@ mod tests {
             agents: None,
             setting_sources: None,
             allow_dangerously_skip_permissions: false,
+            fallback_model: None,
+            workload: None,
+            file: Vec::new(),
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -946,6 +973,9 @@ mod tests {
             agents: None,
             setting_sources: None,
             allow_dangerously_skip_permissions: false,
+            fallback_model: None,
+            workload: None,
+            file: Vec::new(),
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));
@@ -1008,6 +1038,9 @@ mod tests {
             agents: None,
             setting_sources: None,
             allow_dangerously_skip_permissions: false,
+            fallback_model: None,
+            workload: None,
+            file: Vec::new(),
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::DirectConnect(_)));
@@ -1070,6 +1103,9 @@ mod tests {
             agents: None,
             setting_sources: None,
             allow_dangerously_skip_permissions: false,
+            fallback_model: None,
+            workload: None,
+            file: Vec::new(),
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Ssh(_)));
@@ -1139,6 +1175,9 @@ mod tests {
             agents: None,
             setting_sources: None,
             allow_dangerously_skip_permissions: false,
+            fallback_model: None,
+            workload: None,
+            file: Vec::new(),
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -1212,6 +1251,9 @@ mod tests {
             agents: None,
             setting_sources: None,
             allow_dangerously_skip_permissions: false,
+            fallback_model: None,
+            workload: None,
+            file: Vec::new(),
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));

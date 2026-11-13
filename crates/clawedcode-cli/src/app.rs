@@ -121,6 +121,9 @@ pub async fn run(cli: Cli) -> Result<()> {
     if let Some(sources) = &cli.setting_sources {
         unsafe { std::env::set_var("CLAWEDCODE_SETTING_SOURCES", sources.join(",")) };
     }
+    if let Some(tag) = &cli.workload {
+        unsafe { std::env::set_var("CC_WORKLOAD", tag) };
+    }
     if let Some(path) = &cli.settings {
         // The reference's `--settings <file-or-json>` accepts inline JSON —
         // write it to a temp file and point the settings override there.
@@ -634,6 +637,9 @@ fn apply_cli_config_overrides(config: &mut AppConfig, cli: &Cli) {
             }
             _ => {}
         }
+    }
+    if let Some(fallback) = &cli.fallback_model {
+        config.runtime.fallback_model = Some(fallback.clone());
     }
 }
 
@@ -3206,6 +3212,9 @@ mod tests {
             agents: None,
             setting_sources: None,
             allow_dangerously_skip_permissions: false,
+            fallback_model: None,
+            workload: None,
+            file: Vec::new(),
         }
     }
 

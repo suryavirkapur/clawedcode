@@ -156,6 +156,15 @@ pub struct Cli {
     /// Allow permission bypass as an option without enabling it.
     #[arg(long, global = true)]
     pub allow_dangerously_skip_permissions: bool,
+    /// Retry once with this model when the primary is overloaded.
+    #[arg(long, global = true)]
+    pub fallback_model: Option<String>,
+    /// Workload tag for billing attribution (cc_workload).
+    #[arg(long, global = true)]
+    pub workload: Option<String>,
+    /// Files whose contents are prepended to the prompt as context.
+    #[arg(long, global = true)]
+    pub file: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -433,6 +442,9 @@ mod tests {
             agents: None,
             setting_sources: None,
             allow_dangerously_skip_permissions: false,
+            fallback_model: None,
+            workload: None,
+            file: Vec::new(),
         }
     }
 
@@ -495,6 +507,9 @@ mod tests {
             agents: None,
             setting_sources: None,
             allow_dangerously_skip_permissions: false,
+            fallback_model: None,
+            workload: None,
+            file: Vec::new(),
         }
     }
 

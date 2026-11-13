@@ -37,6 +37,9 @@ pub struct RuntimeConfig {
     /// Optional explicit thinking budget in tokens (`--max-thinking-tokens`).
     #[serde(default)]
     pub thinking_budget: Option<u64>,
+    /// `--fallback-model`: retry once with this model on overload errors.
+    #[serde(default)]
+    pub fallback_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +63,7 @@ impl Default for AppConfig {
             runtime: RuntimeConfig {
                 effort: None,
                 thinking_budget: None,
+                fallback_model: None,
                 max_turns: 64,
                 session_history_limit: 2_000,
             },
