@@ -981,6 +981,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     // vim modal editing (/vim toggles handler.vim_enabled): pending operator
     // char for d/c + yank register for p.
     let mut vim_pending: char = '\0';
+    // Operator that preceded a pending f/F/t/T target char (`df;`, `yt,`).
+    let mut vim_pending_op: char = '\0';
     let mut vim_register = String::new();
     let mut question_answers: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
     let mut question_multi: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
@@ -2042,6 +2044,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                     // leaves insert; it must not interrupt a running turn).
                     handler.vim_insert = false;
                     vim_pending = '\0';
+                    vim_pending_op = '\0';
                     continue;
                 }
 
@@ -2056,36 +2059,101 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         || (key.code == KeyCode::Esc && vim_pending == '\0');
                     if vim_pass_through {
                         vim_pending = '\0';
+                        vim_pending_op = '\0';
                     } else {
                         if vim_pending != '\0' {
+                            let pending = vim_pending;
                             match key.code {
-                                KeyCode::Char(
-                                    m @ ('h' | 'l' | 'w' | 'b' | 'e' | '0' | '^' | '$'),
-                                ) => {
-                                    let op = vim_pending;
-                                    vim_pending = '\0';
-                                    if let Some((from, to)) =
-                                        vim_delete_range(&input_buffer, cursor_pos, op, m)
-                                    {
-                                        vim_register = input_buffer[from..to].to_string();
-                                        input_buffer.replace_range(from..to, "");
-                                        cursor_pos = from;
-                                        if op == 'c' {
-                                            handler.vim_insert = true;
+                                KeyCode::Char(c) => match pending {
+                                    // f/F/t/T awaiting the target char — bare or
+                                    // after a d/c/y operator (`df;`, `yt,`).
+                                    'f' | 'F' | 't' | 'T' => {
+                                        let op = vim_pending_op;
+                                        vim_pending = '\0';
+                                        vim_pending_op = '\0';
+                                        if let Some((from, to)) = vim_find_range(
+                                            &input_buffer,
+                                            cursor_pos,
+                                            pending,
+                                            c,
+                                            op,
+                                        ) {
+                                            if op == '\0' {
+                                                cursor_pos = to;
+                                            } else {
+                                                vim_register = input_buffer[from..to].to_string();
+                                                if op != 'y' {
+                                                    input_buffer.replace_range(from..to, "");
+                                                    cursor_pos = from;
+                                                    if op == 'c' {
+                                                        handler.vim_insert = true;
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
-                                }
-                                KeyCode::Char(m) if m == vim_pending => {
-                                    // dd / cc operate on the whole line buffer.
-                                    vim_pending = '\0';
-                                    vim_register = input_buffer.clone();
-                                    input_buffer.clear();
-                                    cursor_pos = 0;
-                                    if m == 'c' {
-                                        handler.vim_insert = true;
+                                    // r{char} — replace the char under the cursor.
+                                    'r' => {
+                                        vim_pending = '\0';
+                                        if c != '\n' && cursor_pos < input_buffer.len() {
+                                            let end = vim_next_boundary(&input_buffer, cursor_pos);
+                                            input_buffer
+                                                .replace_range(cursor_pos..end, &c.to_string());
+                                        }
                                     }
+                                    'g' => {
+                                        vim_pending = '\0';
+                                        if c == 'g' {
+                                            cursor_pos = 0;
+                                        }
+                                    }
+                                    // d/c/y awaiting a motion.
+                                    op @ ('d' | 'c' | 'y') => match c {
+                                        m if m == op => {
+                                            // dd/yy/cc — linewise on the current line.
+                                            vim_pending = '\0';
+                                            let (from, to) = if op == 'c' {
+                                                vim_current_line_body(&input_buffer, cursor_pos)
+                                            } else {
+                                                vim_current_line_range(&input_buffer, cursor_pos)
+                                            };
+                                            vim_register = input_buffer[from..to].to_string();
+                                            if op != 'y' {
+                                                input_buffer.replace_range(from..to, "");
+                                                cursor_pos = from.min(input_buffer.len());
+                                                if op == 'c' {
+                                                    handler.vim_insert = true;
+                                                }
+                                            }
+                                        }
+                                        'f' | 'F' | 't' | 'T' => {
+                                            vim_pending = c;
+                                            vim_pending_op = op;
+                                        }
+                                        'h' | 'l' | 'w' | 'W' | 'b' | 'B' | 'e' | 'E' | '0'
+                                        | '^' | '$' | 'G' | 'j' | 'k' => {
+                                            vim_pending = '\0';
+                                            if let Some((from, to)) =
+                                                vim_motion_range(&input_buffer, cursor_pos, c)
+                                            {
+                                                vim_register = input_buffer[from..to].to_string();
+                                                if op != 'y' {
+                                                    input_buffer.replace_range(from..to, "");
+                                                    cursor_pos = from;
+                                                    if op == 'c' {
+                                                        handler.vim_insert = true;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        _ => vim_pending = '\0',
+                                    },
+                                    _ => vim_pending = '\0',
+                                },
+                                _ => {
+                                    vim_pending = '\0';
+                                    vim_pending_op = '\0';
                                 }
-                                _ => vim_pending = '\0',
                             }
                         } else {
                             match (key.code, key.modifiers) {
@@ -2134,6 +2202,74 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                                 (KeyCode::Char('e'), m) if m.is_empty() => {
                                     cursor_pos = vim_word_end(&input_buffer, cursor_pos);
                                 }
+                                (KeyCode::Char('W'), _) => {
+                                    cursor_pos = vim_big_word_forward(&input_buffer, cursor_pos);
+                                }
+                                (KeyCode::Char('B'), _) => {
+                                    cursor_pos = vim_big_word_backward(&input_buffer, cursor_pos);
+                                }
+                                (KeyCode::Char('E'), _) => {
+                                    cursor_pos = vim_big_word_end(&input_buffer, cursor_pos);
+                                }
+                                (KeyCode::Char('j'), m) | (KeyCode::Down, m) if m.is_empty() => {
+                                    cursor_pos = vim_line_move(&input_buffer, cursor_pos, 1);
+                                }
+                                (KeyCode::Char('k'), m) | (KeyCode::Up, m) if m.is_empty() => {
+                                    cursor_pos = vim_line_move(&input_buffer, cursor_pos, -1);
+                                }
+                                (KeyCode::Char('G'), _) => {
+                                    cursor_pos =
+                                        input_buffer.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                                }
+                                (KeyCode::Char('f' | 'F' | 't' | 'T'), _)
+                                    if !key
+                                        .modifiers
+                                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                                {
+                                    if let KeyCode::Char(c) = key.code {
+                                        vim_pending = c;
+                                    }
+                                }
+                                (KeyCode::Char('r'), m) if m.is_empty() => vim_pending = 'r',
+                                (KeyCode::Char('g'), m) if m.is_empty() => vim_pending = 'g',
+                                (KeyCode::Char('~'), m) if m.is_empty() => {
+                                    if cursor_pos < input_buffer.len() {
+                                        let end = vim_next_boundary(&input_buffer, cursor_pos);
+                                        let swapped: String = input_buffer[cursor_pos..end]
+                                            .chars()
+                                            .map(|c| {
+                                                if c.is_uppercase() {
+                                                    c.to_lowercase().next().unwrap_or(c)
+                                                } else {
+                                                    c.to_uppercase().next().unwrap_or(c)
+                                                }
+                                            })
+                                            .collect();
+                                        input_buffer.replace_range(cursor_pos..end, &swapped);
+                                        cursor_pos = end;
+                                    }
+                                }
+                                (KeyCode::Char('J'), _) => {
+                                    cursor_pos = vim_join_lines(&mut input_buffer, cursor_pos);
+                                }
+                                (KeyCode::Char('o'), m) if m.is_empty() => {
+                                    let line_end = input_buffer[cursor_pos..]
+                                        .find('\n')
+                                        .map(|i| cursor_pos + i)
+                                        .unwrap_or(input_buffer.len());
+                                    input_buffer.insert(line_end, '\n');
+                                    cursor_pos = line_end + 1;
+                                    handler.vim_insert = true;
+                                }
+                                (KeyCode::Char('O'), _) => {
+                                    let line_start = input_buffer[..cursor_pos]
+                                        .rfind('\n')
+                                        .map(|i| i + 1)
+                                        .unwrap_or(0);
+                                    input_buffer.insert(line_start, '\n');
+                                    cursor_pos = line_start;
+                                    handler.vim_insert = true;
+                                }
                                 (KeyCode::Char('x'), m) | (KeyCode::Delete, m) if m.is_empty() => {
                                     if cursor_pos < input_buffer.len() {
                                         let end = vim_next_boundary(&input_buffer, cursor_pos);
@@ -2143,6 +2279,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                                 }
                                 (KeyCode::Char('d'), m) if m.is_empty() => vim_pending = 'd',
                                 (KeyCode::Char('c'), m) if m.is_empty() => vim_pending = 'c',
+                                (KeyCode::Char('y'), m) if m.is_empty() => vim_pending = 'y',
                                 (KeyCode::Char('D'), _) => {
                                     if cursor_pos < input_buffer.len() {
                                         vim_register = input_buffer[cursor_pos..].to_string();
@@ -2165,6 +2302,15 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                                         };
                                         input_buffer.insert_str(at, &vim_register);
                                         cursor_pos = at + vim_register.len() - 1;
+                                    }
+                                }
+                                (KeyCode::Char('P'), _) => {
+                                    if !vim_register.is_empty() {
+                                        input_buffer.insert_str(cursor_pos, &vim_register);
+                                        cursor_pos = vim_prev_boundary(
+                                            &input_buffer,
+                                            cursor_pos + vim_register.len(),
+                                        );
                                     }
                                 }
                                 (KeyCode::Char('u'), m) if m.is_empty() => {
@@ -4277,7 +4423,18 @@ fn vim_char_class(c: char) -> u8 {
     }
 }
 
-fn vim_word_forward(buffer: &str, pos: usize) -> usize {
+fn vim_word_class_at(buffer: &str, index: usize, big: bool) -> u8 {
+    let c = buffer[index..].chars().next().unwrap_or(' ');
+    if c.is_whitespace() {
+        0
+    } else if big {
+        1
+    } else {
+        vim_char_class(c)
+    }
+}
+
+fn vim_word_forward_at(buffer: &str, pos: usize, big: bool) -> usize {
     let chars: Vec<(usize, char)> = buffer.char_indices().collect();
     let start = chars
         .iter()
@@ -4286,9 +4443,9 @@ fn vim_word_forward(buffer: &str, pos: usize) -> usize {
     if start >= chars.len() {
         return buffer.len();
     }
-    let cls = vim_char_class(chars[start].1);
+    let cls = vim_word_class_at(buffer, chars[start].0, big);
     let mut i = start;
-    while i < chars.len() && vim_char_class(chars[i].1) == cls {
+    while i < chars.len() && vim_word_class_at(buffer, chars[i].0, big) == cls {
         i += 1;
     }
     while i < chars.len() && chars[i].1.is_whitespace() {
@@ -4301,7 +4458,7 @@ fn vim_word_forward(buffer: &str, pos: usize) -> usize {
     }
 }
 
-fn vim_word_backward(buffer: &str, pos: usize) -> usize {
+fn vim_word_backward_at(buffer: &str, pos: usize, big: bool) -> usize {
     let chars: Vec<(usize, char)> = buffer.char_indices().collect();
     let mut i = chars
         .iter()
@@ -4314,14 +4471,14 @@ fn vim_word_backward(buffer: &str, pos: usize) -> usize {
     while i > 0 && chars[i].1.is_whitespace() {
         i -= 1;
     }
-    let cls = if vim_is_word_char(chars[i].1) { 1 } else { 2 };
-    while i > 0 && vim_char_class(chars[i - 1].1) == cls {
+    let cls = vim_word_class_at(buffer, chars[i].0, big);
+    while i > 0 && vim_word_class_at(buffer, chars[i - 1].0, big) == cls {
         i -= 1;
     }
     chars[i].0
 }
 
-fn vim_word_end(buffer: &str, pos: usize) -> usize {
+fn vim_word_end_at(buffer: &str, pos: usize, big: bool) -> usize {
     let chars: Vec<(usize, char)> = buffer.char_indices().collect();
     let start = chars
         .iter()
@@ -4334,15 +4491,172 @@ fn vim_word_end(buffer: &str, pos: usize) -> usize {
     if i >= chars.len() {
         return vim_prev_boundary(buffer, buffer.len());
     }
-    let cls = if vim_is_word_char(chars[i].1) { 1 } else { 2 };
-    while i + 1 < chars.len() && vim_char_class(chars[i + 1].1) == cls {
+    let cls = vim_word_class_at(buffer, chars[i].0, big);
+    while i + 1 < chars.len() && vim_word_class_at(buffer, chars[i + 1].0, big) == cls {
         i += 1;
     }
     chars[i].0
 }
 
-/// Byte range deleted by a vim operator+motion (e and $ are inclusive).
-fn vim_delete_range(buffer: &str, pos: usize, _op: char, motion: char) -> Option<(usize, usize)> {
+fn vim_word_forward(buffer: &str, pos: usize) -> usize {
+    vim_word_forward_at(buffer, pos, false)
+}
+
+fn vim_word_backward(buffer: &str, pos: usize) -> usize {
+    vim_word_backward_at(buffer, pos, false)
+}
+
+fn vim_word_end(buffer: &str, pos: usize) -> usize {
+    vim_word_end_at(buffer, pos, false)
+}
+
+/// W / B / E — WORD variants treat any non-whitespace run as one word.
+fn vim_big_word_forward(buffer: &str, pos: usize) -> usize {
+    vim_word_forward_at(buffer, pos, true)
+}
+
+fn vim_big_word_backward(buffer: &str, pos: usize) -> usize {
+    vim_word_backward_at(buffer, pos, true)
+}
+
+fn vim_big_word_end(buffer: &str, pos: usize) -> usize {
+    vim_word_end_at(buffer, pos, true)
+}
+
+/// j / k — move to the same column on the next/previous line (Vim's goal
+/// column, clamped to the shorter line).
+fn vim_line_move(buffer: &str, pos: usize, dir: i32) -> usize {
+    let line_start = buffer[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line_end = buffer[pos..]
+        .find('\n')
+        .map(|i| pos + i)
+        .unwrap_or(buffer.len());
+    let col = pos - line_start;
+    if dir > 0 {
+        if line_end >= buffer.len() {
+            return pos;
+        }
+        let next_start = line_end + 1;
+        let next_end = buffer[next_start..]
+            .find('\n')
+            .map(|i| next_start + i)
+            .unwrap_or(buffer.len());
+        (next_start + col).min(next_end)
+    } else {
+        if line_start == 0 {
+            return pos;
+        }
+        let prev_end = line_start - 1;
+        let prev_start = buffer[..prev_end].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        (prev_start + col).min(prev_end)
+    }
+}
+
+/// dd/yy — the current line including its newline (last line eats the
+/// preceding newline instead).
+fn vim_current_line_range(buffer: &str, pos: usize) -> (usize, usize) {
+    let line_start = buffer[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line_end = buffer[pos..]
+        .find('\n')
+        .map(|i| pos + i)
+        .unwrap_or(buffer.len());
+    if line_end < buffer.len() {
+        (line_start, line_end + 1)
+    } else if line_start > 0 {
+        (line_start - 1, line_end)
+    } else {
+        (0, buffer.len())
+    }
+}
+
+/// cc — the current line's body only; the newline stays so a fresh line
+/// opens for insert.
+fn vim_current_line_body(buffer: &str, pos: usize) -> (usize, usize) {
+    let line_start = buffer[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line_end = buffer[pos..]
+        .find('\n')
+        .map(|i| pos + i)
+        .unwrap_or(buffer.len());
+    (line_start, line_end)
+}
+
+/// Position of `target` in `buffer` relative to `pos` (searching backward
+/// when `backward` is set).
+fn vim_find_char_pos(buffer: &str, pos: usize, backward: bool, target: char) -> Option<usize> {
+    if backward {
+        buffer[..pos]
+            .char_indices()
+            .rev()
+            .find(|(_, c)| *c == target)
+            .map(|(i, _)| i)
+    } else {
+        buffer
+            .char_indices()
+            .find(|(i, c)| *i > pos && *c == target)
+            .map(|(i, _)| i)
+    }
+}
+
+/// f/F/t/T — bare motion returns the landing position as `to`; with an
+/// operator the returned range is what gets yanked/changed/deleted
+/// (f/F inclusive of the target char, t/T exclusive).
+fn vim_find_range(
+    buffer: &str,
+    pos: usize,
+    motion: char,
+    target: char,
+    op: char,
+) -> Option<(usize, usize)> {
+    let backward = matches!(motion, 'F' | 'T');
+    let cpos = vim_find_char_pos(buffer, pos, backward, target)?;
+    if op == '\0' {
+        let landing = match motion {
+            't' => vim_prev_boundary(buffer, cpos),
+            'T' => vim_next_boundary(buffer, cpos),
+            _ => cpos,
+        };
+        return Some((pos, landing));
+    }
+    let range = if backward {
+        let start = if motion == 'F' {
+            cpos
+        } else {
+            vim_next_boundary(buffer, cpos)
+        };
+        (start, vim_next_boundary(buffer, pos))
+    } else {
+        let end = if motion == 'f' {
+            vim_next_boundary(buffer, cpos)
+        } else {
+            cpos
+        };
+        (pos, end)
+    };
+    (range.0 < range.1).then_some(range)
+}
+
+/// J — join the next line into the current one: newline plus leading
+/// whitespace collapse to a single space (nothing when the next line is
+/// empty).
+fn vim_join_lines(buffer: &mut String, pos: usize) -> usize {
+    let Some(nl) = buffer[pos..].find('\n').map(|i| pos + i) else {
+        return pos;
+    };
+    let rest = &buffer[nl + 1..];
+    let ws_len = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+    let blank = rest.trim_start_matches([' ', '\t']).is_empty();
+    let join = if blank || buffer[..nl].ends_with(' ') {
+        ""
+    } else {
+        " "
+    };
+    buffer.replace_range(nl..nl + 1 + ws_len, join);
+    nl
+}
+
+/// Byte range covered by a vim motion for operator use (e/E and $ are
+/// inclusive of the landing char).
+fn vim_motion_range(buffer: &str, pos: usize, motion: char) -> Option<(usize, usize)> {
     if buffer.is_empty() {
         return None;
     }
@@ -4352,6 +4666,12 @@ fn vim_delete_range(buffer: &str, pos: usize, _op: char, motion: char) -> Option
         'w' => (vim_word_forward(buffer, pos), false),
         'b' => (vim_word_backward(buffer, pos), false),
         'e' => (vim_word_end(buffer, pos), true),
+        'W' => (vim_big_word_forward(buffer, pos), false),
+        'B' => (vim_big_word_backward(buffer, pos), false),
+        'E' => (vim_big_word_end(buffer, pos), true),
+        'j' => (vim_line_move(buffer, pos, 1), false),
+        'k' => (vim_line_move(buffer, pos, -1), false),
+        'G' => (buffer.len(), false),
         '0' => (0usize, false),
         '^' => (
             buffer
