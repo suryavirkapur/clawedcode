@@ -191,6 +191,59 @@ const SPINNER_FRAMES: &[char] = &['·', '✢', '✳', '✶', '✻', '✽', '✻'
 static CUSTOM_SPINNER_VERBS: std::sync::RwLock<Option<Vec<String>>> =
     std::sync::RwLock::new(None);
 
+/// `settings.spinnerTipsOverride` — `{excludeDefault, tips}` controls the
+/// rotating tip line under the spinner.
+static CUSTOM_SPINNER_TIPS: std::sync::RwLock<Option<(bool, Vec<String>)>> =
+    std::sync::RwLock::new(None);
+
+const DEFAULT_SPINNER_TIPS: &[&str] = &[
+    "Use /help to see all available commands",
+    "Press shift+tab to cycle permission modes",
+    "Use @ to add files to your message",
+    "Run /init to create a CLAUDE.md with project instructions",
+    "Press esc to interrupt the current turn",
+    "Use ! to run a shell command without leaving the prompt",
+];
+
+fn apply_spinner_tips(settings: &serde_json::Value) {
+    let tips = settings.get("spinnerTipsOverride").and_then(|o| {
+        let list = o
+            .get("tips")?
+            .as_array()?
+            .iter()
+            .filter_map(|t| t.as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        Some((
+            o.get("excludeDefault").and_then(|e| e.as_bool()).unwrap_or(false),
+            list,
+        ))
+    });
+    if let Ok(mut slot) = CUSTOM_SPINNER_TIPS.write() {
+        *slot = tips;
+    }
+}
+
+fn spinner_tip(elapsed_ms: u128) -> String {
+    let (exclude_default, custom) = CUSTOM_SPINNER_TIPS
+        .read()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or((false, Vec::new()));
+    let default_len = if exclude_default { 0 } else { DEFAULT_SPINNER_TIPS.len() };
+    let total = default_len + custom.len();
+    if total == 0 {
+        return String::new();
+    }
+    let index = (elapsed_ms / SPINNER_TIP_MS) as usize % total;
+    if index < default_len {
+        DEFAULT_SPINNER_TIPS[index].to_string()
+    } else {
+        custom[index - default_len].clone()
+    }
+}
+
+const SPINNER_TIP_MS: u128 = 8_000;
+
 /// `settings.fileSuggestion` — `{type: "command", command}` runs for
 /// @-palette suggestions instead of index filtering (the reference's
 /// executeFileSuggestionCommand).
@@ -676,6 +729,7 @@ pub fn run_with_context(mut ctx: TuiContext) -> Result<()> {
         &ctx.runtime.compatibility().settings,
         &ctx.session().cwd,
     );
+    apply_spinner_tips(&ctx.runtime.compatibility().settings);
     enable_raw_mode()?;
     execute!(
         stdout(),
@@ -1387,7 +1441,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
             ))
             .max(rewind_picker_height(handler.rewind_picker, ctx));
             let spinner_height = if active_turn.is_some() && awaiting_approval.is_none() {
-                1
+                2
             } else {
                 0
             };
@@ -1488,7 +1542,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
 
             if spinner_height > 0 {
                 frame.render_widget(
-                    Paragraph::new(spinner_line(turn_started_at, handler.turn_tokens)),
+                    Paragraph::new(spinner_lines(turn_started_at, handler.turn_tokens)),
                     chunks[4],
                 );
             }
@@ -4160,6 +4214,13 @@ fn render_question_dialog(
 }
 
 /// Animated "working" line above the input box: `✻ Verb… (esc to interrupt · Ns)`.
+fn spinner_lines(
+    turn_started_at: Option<std::time::Instant>,
+    tokens: u64,
+) -> Vec<Line<'static>> {
+    vec![spinner_line(turn_started_at, tokens), spinner_tip_line(turn_started_at)]
+}
+
 fn spinner_line(turn_started_at: Option<std::time::Instant>, tokens: u64) -> Line<'static> {
     let elapsed = turn_started_at
         .map(|start| start.elapsed().as_millis())
@@ -4186,6 +4247,20 @@ fn spinner_line(turn_started_at: Option<std::time::Instant>, tokens: u64) -> Lin
         Span::styled(
             format!("(esc to interrupt · {seconds}s{tokens_part})"),
             Style::default().fg(pal().dim),
+        ),
+    ])
+}
+
+fn spinner_tip_line(turn_started_at: Option<std::time::Instant>) -> Line<'static> {
+    let elapsed = turn_started_at
+        .map(|start| start.elapsed().as_millis())
+        .unwrap_or(0);
+    let tip = spinner_tip(elapsed);
+    Line::from(vec![
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            format!("Tip: {tip}"),
+            Style::default().fg(pal().dim).add_modifier(Modifier::ITALIC),
         ),
     ])
 }

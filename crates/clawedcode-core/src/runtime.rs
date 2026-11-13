@@ -4944,7 +4944,7 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
         };
         let compat = CompatibilitySnapshot {
             settings_files: vec![],
-            settings: serde_json::Value::Null,
+            settings: serde_json::json!({"language": "English"}),
             skills: vec![],
             memory_files: vec![],
             memory: String::new(),
@@ -4965,7 +4965,12 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
         assert!(request.system_prompt_body.contains("## Actions With Care"));
         assert!(request.system_prompt_body.contains("## Using Your Tools"));
         assert!(request.system_prompt_body.contains("## Session Guidance"));
-        assert!(request.system_prompt_body.contains("## Language"));
+        assert!(request.system_prompt_body.contains("# Language"));
+        assert!(
+            request
+                .system_prompt_body
+                .contains("Always respond in English")
+        );
         assert!(request.system_prompt_body.contains("## Environment"));
         assert!(
             request
@@ -4976,11 +4981,6 @@ members = ["crates/clawedcode-cli", "crates/clawedcode-core", "crates/clawedcode
             request
                 .system_prompt_body
                 .contains("Model: deepseek-v4-pro")
-        );
-        assert!(
-            request
-                .system_prompt_body
-                .contains("Current setting: default")
         );
         assert!(request.system_prompt_body.contains("shell"));
         assert!(request.system_prompt_body.contains("read_file"));
