@@ -680,7 +680,7 @@ pub fn builtin_tools() -> Vec<ToolSpec> {
                     },
                     "subagent_type": {
                         "type": "string",
-                        "description": "Optional specialized agent type. Omit to fork with the current conversation context."
+                        "description": "Specialized agent type — `general-purpose` or a `.claude/agents/<name>.md` name. Omit to fork with the current conversation context."
                     }
                 },
                 "required": ["description", "prompt"]
@@ -703,7 +703,7 @@ pub fn builtin_tools() -> Vec<ToolSpec> {
                     },
                     "subagent_type": {
                         "type": "string",
-                        "description": "Optional specialized agent type. Omit to fork with the current conversation context."
+                        "description": "Specialized agent type — `general-purpose` or a `.claude/agents/<name>.md` name. Omit to fork with the current conversation context."
                     }
                 },
                 "required": ["description", "prompt"]

@@ -27,7 +27,7 @@ use clawedcode_tools::{
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -309,6 +309,15 @@ enum PreparedAgentExecution {
     Pending(std::thread::JoinHandle<Result<(SubAgentResult, AgentToolInput), String>>),
 }
 
+/// Resolved agent-launch parameters after `subagent_type` lookup.
+struct ResolvedAgentRun {
+    config: AppConfig,
+    permission_mode: PermissionMode,
+    max_turns: usize,
+    agent_system_prompt: Option<String>,
+    allowed_tools: Option<Vec<String>>,
+}
+
 fn apply_prompt_override(messages: &mut [clawedcode_api::ProviderMessage], prompt_override: &str) {
     let Some(last_user) = messages.iter_mut().rfind(|message| {
         message.role == clawedcode_api::ProviderRole::User
@@ -489,6 +498,17 @@ impl Runtime {
             permission_engine: PermissionEngine::new(mode),
             interrupt_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Restrict the tool pool to the named tools. MCP tools stay available
+    /// for every agent (reference `filterToolsForAgent` behavior).
+    pub(crate) fn restrict_tools(&mut self, allowed: &HashSet<String>) {
+        self.tools.retain(|t| {
+            allowed.contains(&t.name.to_ascii_lowercase()) || t.name.starts_with("mcp__")
+        });
+        self.tool_instances.retain(|name, _| {
+            allowed.contains(&name.to_ascii_lowercase()) || name.starts_with("mcp__")
+        });
     }
 
     pub fn set_agent_prompt(&mut self, prompt: Option<String>) {
@@ -1190,9 +1210,7 @@ impl Runtime {
                 continue;
             };
 
-            let (config, permission_mode, max_turns, agent_system_prompt) = match self
-                .resolve_agent_run(&parsed, session)
-            {
+            let run = match self.resolve_agent_run(&parsed, session) {
                 Ok(run) => run,
                 Err(err) => {
                     prepared.insert(
@@ -1212,7 +1230,7 @@ impl Runtime {
                 tool_use_id.clone(),
                 PreparedAgentExecution::Pending(std::thread::spawn(move || {
                     let runtime = SubAgentRuntime::new(
-                        config,
+                        run.config,
                         system_prompt,
                         compatibility,
                         sessions_dir,
@@ -1223,9 +1241,10 @@ impl Runtime {
                             &parent_snapshot,
                             SubAgentConfig {
                                 prompt: parsed_for_thread.prompt.clone(),
-                                max_turns,
-                                permission_mode,
-                                agent_system_prompt,
+                                max_turns: run.max_turns,
+                                permission_mode: run.permission_mode,
+                                agent_system_prompt: run.agent_system_prompt,
+                                allowed_tools: run.allowed_tools,
                             },
                         )
                         .map_err(|err| err.to_string())?;
@@ -1269,13 +1288,13 @@ impl Runtime {
     }
 
     /// Resolve a `subagent_type` into run parameters — config, permission
-    /// mode, turn cap, and the agent's system prompt from
+    /// mode, turn cap, tool allowlist, and the agent's system prompt from
     /// `.claude/agents/*.md`. Unknown types fail with the available list.
     fn resolve_agent_run(
         &self,
         parsed: &AgentToolInput,
         session: &Session,
-    ) -> Result<(AppConfig, PermissionMode, usize, Option<String>), String> {
+    ) -> Result<ResolvedAgentRun, String> {
         let agents = crate::compat::discover_agents(&session.cwd);
         let agent = match parsed.subagent_type.as_deref() {
             None => None,
@@ -1293,25 +1312,29 @@ impl Runtime {
             },
         };
 
-        let mut config = self.config.clone();
-        let mut permission_mode = self.permission_mode();
-        let mut max_turns = self.max_turns();
-        let mut agent_system_prompt = None;
+        let mut run = ResolvedAgentRun {
+            config: self.config.clone(),
+            permission_mode: self.permission_mode(),
+            max_turns: self.max_turns(),
+            agent_system_prompt: None,
+            allowed_tools: None,
+        };
         if let Some(agent) = agent {
-            agent_system_prompt = Some(agent.system_prompt.clone());
+            run.agent_system_prompt = Some(agent.system_prompt.clone());
+            run.allowed_tools = agent.tools.clone();
             if let Some(model) = &agent.model {
-                config.model = model.clone();
+                run.config.model = model.clone();
             }
             if let Some(mode) =
                 crate::compat::agent_permission_mode(agent.permission_mode.as_deref())
             {
-                permission_mode = mode;
+                run.permission_mode = mode;
             }
             if let Some(turns) = agent.max_turns {
-                max_turns = turns;
+                run.max_turns = turns;
             }
         }
-        Ok((config, permission_mode, max_turns, agent_system_prompt))
+        Ok(run)
     }
 
     fn execute_agent_tool(
@@ -1336,14 +1359,13 @@ impl Runtime {
             );
         };
 
-        let (config, permission_mode, max_turns, agent_system_prompt) =
-            match self.resolve_agent_run(&parsed, session) {
-                Ok(run) => run,
-                Err(err) => return ContentBlock::tool_error(tool_use_id, err),
-            };
+        let run = match self.resolve_agent_run(&parsed, session) {
+            Ok(run) => run,
+            Err(err) => return ContentBlock::tool_error(tool_use_id, err),
+        };
 
         let runtime = SubAgentRuntime::new(
-            config,
+            run.config,
             self.system_prompt.clone(),
             self.compatibility.clone(),
             sessions_dir,
@@ -1354,9 +1376,10 @@ impl Runtime {
             session,
             SubAgentConfig {
                 prompt: parsed.prompt.clone(),
-                max_turns,
-                permission_mode,
-                agent_system_prompt,
+                max_turns: run.max_turns,
+                permission_mode: run.permission_mode,
+                agent_system_prompt: run.agent_system_prompt,
+                allowed_tools: run.allowed_tools,
             },
         ) {
             Ok(result) => {

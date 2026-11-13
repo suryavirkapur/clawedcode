@@ -546,6 +546,7 @@ impl TuiContext {
                 max_turns: self.runtime.max_turns(),
                 permission_mode: self.runtime.permission_mode(),
                 agent_system_prompt: None,
+                allowed_tools: None,
             },
         )
     }
@@ -566,6 +567,7 @@ impl TuiContext {
                 max_turns: self.runtime.max_turns(),
                 permission_mode: self.runtime.permission_mode(),
                 agent_system_prompt: None,
+                allowed_tools: None,
             },
         )
     }

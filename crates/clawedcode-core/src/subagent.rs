@@ -5,7 +5,7 @@ use crate::{
     permissions::PermissionMode,
     prompt::PromptSpec,
     runtime::Runtime,
-    session::{Message, Role, Session},
+    session::{Role, Session},
 };
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -21,6 +21,9 @@ pub struct SubAgentConfig {
     /// Custom-agent system prompt from `.claude/agents/*.md` when the Task
     /// call named a `subagent_type`.
     pub agent_system_prompt: Option<String>,
+    /// Tool allowlist from the agent frontmatter — `None` or `["*"]` means
+    /// all tools.
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 impl Default for SubAgentConfig {
@@ -30,6 +33,7 @@ impl Default for SubAgentConfig {
             max_turns: 10,
             permission_mode: PermissionMode::Bypass,
             agent_system_prompt: None,
+            allowed_tools: None,
         }
     }
 }
@@ -140,38 +144,21 @@ impl SubAgentRuntime {
         Ok(result)
     }
 
-    /// Forked children inherit the parent's system prompt — swap it for
-    /// the agent's composed prompt when a `subagent_type` was resolved.
-    fn apply_agent_system_prompt(
-        runtime: &Runtime,
-        session: &mut Session,
-        subagent: &SubAgentConfig,
-    ) {
-        if subagent.agent_system_prompt.is_none() {
-            return;
-        }
-        let body = runtime.effective_system_prompt_body(session);
-        if session
-            .messages
-            .first()
-            .is_some_and(|m| m.role == Role::System)
-        {
-            session.messages[0] = Message::from_text(Role::System, body);
-        } else {
-            session
-                .messages
-                .insert(0, Message::from_text(Role::System, body));
-        }
-    }
-
+    /// Named agents (`subagent_type` resolved) start with zero context —
+    /// a fresh session carrying only the agent's composed system prompt.
+    /// Untyped spawns fork the parent's full conversation, matching the
+    /// reference's implicit-fork semantics.
     pub fn spawn_fork_from_parent(
         &self,
         parent_session: &Session,
         subagent: SubAgentConfig,
     ) -> Result<SubAgentResult> {
         let runtime = self.build_runtime(&subagent);
-        let mut session = self.build_child_session_from_parent(parent_session);
-        Self::apply_agent_system_prompt(&runtime, &mut session, &subagent);
+        let fresh = subagent.agent_system_prompt.is_some();
+        let mut session = self.build_child_session(parent_session, !fresh);
+        if fresh {
+            session.push(Role::System, runtime.effective_system_prompt_body(&session));
+        }
         let output = runtime.submit(&mut session, &subagent.prompt);
         session.save(&self.sessions_dir)?;
 
@@ -187,7 +174,8 @@ impl SubAgentRuntime {
         parent_session: &mut Session,
         subagent: SubAgentConfig,
     ) -> Result<SubAgentTaskState> {
-        let mut child_session = self.build_child_session_from_parent(parent_session);
+        let fresh = subagent.agent_system_prompt.is_some();
+        let mut child_session = self.build_child_session(parent_session, !fresh);
         child_session.save(&self.sessions_dir)?;
 
         parent_session.add_child(child_session.id);
@@ -222,7 +210,13 @@ impl SubAgentRuntime {
                     subagent.permission_mode,
                 );
                 runtime.set_agent_prompt(subagent.agent_system_prompt.clone());
-                Self::apply_agent_system_prompt(&runtime, &mut child_session, &subagent);
+                apply_allowed_tools(&mut runtime, &subagent.allowed_tools);
+                if fresh {
+                    child_session.push(
+                        Role::System,
+                        runtime.effective_system_prompt_body(&child_session),
+                    );
+                }
                 let output = runtime.submit(&mut child_session, &subagent.prompt);
                 let summary = summarize_output(&output.response, output.tools_executed);
                 let _ = child_session.save(&sessions_dir);
@@ -264,20 +258,56 @@ impl SubAgentRuntime {
             subagent.permission_mode,
         );
         runtime.set_agent_prompt(subagent.agent_system_prompt.clone());
+        apply_allowed_tools(&mut runtime, &subagent.allowed_tools);
         runtime
     }
 
-    fn build_child_session_from_parent(&self, parent_session: &Session) -> Session {
+    fn build_child_session(&self, parent_session: &Session, fork: bool) -> Session {
         let mut session = Session::new_child_with_task_list(
             parent_session.cwd.clone(),
             parent_session.id,
             parent_session.task_list_id.clone(),
             parent_session.execution_mode.clone(),
         );
-        session.messages = parent_session.messages.clone();
+        if fork {
+            session.messages = parent_session.messages.clone();
+        }
         session.updated_at = Utc::now();
         session
     }
+}
+
+/// Canonical Claude tool names → our tool names, so agent frontmatter
+/// written for the reference format resolves against our registry.
+fn agent_tool_aliases(name: &str) -> &'static [&'static str] {
+    match name.to_ascii_lowercase().as_str() {
+        "bash" | "glob" | "grep" | "ls" => &["shell"],
+        "read" | "file_read" | "fileread" => &["read_file"],
+        "write" | "edit" | "multiedit" | "notebookedit" | "filewrite" | "fileedit" => {
+            &["apply_patch"]
+        }
+        "todowrite" | "todo" => &["taskcreate", "taskupdate", "tasklist", "taskget"],
+        "bashoutput" => &["taskoutput"],
+        "killshell" | "killtask" => &["taskstop"],
+        _ => &[],
+    }
+}
+
+/// Apply an agent's `tools` allowlist — `None` or containing `*` keeps the
+/// full pool, matching the reference's `resolveAgentTools`.
+fn apply_allowed_tools(runtime: &mut Runtime, allowed: &Option<Vec<String>>) {
+    let Some(tools) = allowed else { return };
+    if tools.iter().any(|t| t == "*") {
+        return;
+    }
+    let mut set = std::collections::HashSet::new();
+    for name in tools {
+        set.insert(name.to_ascii_lowercase());
+        for alias in agent_tool_aliases(name) {
+            set.insert(alias.to_string());
+        }
+    }
+    runtime.restrict_tools(&set);
 }
 
 fn upsert_subagent_task(task: SubAgentTaskState) {
@@ -405,6 +435,7 @@ mod tests {
                 max_turns: 5,
                 permission_mode: PermissionMode::Bypass,
                 agent_system_prompt: None,
+                allowed_tools: None,
             })
             .unwrap();
 
@@ -423,6 +454,7 @@ mod tests {
                 max_turns: 5,
                 permission_mode: PermissionMode::Bypass,
                 agent_system_prompt: None,
+                allowed_tools: None,
             })
             .unwrap();
 
@@ -446,6 +478,7 @@ mod tests {
                     max_turns: 5,
                     permission_mode: PermissionMode::Bypass,
                     agent_system_prompt: None,
+                    allowed_tools: None,
                 },
             )
             .unwrap();
@@ -478,6 +511,7 @@ mod tests {
                     max_turns: 5,
                     permission_mode: PermissionMode::Bypass,
                     agent_system_prompt: None,
+                    allowed_tools: None,
                 },
             )
             .unwrap();
@@ -504,6 +538,7 @@ mod tests {
                     max_turns: 5,
                     permission_mode: PermissionMode::Bypass,
                     agent_system_prompt: None,
+                    allowed_tools: None,
                 },
             )
             .unwrap();
@@ -544,6 +579,7 @@ mod tests {
                     max_turns: 5,
                     permission_mode: PermissionMode::Bypass,
                     agent_system_prompt: None,
+                    allowed_tools: None,
                 },
             )
             .unwrap();
@@ -572,6 +608,7 @@ mod tests {
                 max_turns: 1,
                 permission_mode: PermissionMode::Bypass,
                 agent_system_prompt: None,
+                allowed_tools: None,
             })
             .unwrap();
 
@@ -593,6 +630,7 @@ mod tests {
                     max_turns: 5,
                     permission_mode: PermissionMode::Bypass,
                     agent_system_prompt: None,
+                    allowed_tools: None,
                 },
             )
             .unwrap();
@@ -625,6 +663,7 @@ mod tests {
                     max_turns: 5,
                     permission_mode: PermissionMode::Bypass,
                     agent_system_prompt: None,
+                    allowed_tools: None,
                 },
             )
             .unwrap();

@@ -373,7 +373,7 @@ where
 pub struct AgentDefinition {
     pub agent_type: String,
     pub description: Option<String>,
-    pub tools: Vec<String>,
+    pub tools: Option<Vec<String>>,
     pub model: Option<String>,
     pub permission_mode: Option<String>,
     pub max_turns: Option<usize>,
@@ -393,19 +393,62 @@ struct AgentFrontmatter {
     max_turns: Option<usize>,
 }
 
-fn agent_tool_list(value: Option<serde_yaml::Value>) -> Vec<String> {
+/// `None` when the frontmatter has no `tools` key (all tools allowed);
+/// `Some([])` when it's present but empty.
+fn agent_tool_list(value: Option<serde_yaml::Value>) -> Option<Vec<String>> {
     match value {
-        Some(serde_yaml::Value::String(text)) => text
-            .split(',')
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .map(str::to_string)
-            .collect(),
-        Some(serde_yaml::Value::Sequence(items)) => items
-            .iter()
-            .filter_map(|item| item.as_str().map(str::to_string))
-            .collect(),
-        _ => Vec::new(),
+        Some(serde_yaml::Value::String(text)) => Some(
+            text.split(',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .collect(),
+        ),
+        Some(serde_yaml::Value::Sequence(items)) => Some(
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// The reference always registers `general-purpose` (tools `*`) — a file
+/// agent with the same `name` overrides it.
+fn general_purpose_agent() -> AgentDefinition {
+    AgentDefinition {
+        agent_type: "general-purpose".to_string(),
+        description: Some(
+            "General-purpose agent for researching complex questions, searching for \
+             code, and executing multi-step tasks."
+                .to_string(),
+        ),
+        tools: None,
+        model: None,
+        permission_mode: None,
+        max_turns: None,
+        system_prompt: "You are an agent for a terminal coding assistant. Given the \
+            user's message, you should use the tools available to complete the task. \
+            Complete the task fully—don't gold-plate, but don't leave it half-done. \
+            When you complete the task, respond with a concise report covering what \
+            was done and any key findings — the caller will relay this to the user, \
+            so it only needs the essentials.\n\nYour strengths:\n- Searching for \
+            code, configurations, and patterns across large codebases\n- Analyzing \
+            multiple files to understand system architecture\n- Investigating \
+            complex questions that require exploring many files\n- Performing \
+            multi-step research tasks\n\nGuidelines:\n- For file searches: search \
+            broadly when you don't know where something lives. Use read_file when \
+            you know the specific file path.\n- For analysis: Start broad and \
+            narrow down. Use multiple search strategies if the first doesn't yield \
+            results.\n- Be thorough: Check multiple locations, consider different \
+            naming conventions, look for related files.\n- NEVER create files \
+            unless they're absolutely necessary for achieving your goal. ALWAYS \
+            prefer editing an existing file to creating a new one.\n- NEVER \
+            proactively create documentation files (*.md) or README files. Only \
+            create documentation files if explicitly requested."
+            .to_string(),
+        path: PathBuf::from("<built-in>"),
     }
 }
 
@@ -421,6 +464,8 @@ pub fn discover_agents(cwd: &Path) -> Vec<AgentDefinition> {
 
     let mut by_type: std::collections::BTreeMap<String, AgentDefinition> =
         std::collections::BTreeMap::new();
+    let gp = general_purpose_agent();
+    by_type.insert(gp.agent_type.clone(), gp);
     for dir in dirs {
         let Ok(entries) = fs::read_dir(&dir) else {
             continue;
