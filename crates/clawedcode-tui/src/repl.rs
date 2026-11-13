@@ -628,6 +628,9 @@ struct ReplHandler {
     vim_insert: bool,
     /// `/rewind` message selector — index into `rewind_candidates`.
     rewind_picker: Option<usize>,
+    /// Reference `chat:messageActions` (shift+up) — index into
+    /// `visible_rows()` selecting a transcript row for copy/edit actions.
+    msg_actions_cursor: Option<usize>,
     turn_tokens: u64,
     total_input_tokens: u64,
     total_output_tokens: u64,
@@ -656,6 +659,7 @@ impl ReplHandler {
             vim_enabled: false,
             vim_insert: true,
             rewind_picker: None,
+            msg_actions_cursor: None,
             turn_tokens: 0,
             total_input_tokens: 0,
             total_output_tokens: 0,
@@ -668,6 +672,7 @@ impl ReplHandler {
     }
 
     fn rebuild_from_session(&mut self, session: &Session, show_thinking: bool) {
+        self.msg_actions_cursor = None;
         self.transcript_rows.clear();
         let mut turn = TranscriptTurn::default();
         for msg in &session.messages {
@@ -1316,6 +1321,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 status_line_display
                     .as_ref()
                     .map(|(text, padding)| (text.as_str(), *padding)),
+                handler.msg_actions_cursor.is_some(),
             );
 
             if let Some(panel) = &handler.info_panel {
@@ -1940,6 +1946,111 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                     continue;
                 }
 
+                // Reference chat:messageActions — while the cursor is active
+                // every key belongs to it (esc/ctrl+c leave; chars do nothing).
+                if handler.msg_actions_cursor.is_some() {
+                    let rows = handler.visible_rows();
+                    let cursor = handler
+                        .msg_actions_cursor
+                        .unwrap_or(0)
+                        .min(rows.len().saturating_sub(1));
+                    let step = |from: usize, dir: i8| -> Option<usize> {
+                        let mut index = from as i64 + dir as i64;
+                        while index >= 0 && (index as usize) < rows.len() {
+                            if navigable_row(&rows[index as usize]) {
+                                return Some(index as usize);
+                            }
+                            index += dir as i64;
+                        }
+                        None
+                    };
+                    let step_user = |from: usize, dir: i8| -> Option<usize> {
+                        let mut index = from as i64 + dir as i64;
+                        while index >= 0 && (index as usize) < rows.len() {
+                            if matches!(rows[index as usize], RenderRow::User(_)) {
+                                return Some(index as usize);
+                            }
+                            index += dir as i64;
+                        }
+                        None
+                    };
+                    let mut next = Some(cursor);
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Esc, _) => {
+                            next = None;
+                        }
+                        (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
+                            next = None;
+                        }
+                        (KeyCode::Up, m) if m.contains(KeyModifiers::SHIFT) => {
+                            next = step_user(cursor, -1).or(Some(cursor));
+                        }
+                        (KeyCode::Down, m) if m.contains(KeyModifiers::SHIFT) => {
+                            next = step_user(cursor, 1).or(Some(cursor));
+                        }
+                        (KeyCode::Up, m) | (KeyCode::Char('k'), m)
+                            if !m.contains(KeyModifiers::SHIFT) =>
+                        {
+                            next = step(cursor, -1).or(Some(cursor));
+                        }
+                        (KeyCode::Down, m) | (KeyCode::Char('j'), m)
+                            if !m.contains(KeyModifiers::SHIFT) =>
+                        {
+                            next = step(cursor, 1).or(Some(cursor));
+                        }
+                        (KeyCode::Up | KeyCode::Home, m) if m.contains(KeyModifiers::ALT) => {
+                            next = rows.iter().position(navigable_row).or(Some(cursor));
+                        }
+                        (KeyCode::Down | KeyCode::End, m) if m.contains(KeyModifiers::ALT) => {
+                            next = rows.iter().rposition(navigable_row).or(Some(cursor));
+                        }
+                        (KeyCode::Enter, _) => match rows.get(cursor) {
+                            // Reference enter on a user message = edit: the
+                            // text goes back into the prompt.
+                            Some(RenderRow::User(text)) => {
+                                input_buffer = text.clone();
+                                cursor_pos = input_buffer.len();
+                                history_index = None;
+                                next = None;
+                            }
+                            // Reference enter expands/collapses tool results.
+                            Some(RenderRow::ToolResult { tool_use_id, .. }) => {
+                                if !handler.expanded_tool_results.remove(tool_use_id) {
+                                    handler.expanded_tool_results.insert(tool_use_id.clone());
+                                }
+                            }
+                            _ => {}
+                        },
+                        (KeyCode::Char('c'), _) => {
+                            if let Some(row) = rows.get(cursor) {
+                                let _ = copy_to_clipboard(&row_text(row));
+                            }
+                        }
+                        // Reference `p` copies the tool call's primary input
+                        // (file path, command, …).
+                        (KeyCode::Char('p'), _) => {
+                            if let Some(RenderRow::ToolUse { name, input }) = rows.get(cursor)
+                                && let Some(value) = tool_primary_input(name, input)
+                            {
+                                let _ = copy_to_clipboard(&value);
+                            }
+                        }
+                        _ => {}
+                    }
+                    handler.msg_actions_cursor = next;
+                    if let Some(selected) = handler.msg_actions_cursor {
+                        scroll_row_into_view(
+                            &mut viewport,
+                            &handler,
+                            &rows,
+                            selected,
+                            last_area.width as usize,
+                            transcript_height,
+                        );
+                    }
+                    continue;
+                }
+
                 if let Some((query, match_index)) = history_search.clone() {
                     let find = |query: &str, before: usize| -> Option<usize> {
                         (0..before.min(history.len()))
@@ -2531,6 +2642,29 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         }
                         let _ = terminal.clear();
                     }
+                    // Reference chat:messageActions — shift+up enters the
+                    // transcript cursor when idle.
+                    KeyCode::Up
+                        if key.modifiers.contains(KeyModifiers::SHIFT)
+                            && active_turn.is_none()
+                            && !palette_open
+                            && queued_prompts.is_empty()
+                            && handler.has_content() =>
+                    {
+                        let rows = handler.visible_rows();
+                        if let Some(index) = rows.iter().rposition(navigable_row) {
+                            handler.msg_actions_cursor = Some(index);
+                            viewport.pinned_to_bottom = false;
+                            scroll_row_into_view(
+                                &mut viewport,
+                                &handler,
+                                &rows,
+                                index,
+                                last_area.width as usize,
+                                transcript_height,
+                            );
+                        }
+                    }
                     KeyCode::Up if palette_open => {
                         palette_touched = true;
                         palette_index = palette_index.saturating_sub(1);
@@ -3010,7 +3144,7 @@ fn render_conversation(
 
     let transcript = Paragraph::new(render_rows(
         &handler.visible_rows(),
-        None,
+        handler.msg_actions_cursor,
         &[],
         &handler.expanded_tool_results,
         false,
@@ -3998,6 +4132,7 @@ fn render_hint_line(
     vim_insert: bool,
     background_count: usize,
     status_line: Option<(&str, u16)>,
+    msg_actions: bool,
 ) {
     let mode = ctx.permission_mode();
     let mode_text = permission_mode_label(mode);
@@ -4007,7 +4142,9 @@ fn render_hint_line(
     } else {
         String::new()
     };
-    let left = if awaiting {
+    let left = if msg_actions {
+        "↑/↓ select · enter edit/expand · c copy · esc exit".to_string()
+    } else if awaiting {
         "↑/↓ select · enter confirm · esc deny".to_string()
     } else if let Some(key) = exit_hint {
         format!("Press {key} again to exit")
@@ -4352,16 +4489,16 @@ fn render_rows(
                 RenderRow::Info(text) => vec![info_line(text)],
             };
 
-            // Apply selection/match highlighting
+            // Apply selection/match highlighting — the reference's
+            // messageActionsBackground is a subtle row-wide bg tint.
             if is_selected || is_match {
-                let fg = if is_selected {
-                    pal().accent
-                } else {
-                    Color::Yellow
-                };
                 for line in &mut lines {
                     for span in &mut line.spans {
-                        span.style = span.style.fg(fg);
+                        span.style = if is_selected {
+                            span.style.bg(pal().user_msg_bg).fg(pal().accent)
+                        } else {
+                            span.style.fg(Color::Yellow)
+                        };
                     }
                 }
             }
@@ -4876,7 +5013,28 @@ fn tool_display_name(name: &str) -> &str {
     }
 }
 
-/// Produce the short argument shown inside `ToolName(...)` parens.
+/// The full primary input value a `p` press copies in message-actions mode —
+/// like the reference's PRIMARY_INPUT extraction (untruncated).
+fn tool_primary_input(name: &str, raw_input: &str) -> Option<String> {
+    let input: serde_json::Value = serde_json::from_str(raw_input).ok()?;
+    let get = |keys: &[&str]| -> Option<String> {
+        keys.iter()
+            .find_map(|k| input.get(*k).and_then(|v| v.as_str()))
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    match name {
+        "shell" => get(&["command"]),
+        "read_file" => get(&["path", "file_path"]),
+        "apply_patch" => get(&["patch"]),
+        "Agent" | "Task" => get(&["prompt", "description"]),
+        "TaskCreate" => get(&["subject"]),
+        "TaskGet" | "TaskOutput" | "TaskStop" => get(&["task_id", "taskId", "shell_id"]),
+        "ReadMcpResourceTool" => get(&["uri"]),
+        _ => None,
+    }
+}
+
 fn tool_display_arg(name: &str, raw_input: &str) -> String {
     let input: serde_json::Value =
         serde_json::from_str(raw_input).unwrap_or(serde_json::Value::Null);
@@ -4960,6 +5118,65 @@ fn max_transcript_scroll(handler: &ReplHandler, viewport_height: usize) -> usize
         .visible_lines()
         .len()
         .saturating_sub(viewport_height)
+}
+
+/// Rows the message-actions cursor can land on (the reference's navigable
+/// message types — spacer/status chrome is skipped).
+fn navigable_row(row: &RenderRow) -> bool {
+    !matches!(row, RenderRow::Spacer | RenderRow::ToolStatus(_))
+}
+
+/// Rendered-line offsets of each row — used to keep the message-actions
+/// cursor inside the viewport.
+fn rendered_row_offsets(
+    rows: &[RenderRow],
+    expanded_tools: &std::collections::HashSet<String>,
+    width: usize,
+) -> Vec<(usize, usize)> {
+    let mut offset = 0;
+    rows.iter()
+        .map(|row| {
+            let height = render_rows(
+                std::slice::from_ref(row),
+                None,
+                &[],
+                expanded_tools,
+                false,
+                width,
+            )
+            .len()
+            .max(1);
+            let span = (offset, offset + height);
+            offset += height;
+            span
+        })
+        .collect()
+}
+
+fn scroll_row_into_view(
+    viewport: &mut TranscriptViewport,
+    handler: &ReplHandler,
+    rows: &[RenderRow],
+    index: usize,
+    width: usize,
+    viewport_height: usize,
+) {
+    let offsets = rendered_row_offsets(rows, &handler.expanded_tool_results, width);
+    let Some(&(top, bottom)) = offsets.get(index) else {
+        return;
+    };
+    if top < viewport.scroll_offset {
+        viewport.scroll_offset = top;
+    } else if bottom > viewport.scroll_offset + viewport_height {
+        viewport.scroll_offset = bottom.saturating_sub(viewport_height);
+    }
+    let max_scroll = offsets
+        .last()
+        .map(|&(_, end)| end)
+        .unwrap_or(0)
+        .saturating_sub(viewport_height);
+    viewport.scroll_offset = viewport.scroll_offset.min(max_scroll);
+    viewport.pinned_to_bottom = false;
 }
 
 fn max_scroll_for_lines(line_count: usize, viewport_height: usize) -> usize {
