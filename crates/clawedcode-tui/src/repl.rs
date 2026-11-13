@@ -470,6 +470,8 @@ const BUILTIN_COMMANDS: &[&str] = &[
     "/commit",
     "/review",
     "/security-review",
+    "/plugin",
+    "/reload-plugins",
 ];
 
 /// Reference commands that need platform services (accounts, mobile/desktop
@@ -490,8 +492,6 @@ const UNSUPPORTED_COMMANDS: &[&str] = &[
     "/bridge",
     "/chrome",
     "/ide",
-    "/plugin",
-    "/reload-plugins",
     "/install-github-app",
     "/install-slack-app",
     "/privacy-settings",
@@ -7457,6 +7457,56 @@ PR number: {args}"#
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
+                "/plugin" => {
+                    let plugins = clawedcode_core::compat::discover_plugins(&ctx.session().cwd);
+                    let mut lines = Vec::new();
+                    if plugins.is_empty() {
+                        lines.push("No plugins installed.".to_string());
+                        lines.push(
+                            "Install plugins into ~/.claude/plugins/<name>/ or \
+                             <project>/.claude/plugins/<name>/, or pass \
+                             CLAWEDCODE_PLUGIN_DIR."
+                                .to_string(),
+                        );
+                    } else {
+                        for plugin in &plugins {
+                            let version = plugin
+                                .version
+                                .as_deref()
+                                .map(|v| format!(" v{v}"))
+                                .unwrap_or_default();
+                            lines.push(format!("{}{}", plugin.name, version));
+                            if let Some(desc) = &plugin.description {
+                                lines.push(format!("  {desc}"));
+                            }
+                            let mut components = Vec::new();
+                            if !plugin.command_dirs.is_empty() {
+                                components.push("commands");
+                            }
+                            if !plugin.agent_dirs.is_empty() {
+                                components.push("agents");
+                            }
+                            if !plugin.skill_dirs.is_empty() {
+                                components.push("skills");
+                            }
+                            lines.push(format!(
+                                "  {} — {}",
+                                components.join(", "),
+                                plugin.path.display()
+                            ));
+                        }
+                    }
+                    handler.show_panel("Plugins".to_string(), lines);
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/reload-plugins" => {
+                    let _ = ctx.refresh_compatibility();
+                    let plugins = clawedcode_core::compat::discover_plugins(&ctx.session().cwd);
+                    handler.push_overlay(format!("[info] Reloaded {} plugin(s).", plugins.len()));
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
                 name if UNSUPPORTED_COMMANDS.contains(&name) => {
                     handler.push_overlay(format!(
                         "[info] `{command}` requires platform services not available in this build."
@@ -7829,6 +7879,17 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
             source: CommandSource::Skill,
         });
     }
+
+    entries.push(CommandEntry {
+        name: "/plugin".to_string(),
+        description: "List installed plugins".to_string(),
+        source: CommandSource::BuiltIn,
+    });
+    entries.push(CommandEntry {
+        name: "/reload-plugins".to_string(),
+        description: "Rescan plugin directories".to_string(),
+        source: CommandSource::BuiltIn,
+    });
 
     for name in UNSUPPORTED_COMMANDS {
         entries.push(CommandEntry {

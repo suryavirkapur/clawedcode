@@ -135,6 +135,135 @@ pub fn load_output_style(cwd: &Path) -> Option<String> {
     Some(format!("Output style: {style_name}"))
 }
 
+/// A loaded plugin — the reference's `LoadedPlugin` subset: a directory
+/// containing `.claude-plugin/plugin.json` (or a bare `plugin.json`), or a
+/// directory holding at least one component dir (commands/agents/skills).
+#[derive(Debug, Clone)]
+pub struct Plugin {
+    pub name: String,
+    pub description: Option<String>,
+    pub version: Option<String>,
+    pub path: PathBuf,
+    /// Roots searched as skill commands (`commands/`, manifest `commands`).
+    pub command_dirs: Vec<PathBuf>,
+    /// Roots searched as agents (`agents/`, manifest `agents`).
+    pub agent_dirs: Vec<PathBuf>,
+    /// Roots searched as skills (`skills/`, manifest `skills`).
+    pub skill_dirs: Vec<PathBuf>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PluginManifest {
+    name: Option<String>,
+    description: Option<String>,
+    version: Option<String>,
+    commands: Option<serde_json::Value>,
+    agents: Option<serde_json::Value>,
+    skills: Option<serde_json::Value>,
+}
+
+fn manifest_paths(dir: &Path, value: &Option<serde_json::Value>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    match value {
+        Some(serde_json::Value::String(s)) => out.push(dir.join(s)),
+        Some(serde_json::Value::Array(list)) => {
+            for item in list {
+                if let Some(s) = item.as_str() {
+                    out.push(dir.join(s));
+                }
+            }
+        }
+        Some(serde_json::Value::Object(map)) => {
+            for key in map.keys() {
+                out.push(dir.join(format!("commands/{key}.md")));
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Discover plugins from `~/.claude/plugins/*/`, `<cwd>/.claude/plugins/*/`,
+/// and `CLAWEDCODE_PLUGIN_DIR` paths (the reference's `--plugin-dir` —
+/// session-only inline plugins).
+pub fn discover_plugins(cwd: &Path) -> Vec<Plugin> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(home) = claude_home() {
+        roots.push(home.join("plugins"));
+    }
+    roots.push(cwd.join(".claude").join("plugins"));
+
+    let mut plugin_dirs: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        if let Ok(entries) = fs::read_dir(&root) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    plugin_dirs.push(entry.path());
+                }
+            }
+        }
+    }
+    for extra in std::env::var("CLAWEDCODE_PLUGIN_DIR")
+        .map(|v| v.split(':').map(PathBuf::from).collect::<Vec<PathBuf>>())
+        .unwrap_or_default()
+    {
+        plugin_dirs.push(extra);
+    }
+
+    let mut plugins = Vec::new();
+    for dir in plugin_dirs {
+        let manifest_path = dir.join(".claude-plugin/plugin.json");
+        let manifest_path = if manifest_path.exists() {
+            manifest_path
+        } else {
+            dir.join("plugin.json")
+        };
+        let manifest: PluginManifest = fs::read_to_string(&manifest_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+
+        let has_components = ["commands", "agents", "skills"]
+            .iter()
+            .any(|d| dir.join(d).is_dir())
+            || manifest.commands.is_some()
+            || manifest.agents.is_some()
+            || manifest.skills.is_some();
+        // Require either a manifest or at least one component dir.
+        if !manifest_path.exists() && !has_components {
+            continue;
+        }
+
+        let mut command_dirs = manifest_paths(&dir, &manifest.commands);
+        if dir.join("commands").is_dir() {
+            command_dirs.push(dir.join("commands"));
+        }
+        let mut agent_dirs = manifest_paths(&dir, &manifest.agents);
+        if dir.join("agents").is_dir() {
+            agent_dirs.push(dir.join("agents"));
+        }
+        let mut skill_dirs = manifest_paths(&dir, &manifest.skills);
+        if dir.join("skills").is_dir() {
+            skill_dirs.push(dir.join("skills"));
+        }
+
+        plugins.push(Plugin {
+            name: manifest.name.unwrap_or_else(|| {
+                dir.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "plugin".to_string())
+            }),
+            description: manifest.description,
+            version: manifest.version,
+            path: dir,
+            command_dirs,
+            agent_dirs,
+            skill_dirs,
+        });
+    }
+    plugins
+}
+
 pub fn discover_skills(cwd: &Path) -> Result<Vec<SkillDescriptor>> {
     let mut paths: Vec<(PathBuf, bool)> = Vec::new();
 
@@ -145,6 +274,15 @@ pub fn discover_skills(cwd: &Path) -> Result<Vec<SkillDescriptor>> {
     for ancestor in cwd.ancestors() {
         paths.push((ancestor.join(".claude").join("skills"), false));
         paths.push((ancestor.join(".claude").join("commands"), true));
+    }
+
+    for plugin in discover_plugins(cwd) {
+        for dir in plugin.command_dirs {
+            paths.push((dir, true));
+        }
+        for dir in plugin.skill_dirs {
+            paths.push((dir, false));
+        }
     }
 
     let mut discovered = Vec::new();
@@ -738,6 +876,9 @@ pub fn discover_agents(cwd: &Path) -> Vec<AgentDefinition> {
         dirs.push(home.join("agents"));
     }
     dirs.push(cwd.join(".claude").join("agents"));
+    for plugin in discover_plugins(cwd) {
+        dirs.extend(plugin.agent_dirs);
+    }
 
     let mut by_type: std::collections::BTreeMap<String, AgentDefinition> =
         std::collections::BTreeMap::new();
