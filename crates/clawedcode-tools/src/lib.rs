@@ -609,6 +609,7 @@ pub fn builtin_tool_instances() -> Vec<Box<dyn Tool>> {
         Box::new(AskUserQuestion),
         Box::new(Glob),
         Box::new(Grep),
+        Box::new(NotebookEdit),
     ]
 }
 
@@ -770,6 +771,37 @@ pub fn builtin_tools() -> Vec<ToolSpec> {
                     }
                 },
                 "required": ["url", "prompt"]
+            }),
+        },
+        ToolSpec {
+            name: "NotebookEdit".to_string(),
+            description: "Replace, insert, or delete a cell in a Jupyter notebook (.ipynb)".to_string(),
+            needs_approval: true,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "notebook_path": {
+                        "type": "string",
+                        "description": "Absolute path to the .ipynb file"
+                    },
+                    "cell_id": {
+                        "type": "string",
+                        "description": "Cell id or index; insert places the new cell after it"
+                    },
+                    "new_source": {
+                        "type": "string",
+                        "description": "The new source for the cell"
+                    },
+                    "cell_type": {
+                        "type": "string",
+                        "enum": ["code", "markdown"]
+                    },
+                    "edit_mode": {
+                        "type": "string",
+                        "enum": ["replace", "insert", "delete"]
+                    }
+                },
+                "required": ["notebook_path", "new_source"]
             }),
         },
         ToolSpec {
@@ -1082,6 +1114,146 @@ pub struct Glob;
 
 /// Dedicated content search, like the reference's Grep tool.
 pub struct Grep;
+
+/// Jupyter notebook cell editing, like the reference's NotebookEdit tool.
+pub struct NotebookEdit;
+
+impl Tool for NotebookEdit {
+    fn name(&self) -> &str {
+        "NotebookEdit"
+    }
+    fn description(&self) -> &str {
+        "Replace, insert, or delete a cell in a Jupyter notebook (.ipynb)"
+    }
+    fn needs_approval(&self) -> bool {
+        true
+    }
+    fn execute(&self, input: serde_json::Value, cwd: &Path) -> ToolResult {
+        let Some(path_str) = input.get("notebook_path").and_then(|v| v.as_str()) else {
+            return ToolResult {
+                content: "Missing 'notebook_path' parameter".into(),
+                is_error: true,
+            };
+        };
+        let path = match resolve_under_cwd(cwd, path_str) {
+            Ok(p) => p,
+            Err(err) => {
+                return ToolResult {
+                    content: err,
+                    is_error: true,
+                };
+            }
+        };
+        let mode = input
+            .get("edit_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("replace");
+        let new_source = input
+            .get("new_source")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let cell_type = input.get("cell_type").and_then(|v| v.as_str());
+        let cell_id = input.get("cell_id").and_then(|v| v.as_str());
+
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return ToolResult {
+                content: format!("Failed to read {}", path.display()),
+                is_error: true,
+            };
+        };
+        let Ok(mut nb) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            return ToolResult {
+                content: "Invalid notebook JSON".into(),
+                is_error: true,
+            };
+        };
+        let language = nb
+            .get("metadata")
+            .and_then(|m| m.get("language_info"))
+            .and_then(|l| l.get("name"))
+            .and_then(|n| n.as_str())
+            .unwrap_or("python")
+            .to_string();
+        let Some(cells) = nb.get_mut("cells").and_then(|c| c.as_array_mut()) else {
+            return ToolResult {
+                content: "Notebook has no cells".into(),
+                is_error: true,
+            };
+        };
+        // Cells can be addressed by their `id` field or a numeric index.
+        let index = cell_id.and_then(|id| {
+            cells
+                .iter()
+                .position(|c| c.get("id").and_then(|i| i.as_str()) == Some(id))
+                .or_else(|| id.parse::<usize>().ok().filter(|i| *i < cells.len()))
+        });
+
+        let result = match mode {
+            "insert" => {
+                let Some(ct) = cell_type else {
+                    return ToolResult {
+                        content: "cell_type is required when edit_mode=insert".into(),
+                        is_error: true,
+                    };
+                };
+                let at = index.map(|i| i + 1).unwrap_or(0);
+                let mut cell = serde_json::json!({
+                    "cell_type": ct,
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "metadata": {},
+                    "source": new_source,
+                });
+                if ct == "code" {
+                    cell["outputs"] = serde_json::json!([]);
+                    cell["execution_count"] = serde_json::Value::Null;
+                }
+                cells.insert(at.min(cells.len()), cell);
+                Ok(format!("Inserted {ct} cell at index {at}"))
+            }
+            "delete" => {
+                let Some(i) = index else {
+                    return ToolResult {
+                        content: "Cell not found for delete".into(),
+                        is_error: true,
+                    };
+                };
+                cells.remove(i);
+                Ok(format!("Deleted cell {i}"))
+            }
+            _ => {
+                let Some(i) = index else {
+                    return ToolResult {
+                        content: "Cell not found — provide cell_id".into(),
+                        is_error: true,
+                    };
+                };
+                let cell = &mut cells[i];
+                if let Some(ct) = cell_type {
+                    cell["cell_type"] = serde_json::json!(ct);
+                }
+                cell["source"] = serde_json::json!(new_source);
+                if cell.get("cell_type").and_then(|t| t.as_str()) == Some("code") {
+                    cell["outputs"] = serde_json::json!([]);
+                    cell["execution_count"] = serde_json::Value::Null;
+                }
+                Ok(format!("Replaced cell {i} (language {language})"))
+            }
+        };
+        match result {
+            Ok(msg) => match std::fs::write(&path, serde_json::to_string_pretty(&nb).unwrap()) {
+                Ok(()) => ToolResult {
+                    content: msg,
+                    is_error: false,
+                },
+                Err(e) => ToolResult {
+                    content: format!("Failed to write notebook: {e}"),
+                    is_error: true,
+                },
+            },
+            Err(res) => res,
+        }
+    }
+}
 
 fn glob_match(pattern: &str, path: &str) -> bool {
     // `**` spans directories; `*`/`?` stay within a segment.
