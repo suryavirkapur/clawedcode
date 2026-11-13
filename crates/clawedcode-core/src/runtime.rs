@@ -1297,10 +1297,10 @@ impl Runtime {
                 if tool_name == clawedcode_tools::ASK_USER_QUESTION_TOOL_NAME {
                     return ask_user_question_result(tool_use_id, &input, outcome.feedback);
                 }
-                self.execute_tool_inner(tool_use_id, tool_name, input, session)
+                self.execute_tool_hooked(tool_use_id, tool_name, input, session)
             }
             PermissionDecision::Allow => {
-                self.execute_tool_inner(tool_use_id, tool_name, input, session)
+                self.execute_tool_hooked(tool_use_id, tool_name, input, session)
             }
         }
     }
@@ -1317,6 +1317,63 @@ impl Runtime {
             _ if is_task_store_tool(tool_name) => Some((false, false)),
             _ => None,
         }
+    }
+
+    /// `execute_tool_inner` wrapped in user-configured lifecycle hooks:
+    /// PreToolUse hooks may block, PostToolUse hook stderr is appended to
+    /// the result for the model to see.
+    fn execute_tool_hooked(
+        &self,
+        tool_use_id: &str,
+        tool_name: &str,
+        input: serde_json::Value,
+        session: &mut Session,
+    ) -> ContentBlock {
+        let hooks = crate::hooks::load_hooks(&session.cwd);
+        match crate::hooks::run_pre_tool_hooks(
+            &hooks,
+            &session.id.to_string(),
+            &session.cwd,
+            tool_name,
+            &input,
+        ) {
+            crate::hooks::PreHookOutcome::Block(reason) => {
+                return ContentBlock::tool_error(tool_use_id, reason);
+            }
+            crate::hooks::PreHookOutcome::Warn(warning) => {
+                tracing::warn!("{warning}");
+            }
+            crate::hooks::PreHookOutcome::Allow => {}
+        }
+        let result = self.execute_tool_inner(tool_use_id, tool_name, input.clone(), session);
+        let preview = match &result {
+            ContentBlock::ToolResult { content, .. } => {
+                content.chars().take(2000).collect::<String>()
+            }
+            _ => String::new(),
+        };
+        if let Some(feedback) = crate::hooks::run_post_tool_hooks(
+            &hooks,
+            &session.id.to_string(),
+            &session.cwd,
+            tool_name,
+            &input,
+            &preview,
+        ) {
+            if let ContentBlock::ToolResult {
+                tool_use_id: id,
+                content,
+                is_error,
+            } = result
+            {
+                return ContentBlock::ToolResult {
+                    tool_use_id: id,
+                    content: format!("{content}\n\n[PostToolUse hook]: {feedback}"),
+                    is_error,
+                };
+            }
+        }
+        result
     }
 
     fn execute_tool_inner(

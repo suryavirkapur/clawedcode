@@ -5342,12 +5342,30 @@ fn handle_slash_command(
                     return Ok(true);
                 }
                 "/hooks" => {
-                    // Claude Code lists configured lifecycle hooks here; this
-                    // clone has no hooks subsystem yet, so report honestly.
-                    handler.show_panel(
-                        "Hooks".to_string(),
-                        vec!["No hooks configured.".to_string()],
-                    );
+                    let hooks = clawedcode_core::hooks::load_hooks(&ctx.session().cwd);
+                    let mut lines = Vec::new();
+                    if hooks.disabled {
+                        lines.push("All hooks disabled (disableAllHooks).".to_string());
+                    }
+                    if hooks.hooks.is_empty() {
+                        lines.push("No hooks configured.".to_string());
+                        lines.push(
+                            "Add them under \"hooks\" in .claude/settings.local.json.".to_string(),
+                        );
+                    } else {
+                        let mut events: Vec<String> =
+                            hooks.hooks.iter().map(|h| h.event.clone()).collect();
+                        events.sort();
+                        events.dedup();
+                        for event in events {
+                            lines.push(format!("{event}:"));
+                            for hook in clawedcode_core::hooks::hooks_for_event(&hooks, &event) {
+                                let matcher = hook.matcher.as_deref().unwrap_or("*");
+                                lines.push(format!("  {matcher}: {}", hook.command));
+                            }
+                        }
+                    }
+                    handler.show_panel("Hooks".to_string(), lines);
                     let _ = ctx.save_session();
                     return Ok(true);
                 }

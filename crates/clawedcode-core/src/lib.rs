@@ -2,6 +2,7 @@ pub mod background_task;
 pub mod compat;
 pub mod config;
 pub mod content;
+pub mod hooks;
 pub mod interactive;
 pub mod onboarding;
 pub mod permissions;
