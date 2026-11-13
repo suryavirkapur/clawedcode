@@ -1790,6 +1790,18 @@ impl Runtime {
                 format!("Failed to write {}", path.display()),
             );
         }
+        crate::hooks::run_simple_event_hooks(
+            &crate::hooks::load_hooks(&session.cwd),
+            "ConfigChange",
+            &session.id.to_string(),
+            &session.cwd,
+            serde_json::json!({
+                "source": "project_settings",
+                "file_path": std::path::absolute(&path)
+                    .unwrap_or_else(|_| path.clone())
+                    .to_string_lossy(),
+            }),
+        );
         ContentBlock::tool_result(
             tool_use_id,
             serde_json::to_string_pretty(&serde_json::json!({
@@ -1909,9 +1921,42 @@ impl Runtime {
                     format!("Invalid worktree name: {slug}"),
                 );
             }
+            // Hook-configured worktrees replace git entirely — the hook's
+            // stdout is the worktree path (VCS-agnostic isolation).
+            let hooks = crate::hooks::load_hooks(&session.cwd);
+            if crate::hooks::has_hooks(&hooks, "WorktreeCreate") {
+                let Some(hook_path) = crate::hooks::run_output_hooks(
+                    &hooks,
+                    "WorktreeCreate",
+                    &session.id.to_string(),
+                    &session.cwd,
+                    serde_json::json!({ "name": slug }),
+                ) else {
+                    return ContentBlock::tool_error(
+                        tool_use_id,
+                        "WorktreeCreate hook produced no worktree path".to_string(),
+                    );
+                };
+                session.worktree_origin = Some(session.cwd.clone());
+                session.cwd = PathBuf::from(&hook_path);
+                return ContentBlock::tool_result(
+                    tool_use_id,
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "worktreePath": hook_path,
+                    }))
+                    .unwrap_or_default(),
+                );
+            }
             let root = match run_git(&["rev-parse", "--show-toplevel"], &session.cwd) {
                 Ok(r) => PathBuf::from(r),
-                Err(e) => return ContentBlock::tool_error(tool_use_id, e),
+                Err(e) => {
+                    return ContentBlock::tool_error(
+                        tool_use_id,
+                        format!(
+                            "Cannot create a worktree: {e} and no WorktreeCreate hooks are configured"
+                        ),
+                    );
+                }
             };
             let flat = slug.replace('/', "-");
             let path = root.join(".claude/worktrees").join(&flat);
@@ -1925,6 +1970,7 @@ impl Runtime {
                     format!("Failed to create worktree: {e}"),
                 );
             }
+            session.worktree_origin = Some(session.cwd.clone());
             session.cwd = path.clone();
             ContentBlock::tool_result(
                 tool_use_id,
@@ -1935,32 +1981,50 @@ impl Runtime {
                 .unwrap_or_default(),
             )
         } else {
-            if !in_worktree {
+            if !in_worktree && session.worktree_origin.is_none() {
                 return ContentBlock::tool_error(
                     tool_use_id,
                     "Not in a worktree session".to_string(),
                 );
             }
             let path = session.cwd.clone();
-            let root = match run_git(&["rev-parse", "--show-toplevel"], &path) {
-                Ok(r) => PathBuf::from(r),
-                Err(e) => return ContentBlock::tool_error(tool_use_id, e),
+            // Prefer the recorded pre-worktree cwd; fall back to deriving the
+            // main repo from `.claude/worktrees/<slug>` for older sessions.
+            let main = match session.worktree_origin.take() {
+                Some(origin) => origin,
+                None => {
+                    let root = match run_git(&["rev-parse", "--show-toplevel"], &path) {
+                        Ok(r) => PathBuf::from(r),
+                        Err(e) => return ContentBlock::tool_error(tool_use_id, e),
+                    };
+                    path.ancestors()
+                        .find(|a| a.ends_with("worktrees"))
+                        .and_then(|w| w.parent())
+                        .and_then(|p| p.parent())
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or(root)
+                }
             };
-            // The worktree's toplevel IS the worktree path — main repo is the
-            // parent of .claude/worktrees/<slug>.
-            let main = path
-                .ancestors()
-                .find(|a| a.ends_with("worktrees"))
-                .and_then(|w| w.parent())
-                .and_then(|p| p.parent())
-                .map(|p| p.to_path_buf())
-                .unwrap_or(root);
             session.cwd = main;
-            // Try removing the worktree; dirty worktrees are left in place.
-            let _ = run_git(
-                &["worktree", "remove", &path.to_string_lossy()],
-                &session.cwd,
-            );
+            // Hook-configured worktrees delegate removal to WorktreeRemove;
+            // otherwise try git remove (dirty worktrees are left in place).
+            let hooks = crate::hooks::load_hooks(&session.cwd);
+            if crate::hooks::has_hooks(&hooks, "WorktreeRemove") {
+                crate::hooks::run_simple_event_hooks(
+                    &hooks,
+                    "WorktreeRemove",
+                    &session.id.to_string(),
+                    &session.cwd,
+                    serde_json::json!({
+                        "worktree_path": path.to_string_lossy(),
+                    }),
+                );
+            } else {
+                let _ = run_git(
+                    &["worktree", "remove", &path.to_string_lossy()],
+                    &session.cwd,
+                );
+            }
             ContentBlock::tool_result(
                 tool_use_id,
                 format!("Exited worktree; returned to {}", session.cwd.display()),
@@ -2332,7 +2396,38 @@ impl Runtime {
         };
 
         clawedcode_tools::set_extra_allowed_roots(session.additional_allowed_dirs.clone());
-        finish_tool_result(tool_use_id, tool.execute(input, &session.cwd))
+        let result = tool.execute(input.clone(), &session.cwd);
+        // FileChanged hooks fire on successful file edits like the reference.
+        if tool_name == "apply_patch" && !result.is_error {
+            if let Some(patch) = input.get("patch").and_then(|v| v.as_str()) {
+                let hooks = crate::hooks::load_hooks(&session.cwd);
+                let session_id = session.id.to_string();
+                for line in patch.lines() {
+                    let (event, rest) = if let Some(r) = line.strip_prefix("*** Add File:") {
+                        ("add", r)
+                    } else if let Some(r) = line.strip_prefix("*** Update File:") {
+                        ("change", r)
+                    } else if let Some(r) = line.strip_prefix("*** Delete File:") {
+                        ("unlink", r)
+                    } else {
+                        continue;
+                    };
+                    crate::hooks::run_simple_event_hooks(
+                        &hooks,
+                        "FileChanged",
+                        &session_id,
+                        &session.cwd,
+                        serde_json::json!({
+                            "file_path": std::path::absolute(session.cwd.join(rest.trim()))
+                                .unwrap_or_else(|_| session.cwd.join(rest.trim()))
+                                .to_string_lossy(),
+                            "event": event,
+                        }),
+                    );
+                }
+            }
+        }
+        finish_tool_result(tool_use_id, result)
     }
 }
 

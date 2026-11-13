@@ -52,6 +52,10 @@ pub struct Session {
     /// Extra directories the session's file tools may touch (/add-dir).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub additional_allowed_dirs: Vec<std::path::PathBuf>,
+    /// Cwd the session was in before `EnterWorktree` switched it — restores
+    /// on `ExitWorktree` even for hook-based worktrees outside `.claude/worktrees`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_origin: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -147,6 +151,7 @@ impl Session {
             tag: None,
             prompt_color: None,
             additional_allowed_dirs: Vec::new(),
+            worktree_origin: None,
         }
         .with_default_task_list_id()
     }
@@ -181,6 +186,7 @@ impl Session {
             tag: None,
             prompt_color: None,
             additional_allowed_dirs: Vec::new(),
+            worktree_origin: None,
         }
     }
 
@@ -201,6 +207,7 @@ impl Session {
             tag: None,
             prompt_color: None,
             additional_allowed_dirs: Vec::new(),
+            worktree_origin: None,
         }
         .with_default_task_list_id()
     }
@@ -285,6 +292,7 @@ impl Session {
             tag: None,
             prompt_color: None,
             additional_allowed_dirs: Vec::new(),
+            worktree_origin: None,
         }
     }
 }

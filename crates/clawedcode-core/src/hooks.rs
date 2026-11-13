@@ -615,6 +615,38 @@ pub fn run_simple_event_hooks(
     }
 }
 
+/// Whether any hooks are configured for an event.
+pub fn has_hooks(config: &HooksConfig, event: &str) -> bool {
+    !config.disabled && !hooks_for_event(config, event).is_empty()
+}
+
+/// Run hooks for an event and return the first non-empty stdout. Used by
+/// `WorktreeCreate`, where the hook's output IS the worktree path (the hook
+/// fully replaces the default git backend when configured).
+pub fn run_output_hooks(
+    config: &HooksConfig,
+    event: &str,
+    session_id: &str,
+    cwd: &Path,
+    extra: serde_json::Value,
+) -> Option<String> {
+    if config.disabled {
+        return None;
+    }
+    let stdin = session_hook_input(event, session_id, cwd, extra);
+    for hook in hooks_for_event(config, event) {
+        if let Ok(out) = run_hook_command(&hook.command, cwd, &stdin) {
+            if out.status.success() {
+                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !stdout.is_empty() {
+                    return Some(stdout);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Run `PreCompact` hooks before session compaction — fire-and-forget.
 pub fn run_pre_compact_hooks(config: &HooksConfig, session_id: &str, cwd: &Path) {
     if config.disabled {
