@@ -1009,6 +1009,14 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     let mut undo_stack: Vec<(String, usize)> = Vec::new();
     let mut stashed_input: Option<(String, usize)> = None;
     let mut pasted_images: Vec<std::path::PathBuf> = Vec::new();
+    // `statusLine` — a configured shell command whose stdout replaces the
+    // `? for shortcuts` hint, like the reference's StatusLine component.
+    let status_line = load_status_line(&ctx.session().cwd);
+    let status_line_text: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let mut status_line_rx: Option<std::sync::mpsc::Receiver<Option<String>>> = None;
+    let mut status_line_sig = String::new();
+    let mut status_line_pending_since: Option<std::time::Instant> =
+        Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
     let mut last_approval_id: Option<String> = None;
     let always_allowed: Arc<Mutex<std::collections::HashSet<String>>> =
         Arc::new(Mutex::new(load_always_allowed(&ctx.session().cwd)));
@@ -1036,6 +1044,17 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
             &mut queued_prompts,
             &always_allowed,
         )?;
+        if let Some(spec) = &status_line {
+            tick_status_line(
+                spec,
+                ctx,
+                &handler,
+                &mut status_line_sig,
+                &mut status_line_pending_since,
+                &mut status_line_rx,
+                &status_line_text,
+            );
+        }
 
         // Track spinner timing and reset the approval cursor on each new request.
         match active_turn.is_some() {
@@ -1258,6 +1277,13 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
             let exit_hint_key = exit_hint
                 .filter(|(t, _)| t.elapsed().as_millis() < 1500)
                 .map(|(_, key)| key);
+            let status_line_display = status_line.as_ref().and_then(|spec| {
+                status_line_text
+                    .lock()
+                    .ok()
+                    .and_then(|t| t.clone())
+                    .map(|text| (text, spec.padding))
+            });
             render_hint_line(
                 frame,
                 chunks[6],
@@ -1268,6 +1294,9 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 handler.vim_enabled,
                 handler.vim_insert,
                 background_turns.len(),
+                status_line_display
+                    .as_ref()
+                    .map(|(text, padding)| (text.as_str(), *padding)),
             );
 
             if let Some(panel) = &handler.info_panel {
@@ -3779,6 +3808,7 @@ fn render_hint_line(
     vim_enabled: bool,
     vim_insert: bool,
     background_count: usize,
+    status_line: Option<(&str, u16)>,
 ) {
     let mode = ctx.permission_mode();
     let mode_text = permission_mode_label(mode);
@@ -3794,6 +3824,10 @@ fn render_hint_line(
         format!("Press {key} again to exit")
     } else if let Some(query) = history_search {
         format!("(reverse-i-search)`{query}`:")
+    } else if let Some((text, padding)) = status_line {
+        // Configured statusLine replaces the `?`/mode banner, padded like
+        // the reference's paddingX.
+        format!("{}{}", " ".repeat(padding as usize), text)
     } else if mode != clawedcode_core::permissions::PermissionMode::Default {
         format!("{mode_text} · ? for shortcuts")
     } else {
@@ -3811,6 +3845,8 @@ fn render_hint_line(
 
     let left_style = if history_search.is_some() || exit_hint.is_some() {
         Style::default().fg(pal().permission_fg)
+    } else if status_line.is_some() {
+        Style::default().fg(pal().subtle)
     } else if mode != clawedcode_core::permissions::PermissionMode::Default {
         Style::default().fg(permission_mode_color(mode))
     } else {
@@ -7652,6 +7688,218 @@ fn persist_config_key(section: &str, key: &str, value: Option<&str>) {
         }
     }
     let _ = fs::write(&path, updated.join("\n"));
+}
+
+/// `statusLine` spec from settings — `{"type": "command", command, padding}`.
+struct StatusLineSpec {
+    command: String,
+    padding: u16,
+}
+
+/// Load `statusLine` like the reference settings precedence — first hit in
+/// local, project, then user settings wins. `disableAllHooks` disables it.
+fn load_status_line(cwd: &Path) -> Option<StatusLineSpec> {
+    let mut paths = vec![
+        cwd.join(".claude/settings.local.json"),
+        cwd.join(".claude/settings.json"),
+    ];
+    if let Some(home) = clawedcode_core::compat::claude_home() {
+        paths.push(home.join("settings.json"));
+    }
+    let mut disabled = false;
+    let mut spec = None;
+    for path in paths {
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        if json
+            .get("disableAllHooks")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            disabled = true;
+        }
+        if spec.is_none() {
+            spec = json.get("statusLine").and_then(|v| {
+                if v.get("type").and_then(|t| t.as_str()) != Some("command") {
+                    return None;
+                }
+                let command = v.get("command")?.as_str()?.to_string();
+                if command.trim().is_empty() {
+                    return None;
+                }
+                Some(StatusLineSpec {
+                    command,
+                    padding: v
+                        .get("padding")
+                        .and_then(|p| p.as_u64())
+                        .unwrap_or(0)
+                        .min(32) as u16,
+                })
+            });
+        }
+    }
+    if disabled { None } else { spec }
+}
+
+/// Per-tick statusLine driver: collect finished results, then re-run the
+/// command 300ms after the watched state (mode/model/session/vim) changes —
+/// the reference's debounced `scheduleUpdate`.
+fn tick_status_line(
+    spec: &StatusLineSpec,
+    ctx: &TuiContext,
+    handler: &ReplHandler,
+    sig: &mut String,
+    pending_since: &mut Option<std::time::Instant>,
+    rx: &mut Option<mpsc::Receiver<Option<String>>>,
+    text: &Arc<Mutex<Option<String>>>,
+) {
+    if let Some(receiver) = rx.as_ref() {
+        match receiver.try_recv() {
+            Ok(result) => {
+                if let Ok(mut guard) = text.lock() {
+                    *guard = result;
+                }
+                *rx = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => *rx = None,
+        }
+    }
+
+    let next_sig = format!(
+        "{:?}|{}|{}|{}|{}",
+        ctx.permission_mode(),
+        ctx.model_name(),
+        ctx.session().messages.len(),
+        handler.vim_enabled,
+        handler.vim_insert,
+    );
+    if next_sig != *sig {
+        *sig = next_sig;
+        if pending_since.is_none() {
+            *pending_since = Some(std::time::Instant::now());
+        }
+    }
+    let Some(since) = pending_since else {
+        return;
+    };
+    if since.elapsed() < Duration::from_millis(300) || rx.is_some() {
+        return;
+    }
+    *pending_since = None;
+    let command = spec.command.clone();
+    let input = status_line_input(ctx, handler);
+    let (tx, recv) = mpsc::channel();
+    *rx = Some(recv);
+    thread::spawn(move || {
+        let _ = tx.send(run_status_line_command(&command, &input));
+    });
+}
+
+/// JSON on the command's stdin — a subset of the reference's
+/// `StatusLineCommandInput` covering the fields statusline scripts read.
+fn status_line_input(ctx: &TuiContext, handler: &ReplHandler) -> String {
+    let cwd = ctx.session().cwd.display().to_string();
+    let mut payload = serde_json::json!({
+        "hook_event_name": "Status",
+        "session_id": ctx.session().id.to_string(),
+        "model": {
+            "id": ctx.model_name(),
+            "display_name": ctx.model_name(),
+        },
+        "workspace": {
+            "current_dir": cwd,
+            "project_dir": cwd,
+            "added_dirs": [],
+        },
+        "version": env!("CARGO_PKG_VERSION"),
+        "output_style": {
+            "name": output_style_setting(&ctx.session().cwd)
+                .unwrap_or_else(|| "default".to_string()),
+        },
+        "cost": {
+            "total_duration_ms": 0,
+            "total_cost_usd": 0,
+            "total_lines_added": 0,
+            "total_lines_removed": 0,
+        },
+        "context_window": {
+            "total_input_tokens": handler.total_input_tokens,
+            "total_output_tokens": handler.total_output_tokens,
+            "context_window_size": 0,
+        },
+    });
+    if handler.vim_enabled {
+        payload["vim"] = serde_json::json!({
+            "mode": if handler.vim_insert { "INSERT" } else { "NORMAL" },
+        });
+    }
+    payload.to_string()
+}
+
+/// Run the statusLine command with the JSON payload on stdin. First non-
+/// empty lines of stdout (ANSI stripped) become the status text; failures,
+/// empty output, and >5s commands yield `None`.
+fn run_status_line_command(command: &str, input: &str) -> Option<String> {
+    use std::io::Write;
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(input.as_bytes());
+    }
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    let out = rx
+        .recv_timeout(Duration::from_secs(5))
+        .ok()
+        .and_then(|r| r.ok())?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<String> = text
+        .trim()
+        .lines()
+        .map(|line| strip_ansi_codes(line.trim()))
+        .filter(|line| !line.is_empty())
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// Drop ANSI escape sequences — statusline scripts often embed colors we
+/// flatten to the hint style.
+fn strip_ansi_codes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                chars.next();
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Read the configured `outputStyle` name from the project settings files
