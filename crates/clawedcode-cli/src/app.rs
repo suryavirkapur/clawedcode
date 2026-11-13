@@ -1483,6 +1483,20 @@ fn build_approval_fn(yes: bool) -> ApprovalFn {
 fn apply_cli_config_overrides(config: &mut AppConfig, cli: &Cli) {
     if let Some(model) = &cli.model {
         config.model = model.clone();
+    } else {
+        // settings.json `model` applies when --model isn't given —
+        // later files win like settings precedence.
+        for path in clawedcode_core::hooks::settings_file_paths(&cli.cwd) {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+                continue;
+            };
+            if let Some(model) = json.get("model").and_then(|v| v.as_str()) {
+                config.model = model.to_string();
+            }
+        }
     }
     if let Some(turns) = cli.max_turns {
         config.runtime.max_turns = turns;
@@ -1524,6 +1538,32 @@ fn apply_cli_session_overrides(
     session: &mut Session,
     cli: &Cli,
 ) -> Result<()> {
+    // settings permissions.defaultMode applies when no flag overrides it.
+    if cli.permission_mode.is_none() && !cli.dangerously_skip_permissions {
+        let mode_str = runtime
+            .compatibility()
+            .settings
+            .pointer("/permissions/defaultMode")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                runtime
+                    .compatibility()
+                    .settings
+                    .get("permissionMode")
+                    .and_then(|v| v.as_str())
+            });
+        if let Some(parsed) = mode_str.and_then(|m| {
+            match m.to_ascii_lowercase().as_str() {
+                "default" | "dontask" => Some(PermissionMode::Default),
+                "acceptedits" => Some(PermissionMode::AcceptEdits),
+                "plan" => Some(PermissionMode::Plan),
+                "bypasspermissions" | "bypass" => Some(PermissionMode::Bypass),
+                _ => None,
+            }
+        }) {
+            runtime.set_permission_mode(parsed);
+        }
+    }
     if cli.dangerously_skip_permissions && cli.permission_mode.is_none() {
         runtime.set_permission_mode(PermissionMode::Bypass);
     }

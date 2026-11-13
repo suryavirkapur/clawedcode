@@ -63,7 +63,7 @@ struct HookSpec {
 /// settings precedence).
 /// Settings files in precedence order, honoring `CLAWEDCODE_SETTING_SOURCES`
 /// and `CLAWEDCODE_SETTINGS` — shared by hook and permission-rule loading.
-pub(crate) fn settings_file_paths(cwd: &Path) -> Vec<PathBuf> {
+pub fn settings_file_paths(cwd: &Path) -> Vec<PathBuf> {
     // `--settings <file>` / CLAWEDCODE_SETTINGS: extra settings file merged
     // last like the reference flag.
     let extra = std::env::var_os("CLAWEDCODE_SETTINGS").map(PathBuf::from);

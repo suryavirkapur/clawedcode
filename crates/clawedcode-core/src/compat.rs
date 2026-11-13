@@ -1398,6 +1398,11 @@ fn discover_mcp_servers(cwd: &Path, settings: &Value) -> Result<BTreeMap<String,
         return Ok(servers);
     }
 
+    // .mcp.json entries are project-scope — they activate only when
+    // approved: enableAllProjectMcpServers, or named in
+    // enabledMcpjsonServers (and not in disabledMcpjsonServers), like the
+    // reference's project-server approval flow.
+    let mut project_names: Vec<String> = Vec::new();
     let mut ancestor_paths: Vec<PathBuf> = cwd.ancestors().map(PathBuf::from).collect();
     ancestor_paths.reverse();
     ancestor_paths.pop();
@@ -1410,6 +1415,7 @@ fn discover_mcp_servers(cwd: &Path, settings: &Value) -> Result<BTreeMap<String,
             let value: Value = serde_json::from_str(&raw)
                 .with_context(|| format!("failed to parse {}", mcp_json_path.display()))?;
             if let Some(ancestor_servers) = value.get("mcpServers").and_then(parse_mcp_map) {
+                project_names.extend(ancestor_servers.keys().cloned());
                 servers.extend(ancestor_servers);
             }
         }
@@ -1422,7 +1428,46 @@ fn discover_mcp_servers(cwd: &Path, settings: &Value) -> Result<BTreeMap<String,
         let value: Value = serde_json::from_str(&raw)
             .with_context(|| format!("failed to parse {}", mcp_json_path.display()))?;
         if let Some(project_servers) = value.get("mcpServers").and_then(parse_mcp_map) {
+            project_names.extend(project_servers.keys().cloned());
             servers.extend(project_servers);
+        }
+    }
+
+    if !project_names.is_empty() {
+        // Merge approval keys across settings files (user/project/local
+        // + --settings), like the reference's settings precedence.
+        let mut enabled_all = false;
+        let mut enabled: Vec<String> = Vec::new();
+        let mut disabled: Vec<String> = Vec::new();
+        for path in crate::hooks::settings_file_paths(cwd) {
+            let Ok(raw) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
+            if value
+                .get("enableAllProjectMcpServers")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                enabled_all = true;
+            }
+            for (key, out) in [
+                ("enabledMcpjsonServers", &mut enabled),
+                ("disabledMcpjsonServers", &mut disabled),
+            ] {
+                if let Some(arr) = value.get(key).and_then(|v| v.as_array()) {
+                    out.extend(arr.iter().filter_map(|s| s.as_str()).map(str::to_string));
+                }
+            }
+        }
+        for name in project_names {
+            let approved = (enabled_all || enabled.iter().any(|e| e == &name))
+                && !disabled.iter().any(|d| d == &name);
+            if !approved {
+                servers.remove(&name);
+            }
         }
     }
 
@@ -1682,6 +1727,15 @@ Look for regressions first.
         )
         .unwrap();
 
+        // Project servers need approval — enable all via project settings.
+        let claude_dir = level3.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(
+            claude_dir.join("settings.json"),
+            r#"{"enableAllProjectMcpServers": true}"#,
+        )
+        .unwrap();
+
         let servers = discover_mcp_servers(&level3, &Value::Null).unwrap();
 
         assert_eq!(servers.len(), 3);
@@ -1712,6 +1766,45 @@ Look for regressions first.
     }
 
     #[test]
+    fn discover_mcp_servers_requires_project_approval() {
+        let _guard = crate::test_support::env_lock();
+        let fake_home = std::env::temp_dir().join("clawed_mcp_home_project_approval");
+        std::fs::create_dir_all(&fake_home).unwrap();
+        unsafe {
+            std::env::set_var("HOME", &fake_home);
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+            std::env::remove_var("CLAWEDCODE_MCP_CONFIG");
+            std::env::remove_var("CLAWEDCODE_MCP_CONFIG_STRICT");
+        }
+        let root = temp_dir("mcp_approval");
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join(".mcp.json"),
+            r#"{"mcpServers": {"allowed-one": {"type": "stdio", "command": "echo"}, "blocked-one": {"type": "stdio", "command": "echo"}}}"#,
+        )
+        .unwrap();
+
+        // Unapproved project servers don't load.
+        let servers = discover_mcp_servers(&project, &Value::Null).unwrap();
+        assert!(servers.is_empty());
+
+        // enabledMcpjsonServers approves by name; disabledMcpjsonServers wins.
+        let claude_dir = project.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(
+            claude_dir.join("settings.json"),
+            r#"{"enabledMcpjsonServers": ["allowed-one", "blocked-one"], "disabledMcpjsonServers": ["blocked-one"]}"#,
+        )
+        .unwrap();
+        let servers = discover_mcp_servers(&project, &Value::Null).unwrap();
+        assert_eq!(servers.len(), 1);
+        assert!(servers.contains_key("allowed-one"));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn discover_mcp_servers_settings_base() {
         let _guard = crate::test_support::env_lock();
         let fake_home = std::env::temp_dir().join("clawed_mcp_home_settings_base");
@@ -1729,6 +1822,13 @@ Look for regressions first.
         fs::write(
             project.join(".mcp.json"),
             r#"{"mcpServers": {"from_file": {"type": "stdio", "command": "echo", "args": ["file"]}}}"#,
+        )
+        .unwrap();
+        let claude_dir = project.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(
+            claude_dir.join("settings.json"),
+            r#"{"enableAllProjectMcpServers": true}"#,
         )
         .unwrap();
 
@@ -1766,6 +1866,13 @@ Look for regressions first.
         fs::write(
             child.join(".mcp.json"),
             r#"{"mcpServers": {"server": {"type": "stdio", "command": "child-cmd", "args": []}}}"#,
+        )
+        .unwrap();
+        let claude_dir = child.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(
+            claude_dir.join("settings.json"),
+            r#"{"enableAllProjectMcpServers": true}"#,
         )
         .unwrap();
 
@@ -1973,6 +2080,13 @@ Some more content here.
             fs::write(
                 project.join(".mcp.json"),
                 r#"{"mcpServers": {"project-server": {"type": "stdio", "command": "echo", "args": ["project"]}}}"#,
+            )
+            .unwrap();
+            let project_claude = project.join(".claude");
+            fs::create_dir_all(&project_claude).unwrap();
+            fs::write(
+                project_claude.join("settings.json"),
+                r#"{"enableAllProjectMcpServers": true}"#,
             )
             .unwrap();
 
