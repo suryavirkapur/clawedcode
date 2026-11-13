@@ -6056,8 +6056,15 @@ fn spawn_turn_worker(
         let base = execution_prompt
             .as_deref()
             .unwrap_or(visible_prompt.as_str());
+        // The reference names the session's plan file in the reminder so the
+        // model writes the plan there before ExitPlanMode.
+        let plan_path = clawedcode_core::plans::ensure_plan_file(
+            ctx.session(),
+            &ctx.runtime.compatibility().settings,
+        );
         Some(format!(
-            "<system-reminder>Plan mode is active. The user does not want you to execute yet — do NOT edit files, run mutating commands, or otherwise make changes. Explore the codebase read-only and present a concrete plan for approval.</system-reminder>\n\n{base}"
+            "<system-reminder>Plan mode is active. The user does not want you to execute yet — do NOT edit files, run mutating commands, or otherwise make changes. Explore the codebase read-only, write your concrete plan to {} and call ExitPlanMode to present it for approval.</system-reminder>\n\n{base}",
+            plan_path.display()
         ))
     } else {
         execution_prompt

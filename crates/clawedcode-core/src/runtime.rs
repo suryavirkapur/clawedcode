@@ -642,6 +642,11 @@ impl Runtime {
                 session.additional_allowed_dirs.push(dir);
             }
         }
+        // The plans dir can sit outside cwd (~/.claude/plans) — allow writes.
+        let plans_dir = crate::plans::plans_dir(&session.cwd, &self.compatibility.settings);
+        if !session.additional_allowed_dirs.contains(&plans_dir) {
+            session.additional_allowed_dirs.push(plans_dir);
+        }
         session.push(Role::System, self.effective_system_prompt_body(&session));
         session
     }
@@ -2746,10 +2751,29 @@ impl Runtime {
         }
 
         if tool_name == "ExitPlanMode" {
+            // The reference's contract: the model writes its plan to the
+            // session plan file and ExitPlanMode reads it back — the
+            // `plan` input field is the older/inline variant.
+            let plan_file = crate::plans::ensure_plan_file(session, &self.compatibility.settings);
             let plan = input
                 .get("plan")
                 .and_then(|v| v.as_str())
-                .unwrap_or("(no plan provided)");
+                .map(str::to_string)
+                .or_else(|| std::fs::read_to_string(&plan_file).ok().filter(|t| !t.trim().is_empty()));
+            let Some(plan) = plan else {
+                return ContentBlock::tool_error(
+                    tool_use_id,
+                    format!(
+                        "No plan file found at {}. Please write your plan to this file before calling ExitPlanMode.",
+                        plan_file.display()
+                    ),
+                );
+            };
+            // Persist inline plans into the plan file like the reference's
+            // write-on-exit path.
+            if input.get("plan").is_some() {
+                let _ = std::fs::write(&plan_file, &plan);
+            }
             return ContentBlock::tool_result(
                 tool_use_id,
                 format!("Plan submitted for user approval:\n\n{plan}"),

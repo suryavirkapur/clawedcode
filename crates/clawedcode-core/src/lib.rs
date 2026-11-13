@@ -8,6 +8,7 @@ pub mod interactive;
 pub mod memdir;
 pub mod onboarding;
 pub mod permissions;
+pub mod plans;
 pub mod prompt;
 pub mod runtime;
 pub mod session;
