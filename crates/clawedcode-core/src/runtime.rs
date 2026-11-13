@@ -878,11 +878,53 @@ impl Runtime {
         let mut repeated_tool_signature: Option<String> = None;
         let mut repeated_tool_count = 0usize;
 
+        // UserPromptSubmit hooks: stdout is prepended to the provider-facing
+        // prompt as extra context; a blocking hook ends the turn with the
+        // reason shown to the user.
+        let user_prompt = session
+            .last_user_text()
+            .map(str::to_string)
+            .or_else(|| prompt_override.map(str::to_string))
+            .unwrap_or_default();
+        let hook_configs = crate::hooks::load_hooks(&session.cwd);
+        let mut effective_override: Option<String> = prompt_override.map(str::to_string);
+        match crate::hooks::run_prompt_submit_hooks(
+            &hook_configs,
+            &session.id.to_string(),
+            &session.cwd,
+            &user_prompt,
+        ) {
+            crate::hooks::PromptHookOutcome::Block(reason) => {
+                let text = format!("Blocked by hook: {reason}");
+                session.push(Role::Assistant, &text);
+                on_event(&ApiEvent::MessageDelta { text: text.clone() });
+                on_event(&ApiEvent::Completed);
+                return StreamingRuntimeOutput {
+                    session_id: session.id.to_string(),
+                    system_prompt: self.system_prompt.name.to_string(),
+                    response: text,
+                    thinking: String::new(),
+                    tool_count: self.tools.len(),
+                    skill_count: self.compatibility.skills.len(),
+                    mcp_server_count: self.compatibility.mcp_servers.len(),
+                    tools_executed: 0,
+                    tool_uses: Vec::new(),
+                };
+            }
+            crate::hooks::PromptHookOutcome::Allow(context) if !context.is_empty() => {
+                let context = context.join("\n\n");
+                let base = effective_override.unwrap_or_else(|| user_prompt.clone());
+                effective_override = Some(format!("{context}\n\n{base}"));
+            }
+            _ => {}
+        }
+
         for _turn in 0..self.max_turns() {
             if self.interrupted() {
                 break;
             }
-            let request = self.build_request_with_prompt_override(session, prompt_override);
+            let request =
+                self.build_request_with_prompt_override(session, effective_override.as_deref());
             let stream = self.provider.stream(&request);
 
             let turn_result = self

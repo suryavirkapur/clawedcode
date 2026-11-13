@@ -363,3 +363,57 @@ mod tests {
         assert!(!matcher_matches(Some("Bash"), "read_file"));
     }
 }
+
+pub enum PromptHookOutcome {
+    /// Prompt may proceed; carries hook stdout to append as context.
+    Allow(Vec<String>),
+    /// A hook exited 2; prompt is blocked and the reason shown to the user.
+    Block(String),
+}
+
+/// Run `UserPromptSubmit` hooks. Matchers apply to the prompt text (empty or
+/// `*` matchers always run). Hook stdout is appended to the prompt as extra
+/// context, like the reference's `additionalContext`.
+pub fn run_prompt_submit_hooks(
+    config: &HooksConfig,
+    session_id: &str,
+    cwd: &Path,
+    prompt: &str,
+) -> PromptHookOutcome {
+    if config.disabled {
+        return PromptHookOutcome::Allow(Vec::new());
+    }
+    let mut context = Vec::new();
+    for hook in hooks_for_event(config, "UserPromptSubmit") {
+        if !matcher_matches(hook.matcher.as_deref(), prompt) {
+            continue;
+        }
+        let stdin = serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": prompt,
+            "session_id": session_id,
+            "cwd": cwd.display().to_string(),
+        })
+        .to_string();
+        let Ok(out) = run_hook_command(&hook.command, cwd, &stdin) else {
+            continue;
+        };
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        match out.status.code() {
+            Some(2) => {
+                return PromptHookOutcome::Block(if stderr.is_empty() {
+                    format!("blocked by UserPromptSubmit hook `{}`", hook.command)
+                } else {
+                    stderr
+                });
+            }
+            _ => {
+                if !stdout.is_empty() {
+                    context.push(stdout);
+                }
+            }
+        }
+    }
+    PromptHookOutcome::Allow(context)
+}
