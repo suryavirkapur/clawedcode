@@ -631,6 +631,10 @@ struct ReplHandler {
     /// Reference `chat:messageActions` (shift+up) — index into
     /// `visible_rows()` selecting a transcript row for copy/edit actions.
     msg_actions_cursor: Option<usize>,
+    /// `/copy` picker — selection index into code blocks + "Entire response".
+    copy_picker: Option<usize>,
+    copy_picker_text: String,
+    copy_picker_blocks: Vec<(Option<String>, String)>,
     turn_tokens: u64,
     total_input_tokens: u64,
     total_output_tokens: u64,
@@ -660,6 +664,9 @@ impl ReplHandler {
             vim_insert: true,
             rewind_picker: None,
             msg_actions_cursor: None,
+            copy_picker: None,
+            copy_picker_text: String::new(),
+            copy_picker_blocks: Vec::new(),
             turn_tokens: 0,
             total_input_tokens: 0,
             total_output_tokens: 0,
@@ -1172,6 +1179,10 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 ),
             }
             .max(model_picker_height(handler.model_picker, ctx))
+            .max(copy_picker_height(
+                handler.copy_picker,
+                handler.copy_picker_blocks.len(),
+            ))
             .max(theme_picker_height(handler.theme_picker))
             .max(tasks_picker_height(
                 handler.tasks_picker,
@@ -1261,6 +1272,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 );
             } else if let Some(sel) = handler.model_picker {
                 render_model_picker(frame, chunks[2], sel, ctx);
+            } else if handler.copy_picker.is_some() {
+                render_copy_picker(frame, chunks[2], &handler);
             } else if let Some(sel) = handler.theme_picker {
                 render_theme_picker(frame, chunks[2], sel);
             } else if let Some(sel) = handler.tasks_picker {
@@ -1509,6 +1522,34 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         }
                         KeyCode::Esc => {
                             handler.model_picker = None;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                if let Some(sel) = handler.copy_picker {
+                    let count = handler.copy_picker_blocks.len() + 1;
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            handler.copy_picker = Some(sel.saturating_sub(1));
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            handler.copy_picker = Some((sel + 1).min(count.saturating_sub(1)));
+                        }
+                        KeyCode::Enter => {
+                            let text = if sel < handler.copy_picker_blocks.len() {
+                                handler.copy_picker_blocks[sel].1.clone()
+                            } else {
+                                handler.copy_picker_text.clone()
+                            };
+                            handler.copy_picker = None;
+                            handler.copy_picker_blocks.clear();
+                            handler.push_overlay(copy_or_write_to_file(&text));
+                        }
+                        KeyCode::Esc => {
+                            handler.copy_picker = None;
+                            handler.copy_picker_blocks.clear();
                         }
                         _ => {}
                     }
@@ -6167,6 +6208,55 @@ fn handle_slash_command(
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
+                "/copy" => {
+                    let texts = collect_recent_assistant_texts(ctx.session());
+                    if texts.is_empty() {
+                        handler.push_overlay("[info] No assistant message to copy".to_string());
+                        let _ = ctx.save_session();
+                        return Ok(true);
+                    }
+                    let arg = prompt
+                        .strip_prefix("/copy")
+                        .map(str::trim)
+                        .unwrap_or_default();
+                    let mut age = 0usize;
+                    if !arg.is_empty() {
+                        match arg.parse::<usize>() {
+                            Ok(n) if n >= 1 && n <= texts.len() => age = n - 1,
+                            Ok(_) => {
+                                handler.push_overlay(format!(
+                                    "[info] Only {} assistant {} available to copy",
+                                    texts.len(),
+                                    if texts.len() == 1 {
+                                        "message"
+                                    } else {
+                                        "messages"
+                                    }
+                                ));
+                                let _ = ctx.save_session();
+                                return Ok(true);
+                            }
+                            Err(_) => {
+                                handler.push_overlay(format!(
+                                    "[info] Usage: /copy [N] where N is 1 (latest), 2, 3, … Got: {arg}"
+                                ));
+                                let _ = ctx.save_session();
+                                return Ok(true);
+                            }
+                        }
+                    }
+                    let text = texts[age].clone();
+                    let blocks = extract_code_blocks(&text);
+                    if blocks.is_empty() {
+                        handler.push_overlay(copy_or_write_to_file(&text));
+                    } else {
+                        handler.copy_picker_text = text;
+                        handler.copy_picker_blocks = blocks;
+                        handler.copy_picker = Some(0);
+                    }
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
                 "/version" => {
                     handler.push_overlay(format!(
                         "[info] v{} (ClawedCode)",
@@ -6758,35 +6848,6 @@ PR number: {args}"#
                         handler.push_overlay("[info] No messages to rewind to".to_string());
                     } else {
                         handler.rewind_picker = Some(candidates.len() - 1);
-                    }
-                    let _ = ctx.save_session();
-                    return Ok(true);
-                }
-                "/copy" => {
-                    let which = prompt
-                        .strip_prefix("/copy")
-                        .map(str::trim)
-                        .unwrap_or_default()
-                        .parse::<usize>()
-                        .unwrap_or(1)
-                        .max(1);
-                    let texts: Vec<String> = ctx
-                        .session()
-                        .messages
-                        .iter()
-                        .rev()
-                        .filter(|m| m.role == Role::Assistant)
-                        .filter_map(|m| m.primary_text().map(str::to_string))
-                        .collect();
-                    match texts.get(which - 1) {
-                        Some(text) => match copy_to_clipboard(text) {
-                            Ok(tool) => handler.push_overlay(format!(
-                                "[info] Copied response {which} to clipboard ({tool})"
-                            )),
-                            Err(err) => handler
-                                .push_overlay(format!("[error] Clipboard copy failed: {err}")),
-                        },
-                        None => handler.push_overlay(format!("[info] No response {which} to copy")),
                     }
                     let _ = ctx.save_session();
                     return Ok(true);
@@ -8282,6 +8343,136 @@ fn render_model_picker(frame: &mut Frame, area: Rect, selected: usize, ctx: &Tui
             area.height.saturating_sub(1),
         ),
     );
+}
+
+fn copy_picker_height(picker: Option<usize>, block_count: usize) -> u16 {
+    if picker.is_none() {
+        return 0;
+    }
+    // border + title + blank + blocks + entire-response + footer
+    block_count as u16 + 5
+}
+
+fn render_copy_picker(frame: &mut Frame, area: Rect, handler: &ReplHandler) {
+    if area.height == 0 {
+        return;
+    }
+    let selected = handler.copy_picker.unwrap_or(0);
+    let border_width = area.width.saturating_sub(2) as usize;
+    frame.render_widget(
+        Paragraph::new(format!("╭{}╮", "─".repeat(border_width)))
+            .style(Style::default().fg(pal().accent)),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    let mut lines = vec![
+        Line::from(Span::styled(
+            " Select content to copy:",
+            Style::default().fg(pal().accent),
+        )),
+        Line::from(""),
+    ];
+    let options = handler
+        .copy_picker_blocks
+        .iter()
+        .enumerate()
+        .map(|(index, (lang, code))| {
+            let detail = [lang.clone().unwrap_or_else(|| "code".to_string()), {
+                let n = code.lines().count();
+                format!("{n} line{}", if n == 1 { "" } else { "s" })
+            }]
+            .join(", ");
+            format!("Code block {} ({detail})", index + 1)
+        })
+        .chain(std::iter::once("Entire response".to_string()));
+    for (index, label) in options.enumerate() {
+        let focused = index == selected;
+        let style = if focused {
+            Style::default().fg(pal().accent)
+        } else {
+            Style::default().fg(pal().text)
+        };
+        lines.push(Line::from(Span::styled(
+            format!(" {}{label}", if focused { "❯" } else { " " }),
+            style,
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        " Enter to copy · Esc to cancel",
+        Style::default().fg(pal().dim),
+    )));
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect::new(
+            area.x,
+            area.y + 1,
+            area.width,
+            area.height.saturating_sub(1),
+        ),
+    );
+}
+
+/// Fenced code blocks in an assistant message — `(language, body)` pairs
+/// like the reference's extractCodeBlocks.
+fn extract_code_blocks(text: &str) -> Vec<(Option<String>, String)> {
+    let mut blocks = Vec::new();
+    let mut in_block = false;
+    let mut lang: Option<String> = None;
+    let mut body = String::new();
+    for line in text.lines() {
+        let trimmed = line.trim_end();
+        if !in_block && trimmed.starts_with("```") {
+            in_block = true;
+            let tag = trimmed.trim_start_matches('`').trim();
+            lang = if tag.is_empty() {
+                None
+            } else {
+                Some(tag.to_string())
+            };
+            body.clear();
+        } else if in_block && trimmed.starts_with("```") {
+            in_block = false;
+            blocks.push((lang.take(), body.trim_end_matches('\n').to_string()));
+        } else if in_block {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    blocks
+}
+
+/// Assistant texts newest-first (text-bearing messages only), index 0 =
+/// latest — the reference's collectRecentAssistantTexts.
+fn collect_recent_assistant_texts(session: &Session) -> Vec<String> {
+    session
+        .messages
+        .iter()
+        .rev()
+        .filter(|m| m.role == Role::Assistant)
+        .filter_map(|m| m.primary_text().map(str::to_string))
+        .filter(|t| !t.trim().is_empty())
+        .take(10)
+        .collect()
+}
+
+/// Copy to the clipboard; on failure fall back to a temp file like the
+/// reference's copyOrWriteToFile.
+fn copy_or_write_to_file(text: &str) -> String {
+    match copy_to_clipboard(text) {
+        Ok(_) => "[info] Copied to clipboard".to_string(),
+        Err(_) => {
+            let path = std::env::temp_dir().join(format!(
+                "clawedcode-copy-{}.md",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0)
+            ));
+            match fs::write(&path, text) {
+                Ok(()) => format!("[info] Copied to file: {}", path.display()),
+                Err(err) => format!("[error] Could not copy: {err}"),
+            }
+        }
+    }
 }
 
 fn theme_picker_height(picker: Option<usize>) -> u16 {
