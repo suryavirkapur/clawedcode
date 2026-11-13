@@ -1599,6 +1599,17 @@ fn apply_cli_session_overrides(
     session: &mut Session,
     cli: &Cli,
 ) -> Result<()> {
+    // permissions.disableBypassPermissionsMode: "disable" — the
+    // reference's bypass kill switch.
+    if runtime
+        .compatibility()
+        .settings
+        .pointer("/permissions/disableBypassPermissionsMode")
+        .and_then(|v| v.as_str())
+        == Some("disable")
+    {
+        runtime.set_bypass_permissions_disabled(true);
+    }
     // settings permissions.defaultMode applies when no flag overrides it.
     if cli.permission_mode.is_none() && !cli.dangerously_skip_permissions {
         let mode_str = runtime

@@ -795,7 +795,22 @@ impl Runtime {
     }
 
     pub fn set_permission_mode(&mut self, mode: PermissionMode) {
+        if mode == PermissionMode::Bypass && self.permission_engine.bypass_disabled() {
+            eprintln!(
+                "Cannot set permission mode to bypassPermissions because it is disabled by settings or configuration"
+            );
+        }
         self.permission_engine.set_mode(mode);
+    }
+
+    /// `permissions.disableBypassPermissionsMode` — lock out Bypass for
+    /// the rest of the session.
+    pub fn set_bypass_permissions_disabled(&self, disabled: bool) {
+        self.permission_engine.set_bypass_disabled(disabled);
+    }
+
+    pub fn bypass_permissions_disabled(&self) -> bool {
+        self.permission_engine.bypass_disabled()
     }
 
     /// Apply a hook-provided `updatedPermissions` entry — `session`/`cliArg`

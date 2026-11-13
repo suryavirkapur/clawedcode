@@ -37,12 +37,16 @@ pub struct PermissionEngine {
     /// `Cell` so hook-driven `setMode` permission updates can change the
     /// mode through the `&self` tool-execution path.
     mode: std::cell::Cell<PermissionMode>,
+    /// `permissions.disableBypassPermissionsMode: "disable"` — Bypass can
+    /// never be entered, from flags, settings, hooks, or mode cycling.
+    bypass_disabled: std::cell::Cell<bool>,
 }
 
 impl PermissionEngine {
     pub fn new(mode: PermissionMode) -> Self {
         Self {
             mode: std::cell::Cell::new(mode),
+            bypass_disabled: std::cell::Cell::new(false),
         }
     }
 
@@ -50,8 +54,24 @@ impl PermissionEngine {
         self.mode.get()
     }
 
+    /// Whether bypassPermissions mode is disabled by settings.
+    pub fn bypass_disabled(&self) -> bool {
+        self.bypass_disabled.get()
+    }
+
+    pub fn set_bypass_disabled(&self, disabled: bool) {
+        self.bypass_disabled.set(disabled);
+        // If already in bypass when disabled lands, fall back to default.
+        if disabled && self.mode.get() == PermissionMode::Bypass {
+            self.mode.set(PermissionMode::Default);
+        }
+    }
+
     /// Set the mode — `&self` because hook-driven updates apply mid-call.
     pub fn set_mode(&self, mode: PermissionMode) {
+        if mode == PermissionMode::Bypass && self.bypass_disabled.get() {
+            return;
+        }
         self.mode.set(mode);
     }
 
