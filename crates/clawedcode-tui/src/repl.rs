@@ -6198,6 +6198,9 @@ fn compact_session(session: &mut Session) -> Vec<String> {
         &session.cwd,
         serde_json::json!({}),
     );
+    // Memory caches clear post-compaction in the reference; InstructionsLoaded
+    // re-fires per file with load_reason "compact".
+    clawedcode_core::compat::refire_instructions_loaded(&session.cwd, "compact");
     // The reference re-fires SessionStart with source "compact" after
     // compaction; returned context prefixes the next prompt like /clear.
     clawedcode_core::hooks::run_session_start_hooks(
