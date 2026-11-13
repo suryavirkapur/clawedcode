@@ -136,6 +136,21 @@ pub fn bootstrap(cli: Cli) -> Result<BootstrappedApp> {
     let config = AppConfig::load(cli.config.as_deref())?;
     ensure_default_config_exists(cli.config.as_deref())?;
     let compatibility = compat::discover(&cli.cwd)?;
+    // settings.env applies to the process environment before hooks, MCP
+    // servers, or tools spawn — the reference applies it early in init.
+    if let Some(env_map) = compatibility
+        .settings
+        .get("env")
+        .and_then(|v| v.as_object())
+    {
+        for (key, value) in env_map {
+            if let Some(value) = value.as_str() {
+                unsafe {
+                    std::env::set_var(key, value);
+                }
+            }
+        }
+    }
     let mode = resolve_mode(&cli)?;
     Ok(BootstrappedApp {
         cli,

@@ -1618,6 +1618,31 @@ fn apply_cli_session_overrides(
             session.additional_allowed_dirs.push(abs);
         }
     }
+    // permissions.additionalDirectories from settings joins --add-dir roots.
+    if let Some(dirs) = runtime
+        .compatibility()
+        .settings
+        .pointer("/permissions/additionalDirectories")
+        .and_then(|v| v.as_array())
+    {
+        for dir in dirs.iter().filter_map(|v| v.as_str()) {
+            let expanded = dir.strip_prefix("~/").and_then(|rest| {
+                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(rest))
+            });
+            let path = expanded.unwrap_or_else(|| {
+                let p = std::path::PathBuf::from(dir);
+                if p.is_absolute() {
+                    p
+                } else {
+                    session.cwd.join(p)
+                }
+            });
+            let abs = path.canonicalize().unwrap_or(path);
+            if !session.additional_allowed_dirs.contains(&abs) {
+                session.additional_allowed_dirs.push(abs);
+            }
+        }
+    }
     if let Some(id) = &cli.session_id {
         session.id =
             uuid::Uuid::parse_str(id).with_context(|| format!("invalid --session-id: {id}"))?;
