@@ -1471,7 +1471,152 @@ fn discover_mcp_servers(cwd: &Path, settings: &Value) -> Result<BTreeMap<String,
         }
     }
 
+    // Enterprise policy: deniedMcpServers blocks by name/command/URL;
+    // allowedMcpServers whitelists when present — deny wins over allow.
+    let mut denied: Vec<Value> = Vec::new();
+    let mut allowed: Option<Vec<Value>> = None;
+    for path in crate::hooks::settings_file_paths(cwd) {
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        if let Some(arr) = value.get("deniedMcpServers").and_then(|v| v.as_array()) {
+            denied.extend(arr.iter().cloned());
+        }
+        if let Some(arr) = value.get("allowedMcpServers").and_then(|v| v.as_array()) {
+            allowed.get_or_insert_with(Vec::new).extend(arr.iter().cloned());
+        }
+    }
+    if !denied.is_empty() || allowed.is_some() {
+        servers.retain(|name, cfg| mcp_policy_allows(name, cfg, &denied, allowed.as_deref()));
+    }
+
     Ok(servers)
+}
+
+/// `[command, ...args]` for stdio servers, like the reference's
+/// `getServerCommandArray` — None for remote/sdk servers.
+fn mcp_command_array(config: &McpServerConfig) -> Option<Vec<String>> {
+    match config {
+        McpServerConfig::Stdio { command, args, .. } => {
+            let mut all = vec![command.clone()];
+            all.extend(args.iter().cloned());
+            Some(all)
+        }
+        _ => None,
+    }
+}
+
+/// URL for remote servers — None for stdio/sdk.
+fn mcp_server_url(config: &McpServerConfig) -> Option<&str> {
+    match config {
+        McpServerConfig::Sse { url, .. }
+        | McpServerConfig::Http { url, .. }
+        | McpServerConfig::Ws { url, .. } => Some(url),
+        _ => None,
+    }
+}
+
+/// Wildcard URL match: `*` matches any characters, rest is literal —
+/// the reference's urlPatternToRegex.
+fn url_pattern_matches(url: &str, pattern: &str) -> bool {
+    let mut parts = pattern.split('*');
+    let first = parts.next().unwrap_or("");
+    if !url.starts_with(first) {
+        return false;
+    }
+    let mut rest = &url[first.len()..];
+    for literal in parts {
+        if literal.is_empty() {
+            continue;
+        }
+        match rest.find(literal) {
+            Some(idx) => rest = &rest[idx + literal.len()..],
+            None => return false,
+        }
+    }
+    // A pattern not ending in `*` anchors its final literal to the end.
+    pattern.ends_with('*') || {
+        let final_lit = pattern.rsplit('*').next().unwrap_or("");
+        final_lit.is_empty() || url.ends_with(final_lit)
+    }
+}
+
+/// `allowedMcpServers`/`deniedMcpServers` policy check. Entries are
+/// `{serverName}`, `{serverCommand: [...]}`, or `{serverUrl: glob}`.
+fn mcp_policy_allows(
+    name: &str,
+    config: &McpServerConfig,
+    denied: &[Value],
+    allowed: Option<&[Value]>,
+) -> bool {
+    let command = mcp_command_array(config);
+    let url = mcp_server_url(config);
+
+    for entry in denied {
+        if entry.get("serverName").and_then(|v| v.as_str()) == Some(name) {
+            return false;
+        }
+        if let (Some(entry_cmd), Some(cmd)) = (
+            entry.get("serverCommand").and_then(|v| v.as_array()),
+            command.as_ref(),
+        ) {
+            let entry_cmd: Vec<&str> = entry_cmd.iter().filter_map(|v| v.as_str()).collect();
+            if entry_cmd.len() == cmd.len()
+                && entry_cmd.iter().zip(cmd.iter()).all(|(a, b)| a == b)
+            {
+                return false;
+            }
+        }
+        if let (Some(pattern), Some(url)) = (
+            entry.get("serverUrl").and_then(|v| v.as_str()),
+            url,
+        ) {
+            if url_pattern_matches(url, pattern) {
+                return false;
+            }
+        }
+    }
+
+    let Some(allowed) = allowed else {
+        return true;
+    };
+    if allowed.is_empty() {
+        return false;
+    }
+    let has_command_entries = allowed.iter().any(|e| e.get("serverCommand").is_some());
+    let has_url_entries = allowed.iter().any(|e| e.get("serverUrl").is_some());
+    let name_allowed = allowed
+        .iter()
+        .any(|e| e.get("serverName").and_then(|v| v.as_str()) == Some(name));
+
+    if let Some(cmd) = command.as_ref() {
+        if has_command_entries {
+            return allowed.iter().any(|e| {
+                let Some(entry_cmd) = e.get("serverCommand").and_then(|v| v.as_array()) else {
+                    return false;
+                };
+                let entry_cmd: Vec<&str> =
+                    entry_cmd.iter().filter_map(|v| v.as_str()).collect();
+                entry_cmd.len() == cmd.len()
+                    && entry_cmd.iter().zip(cmd.iter()).all(|(a, b)| a == b)
+            });
+        }
+        return name_allowed;
+    }
+    if let Some(url) = url {
+        if has_url_entries {
+            return allowed.iter().any(|e| {
+                e.get("serverUrl")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|p| url_pattern_matches(url, p))
+            });
+        }
+        return name_allowed;
+    }
+    name_allowed
 }
 
 fn parse_mcp_map(value: &Value) -> Option<BTreeMap<String, McpServerConfig>> {
@@ -1800,6 +1945,69 @@ Look for regressions first.
         let servers = discover_mcp_servers(&project, &Value::Null).unwrap();
         assert_eq!(servers.len(), 1);
         assert!(servers.contains_key("allowed-one"));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn discover_mcp_servers_policy_allow_deny() {
+        let _guard = crate::test_support::env_lock();
+        let fake_home = std::env::temp_dir().join("clawed_mcp_home_policy");
+        std::fs::create_dir_all(&fake_home).unwrap();
+        unsafe {
+            std::env::set_var("HOME", &fake_home);
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+            std::env::remove_var("CLAWEDCODE_MCP_CONFIG");
+            std::env::remove_var("CLAWEDCODE_MCP_CONFIG_STRICT");
+        }
+        let root = temp_dir("mcp_policy");
+        let project = root.join("project");
+        let claude_dir = project.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+
+        let settings = r#"{"mcpServers": {
+            "by-name": {"type": "stdio", "command": "echo"},
+            "by-cmd": {"type": "stdio", "command": "npx", "args": ["srv"]},
+            "by-url": {"type": "http", "url": "https://api.example.com/mcp"},
+            "other-url": {"type": "http", "url": "https://other.org/mcp"}
+        }}"#;
+        let settings: Value = serde_json::from_str(settings).unwrap();
+
+        // deniedMcpServers matches by name, command array, and URL glob.
+        fs::write(
+            claude_dir.join("settings.json"),
+            r#"{"deniedMcpServers": [
+                {"serverName": "by-name"},
+                {"serverCommand": ["npx", "srv"]},
+                {"serverUrl": "https://*.example.com/*"}
+            ]}"#,
+        )
+        .unwrap();
+        let servers = discover_mcp_servers(&project, &settings).unwrap();
+        assert_eq!(servers.len(), 1);
+        assert!(servers.contains_key("other-url"));
+
+        // allowedMcpServers whitelists; deny wins over allow.
+        fs::write(
+            claude_dir.join("settings.json"),
+            r#"{
+                "allowedMcpServers": [{"serverName": "by-name"}, {"serverUrl": "https://*.example.com/*"}],
+                "deniedMcpServers": [{"serverName": "by-name"}]
+            }"#,
+        )
+        .unwrap();
+        let servers = discover_mcp_servers(&project, &settings).unwrap();
+        assert_eq!(servers.len(), 1);
+        assert!(servers.contains_key("by-url"));
+
+        // Empty allowlist blocks everything.
+        fs::write(
+            claude_dir.join("settings.json"),
+            r#"{"allowedMcpServers": []}"#,
+        )
+        .unwrap();
+        let servers = discover_mcp_servers(&project, &settings).unwrap();
+        assert!(servers.is_empty());
 
         fs::remove_dir_all(root).ok();
     }
