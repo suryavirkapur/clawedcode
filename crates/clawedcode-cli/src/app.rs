@@ -654,7 +654,7 @@ fn execute_plugin(cli: &Cli, action: crate::cli::PluginAction) -> Result<()> {
             if available {
                 // Show plugins offered by registered marketplaces that are not
                 // installed yet, like the reference's `--available` listing.
-                if let Ok(doc) = load_known_marketplaces() {
+                if let Ok(doc) = load_known_marketplaces(&cli.cwd) {
                     if let Some(map) = doc.as_object() {
                         for (market, entry) in map {
                             let Ok(manifest) = entry["source"]["path"]
@@ -737,12 +737,45 @@ fn known_marketplaces_path() -> Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("cannot determine ~/.claude path"))
 }
 
-fn load_known_marketplaces() -> Result<serde_json::Value> {
+fn load_known_marketplaces(cwd: &std::path::Path) -> Result<serde_json::Value> {
     let path = known_marketplaces_path()?;
-    Ok(std::fs::read_to_string(&path)
+    let mut doc = std::fs::read_to_string(&path)
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_else(|| serde_json::json!({})))
+        .unwrap_or_else(|| serde_json::json!({}));
+    // settings extraKnownMarketplaces merge in as read-only entries —
+    // a local source's installLocation is the path itself. The stored
+    // registry wins on name conflicts.
+    for settings_path in clawedcode_core::hooks::settings_file_paths(cwd) {
+        let Ok(raw) = std::fs::read_to_string(&settings_path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let Some(extra) = value
+            .get("extraKnownMarketplaces")
+            .and_then(|v| v.as_object())
+        else {
+            continue;
+        };
+        for (name, entry) in extra {
+            if doc.get(name).is_some() {
+                continue;
+            }
+            let mut entry = entry.clone();
+            if entry.get("installLocation").is_none() {
+                if let Some(path) = entry
+                    .pointer("/source/path")
+                    .and_then(|v| v.as_str())
+                {
+                    entry["installLocation"] = serde_json::json!(path);
+                }
+            }
+            doc[name] = entry;
+        }
+    }
+    Ok(doc)
 }
 
 fn save_known_marketplaces(doc: &serde_json::Value) -> Result<()> {
@@ -797,7 +830,7 @@ fn execute_marketplace(cli: &Cli, action: crate::cli::MarketplaceAction) -> Resu
                 .with_context(|| format!("marketplace source '{source}' not found"))?;
             let (manifest_path, manifest, base) = read_marketplace_manifest(&abs)?;
             let name = manifest["name"].as_str().unwrap().to_string();
-            let mut doc = load_known_marketplaces()?;
+            let mut doc = load_known_marketplaces(&cli.cwd)?;
             if doc.get(&name).is_some() {
                 anyhow::bail!("Marketplace '{name}' is already registered");
             }
@@ -816,7 +849,7 @@ fn execute_marketplace(cli: &Cli, action: crate::cli::MarketplaceAction) -> Resu
             println!("Added marketplace '{name}' ({count} plugin(s))");
         }
         MarketplaceAction::List => {
-            let doc = load_known_marketplaces()?;
+            let doc = load_known_marketplaces(&cli.cwd)?;
             let Some(map) = doc.as_object() else {
                 println!("No marketplaces registered.");
                 return Ok(());
@@ -840,7 +873,7 @@ fn execute_marketplace(cli: &Cli, action: crate::cli::MarketplaceAction) -> Resu
             }
         }
         MarketplaceAction::Remove { name } => {
-            let mut doc = load_known_marketplaces()?;
+            let mut doc = load_known_marketplaces(&cli.cwd)?;
             let removed = doc
                 .as_object_mut()
                 .map(|m| m.remove(&name).is_some())
@@ -852,7 +885,7 @@ fn execute_marketplace(cli: &Cli, action: crate::cli::MarketplaceAction) -> Resu
             println!("Removed marketplace '{name}'");
         }
         MarketplaceAction::Update { name } => {
-            let doc = load_known_marketplaces()?;
+            let doc = load_known_marketplaces(&cli.cwd)?;
             let names: Vec<String> = match &name {
                 Some(n) => vec![n.clone()],
                 None => doc.as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default(),
@@ -935,7 +968,7 @@ fn execute_plugin_install(cli: &Cli, spec: &str, scope: &str) -> Result<()> {
     let (plugin_name, market_name) = spec
         .rsplit_once('@')
         .ok_or_else(|| anyhow::anyhow!("expected 'name@marketplace', e.g. plugin install fmt@tools"))?;
-    let doc = load_known_marketplaces()?;
+    let doc = load_known_marketplaces(&cli.cwd)?;
     let entry = doc
         .get(market_name)
         .ok_or_else(|| anyhow::anyhow!("No marketplace named '{market_name}'"))?;
@@ -1012,11 +1045,11 @@ fn execute_plugin_uninstall(cli: &Cli, spec: &str, scope: &str, keep_data: bool)
 
 /// `plugin update name@marketplace` — re-materialize the installed copy from
 /// the marketplace source (a re-copy for local sources).
-fn execute_plugin_update(_cli: &Cli, spec: &str) -> Result<()> {
+fn execute_plugin_update(cli: &Cli, spec: &str) -> Result<()> {
     let (plugin_name, market_name) = spec
         .rsplit_once('@')
         .ok_or_else(|| anyhow::anyhow!("expected 'name@marketplace'"))?;
-    let doc = load_known_marketplaces()?;
+    let doc = load_known_marketplaces(&cli.cwd)?;
     let entry = doc
         .get(market_name)
         .ok_or_else(|| anyhow::anyhow!("No marketplace named '{market_name}'"))?;
