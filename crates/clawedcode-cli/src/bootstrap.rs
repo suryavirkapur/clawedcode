@@ -543,6 +543,10 @@ mod tests {
             prefill: None,
             effort: None,
             max_thinking_tokens: None,
+            init: false,
+            init_only: false,
+            disable_slash_commands: false,
+            replay_user_messages: false,
         }
     }
 
@@ -802,6 +806,10 @@ mod tests {
             prefill: None,
             effort: None,
             max_thinking_tokens: None,
+            init: false,
+            init_only: false,
+            disable_slash_commands: false,
+            replay_user_messages: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Tui));
@@ -850,6 +858,10 @@ mod tests {
             prefill: None,
             effort: None,
             max_thinking_tokens: None,
+            init: false,
+            init_only: false,
+            disable_slash_commands: false,
+            replay_user_messages: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -898,6 +910,10 @@ mod tests {
             prefill: None,
             effort: None,
             max_thinking_tokens: None,
+            init: false,
+            init_only: false,
+            disable_slash_commands: false,
+            replay_user_messages: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));
@@ -949,6 +965,10 @@ mod tests {
             prefill: None,
             effort: None,
             max_thinking_tokens: None,
+            init: false,
+            init_only: false,
+            disable_slash_commands: false,
+            replay_user_messages: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::DirectConnect(_)));
@@ -1000,6 +1020,10 @@ mod tests {
             prefill: None,
             effort: None,
             max_thinking_tokens: None,
+            init: false,
+            init_only: false,
+            disable_slash_commands: false,
+            replay_user_messages: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Ssh(_)));
@@ -1058,6 +1082,10 @@ mod tests {
             prefill: None,
             effort: None,
             max_thinking_tokens: None,
+            init: false,
+            init_only: false,
+            disable_slash_commands: false,
+            replay_user_messages: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -1120,6 +1148,10 @@ mod tests {
             prefill: None,
             effort: None,
             max_thinking_tokens: None,
+            init: false,
+            init_only: false,
+            disable_slash_commands: false,
+            replay_user_messages: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));

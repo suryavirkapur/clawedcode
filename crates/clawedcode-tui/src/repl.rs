@@ -548,6 +548,9 @@ fn command_is_visible(entry: &CommandEntry, install_method: InstallMethod) -> bo
 }
 
 fn skill_is_registerable(skill: &SkillDescriptor) -> bool {
+    if std::env::var_os("CLAWEDCODE_DISABLE_SLASH_COMMANDS").is_some() {
+        return false;
+    }
     if !skill.body.trim().is_empty()
         && is_valid_command_name(&skill.slash_command)
         && !is_reserved_command(&skill.slash_command)

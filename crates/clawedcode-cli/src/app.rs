@@ -170,6 +170,26 @@ pub async fn execute(boot: BootstrappedApp) -> Result<()> {
         return Ok(());
     }
 
+    // `--init`/`--init-only`: fire Setup hooks like the reference; --init-only
+    // exits without a model call.
+    if cli.init || cli.init_only {
+        clawedcode_core::hooks::run_simple_event_hooks(
+            &clawedcode_core::hooks::load_hooks(&cli.cwd),
+            "Setup",
+            "cli",
+            &cli.cwd,
+            serde_json::json!({ "trigger": "init" }),
+        );
+        if cli.init_only {
+            println!("Setup hooks fired for {}", cli.cwd.display());
+            return Ok(());
+        }
+    }
+    if cli.disable_slash_commands {
+        // SAFETY: set before any threads/turn workers spawn in this process.
+        unsafe { std::env::set_var("CLAWEDCODE_DISABLE_SLASH_COMMANDS", "1") };
+    }
+
     // `--rewind-files N`: standalone file restore at a message index, then exit.
     if let Some(msg_index) = cli.rewind_files {
         let sessions_dir =
@@ -227,6 +247,12 @@ pub async fn execute(boot: BootstrappedApp) -> Result<()> {
             }
             if let Some(prompt) = cli.prompt.clone() {
                 ctx.set_startup_prompt(Some(prompt));
+            } else if cli.init {
+                // `--init`: fire Setup hooks (done above) then run the same
+                // CLAUDE.md-generation prompt `/init` submits.
+                ctx.set_startup_prompt(Some(
+                    "Analyze this codebase and create a CLAUDE.md file in the project root. It should document the build and test commands, code layout, conventions, and anything an agent should know to work effectively here.".to_string(),
+                ));
             }
             if let Some(prefill) = cli.prefill.clone() {
                 ctx.set_prefill_input(Some(prefill));
@@ -659,6 +685,7 @@ async fn execute_run(
         } else {
             let output =
                 runtime.submit_with_approval(&mut session, &run_mode.prompt, &*approval_fn);
+            replay_user_message(&cli, &run_mode.prompt);
             println!("{}", serde_json::to_string_pretty(&output)?);
         }
 
@@ -828,6 +855,7 @@ async fn execute_continue(
             let _ = session.save(&path);
         }
 
+        replay_user_message(&cli, &continue_mode.prompt);
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         let show_thinking = continue_mode.show_thinking;
@@ -2091,6 +2119,20 @@ fn session_store_dir(explicit_data_dir: Option<PathBuf>) -> Option<PathBuf> {
         .map(|dir| dir.join("sessions"))
 }
 
+/// `--replay-user-messages`: echo the submitted user message ahead of the
+/// JSON result, like the reference's stream-json replay.
+fn replay_user_message(cli: &Cli, prompt: &str) {
+    if cli.replay_user_messages {
+        println!(
+            "{}",
+            serde_json::json!({
+                "type": "user",
+                "message": { "role": "user", "content": prompt },
+            })
+        );
+    }
+}
+
 /// Session id targeted by `-r <id>` or the `resume <id>` subcommand.
 fn resume_target_id(cli: &Cli) -> Option<String> {
     if let Some(id) = cli.resume.as_deref().filter(|id| !id.is_empty()) {
@@ -3076,6 +3118,10 @@ mod tests {
             prefill: None,
             effort: None,
             max_thinking_tokens: None,
+            init: false,
+            init_only: false,
+            disable_slash_commands: false,
+            replay_user_messages: false,
         }
     }
 

@@ -123,6 +123,18 @@ pub struct Cli {
     /// Explicit thinking budget in tokens (overrides effort-derived budget).
     #[arg(long, global = true)]
     pub max_thinking_tokens: Option<u64>,
+    /// Run the /init flow (Setup hooks + CLAUDE.md generation) at startup.
+    #[arg(long, global = true)]
+    pub init: bool,
+    /// Fire Setup hooks for this project and exit without a model call.
+    #[arg(long, global = true)]
+    pub init_only: bool,
+    /// Disable .claude skills registering as slash commands.
+    #[arg(long, global = true)]
+    pub disable_slash_commands: bool,
+    /// Echo user messages back in JSON output modes.
+    #[arg(long, global = true)]
+    pub replay_user_messages: bool,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -384,6 +396,10 @@ mod tests {
             prefill: None,
             effort: None,
             max_thinking_tokens: None,
+            init: false,
+            init_only: false,
+            disable_slash_commands: false,
+            replay_user_messages: false,
         }
     }
 
@@ -435,6 +451,10 @@ mod tests {
             prefill: None,
             effort: None,
             max_thinking_tokens: None,
+            init: false,
+            init_only: false,
+            disable_slash_commands: false,
+            replay_user_messages: false,
         }
     }
 
