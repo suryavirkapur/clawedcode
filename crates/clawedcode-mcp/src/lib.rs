@@ -348,7 +348,7 @@ impl McpStdioClient {
 
         // Byte-wise reads gated on poll(): a server that emits a partial line
         // or partial body then stalls cannot wedge the blocking read.
-        let mut read_byte = |stdout: &mut BufReader<ChildStdout>| -> Result<u8, String> {
+        let read_byte = |stdout: &mut BufReader<ChildStdout>| -> Result<u8, String> {
             loop {
                 if let Some(buf) = stdout.buffer().first() {
                     let b = *buf;

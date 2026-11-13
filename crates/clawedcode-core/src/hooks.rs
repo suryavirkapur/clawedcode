@@ -224,13 +224,42 @@ fn simple_pattern_match(pattern: &str, text: &str) -> bool {
     true
 }
 
+#[derive(Debug)]
 pub enum PreHookOutcome {
-    /// No hook blocked the tool call.
+    /// No hook blocked the tool call; normal permission flow applies.
     Allow,
+    /// `permissionDecision: "allow"` — skip the permission prompt.
+    Approve,
+    /// `permissionDecision: "ask"` — force the permission prompt.
+    ForceAsk,
     /// A hook exited with code 2; carries the reason shown to the model.
     Block(String),
     /// A hook exited non-zero (non-blocking); carries a warning.
     Warn(String),
+}
+
+/// Result of `PreToolUse` hooks, matching the reference's JSON contract:
+/// `permissionDecision`, `updatedInput`, `additionalContext`, `systemMessage`.
+#[derive(Debug)]
+pub struct PreToolHookResult {
+    pub outcome: PreHookOutcome,
+    /// `hookSpecificOutput.updatedInput` — replaces the tool input entirely.
+    pub updated_input: Option<serde_json::Value>,
+    /// `hookSpecificOutput.additionalContext` — appended to the tool result.
+    pub additional_context: Option<String>,
+    /// `systemMessage` — surfaced to the user.
+    pub system_message: Option<String>,
+}
+
+impl PreToolHookResult {
+    fn allow() -> Self {
+        Self {
+            outcome: PreHookOutcome::Allow,
+            updated_input: None,
+            additional_context: None,
+            system_message: None,
+        }
+    }
 }
 
 fn hook_input_json(
@@ -324,10 +353,11 @@ pub fn run_pre_tool_hooks(
     cwd: &Path,
     tool_name: &str,
     input: &serde_json::Value,
-) -> PreHookOutcome {
+) -> PreToolHookResult {
     if config.disabled {
-        return PreHookOutcome::Allow;
+        return PreToolHookResult::allow();
     }
+    let mut result = PreToolHookResult::allow();
     let mut warning = None;
     for hook in hooks_for_event(config, "PreToolUse") {
         if !matcher_matches(hook.matcher.as_deref(), tool_name) {
@@ -342,21 +372,58 @@ pub fn run_pre_tool_hooks(
         if let Ok(json) =
             serde_json::from_str::<serde_json::Value>(String::from_utf8_lossy(&out.stdout).trim())
         {
-            let decision = json
-                .get("hookSpecificOutput")
-                .and_then(|o| o.get("permissionDecision"))
-                .and_then(|d| d.as_str());
-            match decision {
-                Some("deny") => {
-                    let reason = json
-                        .get("reason")
-                        .and_then(|r| r.as_str())
-                        .filter(|r| !r.trim().is_empty())
-                        .map(str::to_string)
-                        .unwrap_or_else(|| format!("Blocked by hook `{}`", hook.command));
-                    return PreHookOutcome::Block(reason);
+            let reason_of = |j: &serde_json::Value| {
+                j.get("hookSpecificOutput")
+                    .and_then(|o| o.get("permissionDecisionReason"))
+                    .and_then(|r| r.as_str())
+                    .filter(|r| !r.trim().is_empty())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        j.get("reason")
+                            .and_then(|r| r.as_str())
+                            .filter(|r| !r.trim().is_empty())
+                            .map(str::to_string)
+                    })
+            };
+            if let Some(msg) = json
+                .get("systemMessage")
+                .and_then(|m| m.as_str())
+                .filter(|m| !m.trim().is_empty())
+            {
+                result.system_message = Some(msg.to_string());
+            }
+            if let Some(hso) = json.get("hookSpecificOutput") {
+                match hso.get("permissionDecision").and_then(|d| d.as_str()) {
+                    Some("deny") => {
+                        result.outcome = PreHookOutcome::Block(reason_of(&json).unwrap_or_else(
+                            || format!("Blocked by hook `{}`", hook.command),
+                        ));
+                        return result;
+                    }
+                    Some("allow") => result.outcome = PreHookOutcome::Approve,
+                    Some("ask") => result.outcome = PreHookOutcome::ForceAsk,
+                    _ => {}
                 }
-                Some("allow") | Some("ask") => continue,
+                if let Some(ui) = hso.get("updatedInput") {
+                    result.updated_input = Some(ui.clone());
+                }
+                if let Some(ctx) = hso
+                    .get("additionalContext")
+                    .and_then(|c| c.as_str())
+                    .filter(|c| !c.trim().is_empty())
+                {
+                    result.additional_context = Some(ctx.to_string());
+                }
+            }
+            // Legacy top-level decision: "approve" | "block".
+            match json.get("decision").and_then(|d| d.as_str()) {
+                Some("block") => {
+                    result.outcome = PreHookOutcome::Block(reason_of(&json).unwrap_or_else(
+                        || format!("Blocked by hook `{}`", hook.command),
+                    ));
+                    return result;
+                }
+                Some("approve") => result.outcome = PreHookOutcome::Approve,
                 _ => {}
             }
             if json.get("continue").and_then(|v| v.as_bool()) == Some(false) {
@@ -365,8 +432,10 @@ pub fn run_pre_tool_hooks(
                     .and_then(|r| r.as_str())
                     .filter(|r| !r.trim().is_empty())
                     .map(str::to_string)
+                    .or_else(|| reason_of(&json))
                     .unwrap_or_else(|| format!("Stopped by hook `{}`", hook.command));
-                return PreHookOutcome::Block(reason);
+                result.outcome = PreHookOutcome::Block(reason);
+                return result;
             }
         }
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
@@ -378,7 +447,8 @@ pub fn run_pre_tool_hooks(
                 } else {
                     stderr
                 };
-                return PreHookOutcome::Block(reason);
+                result.outcome = PreHookOutcome::Block(reason);
+                return result;
             }
             _ => {
                 if !stderr.is_empty() && warning.is_none() {
@@ -392,10 +462,10 @@ pub fn run_pre_tool_hooks(
             }
         }
     }
-    match warning {
-        Some(w) => PreHookOutcome::Warn(w),
-        None => PreHookOutcome::Allow,
+    if let Some(w) = warning {
+        result.outcome = PreHookOutcome::Warn(w);
     }
+    result
 }
 
 /// Run `PostToolUse` hooks. Exit 2 appends stderr to the tool result (the
@@ -429,6 +499,26 @@ pub fn run_post_tool_hooks(
             continue;
         };
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
+            if let Some(ctx) = json
+                .get("hookSpecificOutput")
+                .and_then(|o| o.get("additionalContext"))
+                .and_then(|c| c.as_str())
+                .filter(|c| !c.trim().is_empty())
+            {
+                feedback.push(ctx.to_string());
+            }
+            if json.get("decision").and_then(|d| d.as_str()) == Some("block") {
+                feedback.push(
+                    json.get("reason")
+                        .and_then(|r| r.as_str())
+                        .filter(|r| !r.trim().is_empty())
+                        .unwrap_or("Blocked by hook")
+                        .to_string(),
+                );
+            }
+        }
         if out.status.code() == Some(2) && !stderr.is_empty() {
             feedback.push(stderr);
         }
@@ -481,6 +571,17 @@ pub fn run_session_start_hooks(
             continue;
         };
         let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
+            if let Some(ctx) = json
+                .get("hookSpecificOutput")
+                .and_then(|o| o.get("additionalContext"))
+                .and_then(|c| c.as_str())
+                .filter(|c| !c.trim().is_empty())
+            {
+                context.push(ctx.to_string());
+                continue;
+            }
+        }
         if !stdout.is_empty() {
             context.push(stdout);
         }
@@ -759,12 +860,16 @@ mod tests {
         ).unwrap();
         let config = load_hooks(&dir);
         assert_eq!(config.hooks.len(), 1);
-        match run_pre_tool_hooks(&config, "s", &dir, "apply_patch", &serde_json::json!({})) {
+        match run_pre_tool_hooks(&config, "s", &dir, "apply_patch", &serde_json::json!({}))
+            .outcome
+        {
             PreHookOutcome::Block(r) => assert!(r.contains("nope"), "{r}"),
             _ => panic!("expected block"),
         }
         // Non-matching tool passes through.
-        match run_pre_tool_hooks(&config, "s", &dir, "read_file", &serde_json::json!({})) {
+        match run_pre_tool_hooks(&config, "s", &dir, "read_file", &serde_json::json!({}))
+            .outcome
+        {
             PreHookOutcome::Allow => {}
             _ => panic!("expected allow"),
         }
@@ -826,6 +931,17 @@ pub fn run_prompt_submit_hooks(
                 });
             }
             _ => {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
+                    if let Some(ctx) = json
+                        .get("hookSpecificOutput")
+                        .and_then(|o| o.get("additionalContext"))
+                        .and_then(|c| c.as_str())
+                        .filter(|c| !c.trim().is_empty())
+                    {
+                        context.push(ctx.to_string());
+                        continue;
+                    }
+                }
                 if !stdout.is_empty() {
                     context.push(stdout);
                 }

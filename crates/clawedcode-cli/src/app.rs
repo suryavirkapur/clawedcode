@@ -992,7 +992,7 @@ fn execute_plugin_uninstall(cli: &Cli, spec: &str, scope: &str, keep_data: bool)
 
 /// `plugin update name@marketplace` — re-materialize the installed copy from
 /// the marketplace source (a re-copy for local sources).
-fn execute_plugin_update(cli: &Cli, spec: &str) -> Result<()> {
+fn execute_plugin_update(_cli: &Cli, spec: &str) -> Result<()> {
     let (plugin_name, market_name) = spec
         .rsplit_once('@')
         .ok_or_else(|| anyhow::anyhow!("expected 'name@marketplace'"))?;

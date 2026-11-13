@@ -2240,7 +2240,38 @@ impl Runtime {
             return ContentBlock::tool_error(tool_use_id, format!("Unknown tool: {tool_name}"));
         };
 
-        let decision = self.permission_engine.decide(needs_approval, write_like);
+        // PreToolUse hooks run before permission evaluation, like the
+        // reference — their permissionDecision can bypass or force the prompt.
+        let hooks = crate::hooks::load_hooks(&session.cwd);
+        let pre = crate::hooks::run_pre_tool_hooks(
+            &hooks,
+            &session.id.to_string(),
+            &session.cwd,
+            tool_name,
+            &input,
+        );
+        let decision_override = match &pre.outcome {
+            crate::hooks::PreHookOutcome::Block(reason) => {
+                return ContentBlock::tool_error(tool_use_id, reason.clone());
+            }
+            crate::hooks::PreHookOutcome::Warn(warning) => {
+                tracing::warn!("{warning}");
+                None
+            }
+            crate::hooks::PreHookOutcome::Approve => Some(PermissionDecision::Allow),
+            crate::hooks::PreHookOutcome::ForceAsk => Some(PermissionDecision::Ask),
+            crate::hooks::PreHookOutcome::Allow => None,
+        };
+        if let Some(msg) = &pre.system_message {
+            tracing::info!("PreToolUse systemMessage: {msg}");
+        }
+        let input = pre.updated_input.unwrap_or(input);
+        let pre_context = pre.additional_context;
+
+        let decision = match decision_override {
+            Some(d) => d,
+            None => self.permission_engine.decide(needs_approval, write_like),
+        };
 
         match decision {
             PermissionDecision::Deny => {
@@ -2269,7 +2300,7 @@ impl Runtime {
                     &input,
                 ) {
                     Some(crate::hooks::PermissionHookDecision::Allow) => {
-                        return self.execute_tool_hooked(tool_use_id, tool_name, input, session);
+                        return self.execute_tool_hooked(tool_use_id, tool_name, input, session, &pre_context);
                     }
                     Some(crate::hooks::PermissionHookDecision::Deny) => {
                         let reason = format!("Tool '{tool_name}' denied by PermissionRequest hook");
@@ -2310,10 +2341,10 @@ impl Runtime {
                 if tool_name == clawedcode_tools::ASK_USER_QUESTION_TOOL_NAME {
                     return ask_user_question_result(tool_use_id, &input, outcome.feedback);
                 }
-                self.execute_tool_hooked(tool_use_id, tool_name, input, session)
+                self.execute_tool_hooked(tool_use_id, tool_name, input, session, &pre_context)
             }
             PermissionDecision::Allow => {
-                self.execute_tool_hooked(tool_use_id, tool_name, input, session)
+                self.execute_tool_hooked(tool_use_id, tool_name, input, session, &pre_context)
             }
         }
     }
@@ -2344,24 +2375,15 @@ impl Runtime {
         tool_name: &str,
         input: serde_json::Value,
         session: &mut Session,
+        pre_context: &Option<String>,
     ) -> ContentBlock {
         let hooks = crate::hooks::load_hooks(&session.cwd);
-        match crate::hooks::run_pre_tool_hooks(
-            &hooks,
-            &session.id.to_string(),
-            &session.cwd,
-            tool_name,
-            &input,
-        ) {
-            crate::hooks::PreHookOutcome::Block(reason) => {
-                return ContentBlock::tool_error(tool_use_id, reason);
+        let mut result = self.execute_tool_inner(tool_use_id, tool_name, input.clone(), session);
+        if let Some(ctx) = pre_context {
+            if let ContentBlock::ToolResult { content, .. } = &mut result {
+                *content = format!("{content}\n\n[PreToolUse hook]: {ctx}");
             }
-            crate::hooks::PreHookOutcome::Warn(warning) => {
-                tracing::warn!("{warning}");
-            }
-            crate::hooks::PreHookOutcome::Allow => {}
         }
-        let result = self.execute_tool_inner(tool_use_id, tool_name, input.clone(), session);
         let preview = match &result {
             ContentBlock::ToolResult { content, .. } => {
                 content.chars().take(2000).collect::<String>()
