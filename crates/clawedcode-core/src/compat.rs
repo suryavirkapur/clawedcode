@@ -1038,7 +1038,10 @@ pub fn discover_agents(cwd: &Path) -> Vec<AgentDefinition> {
                             .get("model")
                             .and_then(|v| v.as_str())
                             .map(str::to_string),
-                        permission_mode: None,
+                        permission_mode: def
+                            .get("permissionMode")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
                         max_turns: def
                             .get("maxTurns")
                             .and_then(|v| v.as_u64())

@@ -67,25 +67,28 @@ pub fn load_hooks(cwd: &Path) -> HooksConfig {
     // last like the reference flag.
     let extra = std::env::var_os("CLAWEDCODE_SETTINGS").map(PathBuf::from);
     // `--setting-sources <list>` (CLAWEDCODE_SETTING_SOURCES): only load the
-    // listed sources — "project" is settings.json, "local" is
-    // settings.local.json, "user" is a hypothetical ~/.claude source.
+    // listed sources — "project" is .claude/settings.json, "local" is
+    // settings.local.json, "user" is ~/.claude/settings.json.
     let sources: Option<Vec<String>> = std::env::var("CLAWEDCODE_SETTING_SOURCES")
         .ok()
         .map(|raw| raw.split(',').map(|s| s.trim().to_string()).collect());
-    let mut paths: Vec<PathBuf> = Vec::new();
-    let source_for = |name: &str| match name {
-        "settings.json" => "project",
-        "settings.local.json" => "local",
-        _ => "project",
-    };
-    for name in ["settings.json", "settings.local.json"] {
-        if sources
+    let wants = |source: &str| {
+        sources
             .as_ref()
-            .map(|s| s.iter().any(|x| x == source_for(name)))
+            .map(|s| s.iter().any(|x| x == source))
             .unwrap_or(true)
-        {
-            paths.push(cwd.join(".claude").join(name));
+    };
+    let mut paths: Vec<PathBuf> = Vec::new();
+    if wants("user") {
+        if let Some(home) = crate::compat::claude_home() {
+            paths.push(home.join("settings.json"));
         }
+    }
+    if wants("project") {
+        paths.push(cwd.join(".claude").join("settings.json"));
+    }
+    if wants("local") {
+        paths.push(cwd.join(".claude").join("settings.local.json"));
     }
     paths.extend(extra);
     for path in paths {
