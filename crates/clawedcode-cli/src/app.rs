@@ -450,6 +450,9 @@ async fn execute_continue(
         find_latest_session(&sessions_dir).context("no sessions found to continue")?;
 
     let mut session = latest_session;
+    if worktree_origin.is_some() {
+        session.worktree_origin = worktree_origin.clone();
+    }
 
     let mut runtime = Runtime::with_mode(
         config,
@@ -2674,6 +2677,9 @@ mod tests {
             remote: None,
             direct_connect: None,
             ssh: None,
+            worktree: None,
+            agent: None,
+            fork_session: false,
         }
     }
 
@@ -2702,6 +2708,8 @@ mod tests {
                 show_thinking: false,
                 yes: true,
             },
+            None,
+            None,
         ));
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);

@@ -419,6 +419,9 @@ mod tests {
             remote: None,
             direct_connect: None,
             ssh: None,
+            worktree: None,
+            agent: None,
+            fork_session: false,
         }
     }
 
@@ -646,6 +649,9 @@ mod tests {
             remote: None,
             direct_connect: None,
             ssh: None,
+            worktree: None,
+            agent: None,
+            fork_session: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Tui));
@@ -662,6 +668,9 @@ mod tests {
             remote: None,
             direct_connect: None,
             ssh: None,
+            worktree: None,
+            agent: None,
+            fork_session: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -678,6 +687,9 @@ mod tests {
             remote: Some("remote.example.com".to_string()),
             direct_connect: None,
             ssh: None,
+            worktree: None,
+            agent: None,
+            fork_session: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));
@@ -697,6 +709,9 @@ mod tests {
             remote: None,
             direct_connect: Some("localhost:9000".to_string()),
             ssh: None,
+            worktree: None,
+            agent: None,
+            fork_session: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::DirectConnect(_)));
@@ -716,6 +731,9 @@ mod tests {
             remote: None,
             direct_connect: None,
             ssh: Some("user@server".to_string()),
+            worktree: None,
+            agent: None,
+            fork_session: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Ssh(_)));
@@ -742,6 +760,9 @@ mod tests {
             remote: None,
             direct_connect: None,
             ssh: None,
+            worktree: None,
+            agent: None,
+            fork_session: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -772,6 +793,9 @@ mod tests {
             remote: Some("remote.example.com".to_string()),
             direct_connect: None,
             ssh: None,
+            worktree: None,
+            agent: None,
+            fork_session: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));

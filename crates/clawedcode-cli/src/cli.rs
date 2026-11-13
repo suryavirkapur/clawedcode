@@ -212,6 +212,9 @@ mod tests {
             remote: None,
             direct_connect: None,
             ssh: None,
+            worktree: None,
+            agent: None,
+            fork_session: false,
         }
     }
 
@@ -231,6 +234,9 @@ mod tests {
             remote,
             direct_connect,
             ssh,
+            worktree: None,
+            agent: None,
+            fork_session: false,
         }
     }
 
