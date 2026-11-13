@@ -110,7 +110,20 @@ pub async fn run(cli: Cli) -> Result<()> {
         unsafe { std::env::set_var("CLAWEDCODE_MCP_CONFIG_STRICT", "1") };
     }
     if let Some(path) = &cli.settings {
-        unsafe { std::env::set_var("CLAWEDCODE_SETTINGS", path) };
+        // The reference's `--settings <file-or-json>` accepts inline JSON —
+        // write it to a temp file and point the settings override there.
+        let raw = path.to_string_lossy();
+        if raw.trim_start().starts_with('{') {
+            serde_json::from_str::<serde_json::Value>(&raw)
+                .context("invalid JSON passed to --settings")?;
+            let tmp = std::env::temp_dir()
+                .join(format!("clawedcode-settings-{}.json", std::process::id()));
+            std::fs::write(&tmp, raw.as_bytes())
+                .context("failed to write --settings JSON to temp file")?;
+            unsafe { std::env::set_var("CLAWEDCODE_SETTINGS", &tmp) };
+        } else {
+            unsafe { std::env::set_var("CLAWEDCODE_SETTINGS", path) };
+        }
     }
     let boot = bootstrap(cli)?;
     execute(boot).await
@@ -170,17 +183,30 @@ pub async fn execute(boot: BootstrappedApp) -> Result<()> {
         return Ok(());
     }
 
-    // `--init`/`--init-only`: fire Setup hooks like the reference; --init-only
-    // exits without a model call.
-    if cli.init || cli.init_only {
+    // `--init`/`--init-only`/`--maintenance`: fire Setup hooks like the
+    // reference; --init-only also fires SessionStart:startup and exits.
+    if cli.init || cli.init_only || cli.maintenance {
+        let trigger = if cli.maintenance {
+            "maintenance"
+        } else {
+            "init"
+        };
+        let hooks = clawedcode_core::hooks::load_hooks(&cli.cwd);
         clawedcode_core::hooks::run_simple_event_hooks(
-            &clawedcode_core::hooks::load_hooks(&cli.cwd),
+            &hooks,
             "Setup",
             "cli",
             &cli.cwd,
-            serde_json::json!({ "trigger": "init" }),
+            serde_json::json!({ "trigger": trigger }),
         );
         if cli.init_only {
+            clawedcode_core::hooks::run_simple_event_hooks(
+                &hooks,
+                "SessionStart",
+                "cli",
+                &cli.cwd,
+                serde_json::json!({ "trigger": "startup" }),
+            );
             println!("Setup hooks fired for {}", cli.cwd.display());
             return Ok(());
         }
@@ -337,6 +363,23 @@ pub async fn execute(boot: BootstrappedApp) -> Result<()> {
         ExecutionMode::Mcp(action) => execute_mcp(&cli, &compatibility, action),
         ExecutionMode::Doctor => execute_doctor(&cli, &config, &compatibility),
         ExecutionMode::Plugin(action) => execute_plugin(&cli, action),
+        ExecutionMode::Agents => {
+            let agents = compat::discover_agents(&cli.cwd);
+            if agents.is_empty() {
+                println!("No agents configured.");
+            } else {
+                for agent in agents {
+                    let model = agent.model.unwrap_or_default();
+                    let model = if model.is_empty() {
+                        "default".to_string()
+                    } else {
+                        model
+                    };
+                    println!("{} · {}", agent.agent_type, model);
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -560,6 +603,20 @@ fn apply_cli_config_overrides(config: &mut AppConfig, cli: &Cli) {
     }
     if let Some(budget) = cli.max_thinking_tokens {
         config.runtime.thinking_budget = Some(budget);
+    }
+    if let Some(mode) = cli.thinking.as_deref() {
+        match mode {
+            "disabled" => {
+                config.runtime.effort = None;
+                config.runtime.thinking_budget = None;
+            }
+            "enabled" | "adaptive" => {
+                if config.runtime.effort.is_none() {
+                    config.runtime.effort = Some("high".to_string());
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -3122,6 +3179,8 @@ mod tests {
             init_only: false,
             disable_slash_commands: false,
             replay_user_messages: false,
+            maintenance: false,
+            thinking: None,
         }
     }
 

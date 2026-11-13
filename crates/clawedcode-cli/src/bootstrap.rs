@@ -31,6 +31,7 @@ pub enum ExecutionMode {
     Mcp(crate::cli::McpAction),
     Doctor,
     Plugin(crate::cli::PluginAction),
+    Agents,
 }
 
 #[derive(Debug, Clone)]
@@ -364,6 +365,7 @@ pub fn resolve_mode(cli: &Cli) -> Result<ExecutionMode> {
         })),
         Command::Mcp { action } => Ok(ExecutionMode::Mcp(action)),
         Command::Doctor => Ok(ExecutionMode::Doctor),
+        Command::Agents => Ok(ExecutionMode::Agents),
         Command::Plugin { action } => Ok(ExecutionMode::Plugin(action)),
     }
 }
@@ -547,6 +549,8 @@ mod tests {
             init_only: false,
             disable_slash_commands: false,
             replay_user_messages: false,
+            maintenance: false,
+            thinking: None,
         }
     }
 
@@ -810,6 +814,8 @@ mod tests {
             init_only: false,
             disable_slash_commands: false,
             replay_user_messages: false,
+            maintenance: false,
+            thinking: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Tui));
@@ -862,6 +868,8 @@ mod tests {
             init_only: false,
             disable_slash_commands: false,
             replay_user_messages: false,
+            maintenance: false,
+            thinking: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -914,6 +922,8 @@ mod tests {
             init_only: false,
             disable_slash_commands: false,
             replay_user_messages: false,
+            maintenance: false,
+            thinking: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));
@@ -969,6 +979,8 @@ mod tests {
             init_only: false,
             disable_slash_commands: false,
             replay_user_messages: false,
+            maintenance: false,
+            thinking: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::DirectConnect(_)));
@@ -1024,6 +1036,8 @@ mod tests {
             init_only: false,
             disable_slash_commands: false,
             replay_user_messages: false,
+            maintenance: false,
+            thinking: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Ssh(_)));
@@ -1086,6 +1100,8 @@ mod tests {
             init_only: false,
             disable_slash_commands: false,
             replay_user_messages: false,
+            maintenance: false,
+            thinking: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -1152,6 +1168,8 @@ mod tests {
             init_only: false,
             disable_slash_commands: false,
             replay_user_messages: false,
+            maintenance: false,
+            thinking: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));

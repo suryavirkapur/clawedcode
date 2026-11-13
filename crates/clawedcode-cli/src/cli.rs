@@ -135,6 +135,12 @@ pub struct Cli {
     /// Echo user messages back in JSON output modes.
     #[arg(long, global = true)]
     pub replay_user_messages: bool,
+    /// Run Setup hooks with the maintenance trigger, then continue.
+    #[arg(long, global = true)]
+    pub maintenance: bool,
+    /// Thinking mode: enabled, adaptive, or disabled.
+    #[arg(long, global = true)]
+    pub thinking: Option<String>,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -240,6 +246,8 @@ pub enum Command {
     },
     /// Check the environment (reference `claude doctor`).
     Doctor,
+    /// List configured agents (reference `claude agents`).
+    Agents,
     /// Manage plugins (reference `claude plugin`).
     Plugin {
         #[command(subcommand)]
@@ -344,6 +352,7 @@ impl Cli {
             Some(Command::Remote { .. }) => Intent::Remote,
             Some(Command::Mcp { .. }) => Intent::Mcp,
             Some(Command::Doctor) | Some(Command::Plugin { .. }) => Intent::Interactive,
+            Some(Command::Agents) => Intent::Interactive,
             None => Intent::Interactive,
         }
     }
@@ -400,6 +409,8 @@ mod tests {
             init_only: false,
             disable_slash_commands: false,
             replay_user_messages: false,
+            maintenance: false,
+            thinking: None,
         }
     }
 
@@ -455,6 +466,8 @@ mod tests {
             init_only: false,
             disable_slash_commands: false,
             replay_user_messages: false,
+            maintenance: false,
+            thinking: None,
         }
     }
 
