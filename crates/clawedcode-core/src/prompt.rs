@@ -58,12 +58,14 @@ pub fn render_system_prompt(spec: &PromptSpec, ctx: &PromptRenderContext<'_>) ->
         using_your_tools_section(ctx.tool_names),
         tone_and_style_section(),
         session_guidance_section(ctx),
-        language_section(ctx.compatibility),
         environment_section(ctx.session, ctx.model),
     ];
 
     if let Some(section) = git_attribution_section(ctx.compatibility, ctx.session, ctx.model)
     {
+        sections.push(section);
+    }
+    if let Some(section) = language_section(ctx.compatibility) {
         sections.push(section);
     }
 
@@ -215,21 +217,18 @@ fn session_guidance_section(ctx: &PromptRenderContext<'_>) -> String {
     lines.join("\n")
 }
 
-fn language_section(compatibility: &CompatibilitySnapshot) -> String {
+/// The reference's getLanguageSection: "Always respond in X" — absent
+/// entirely when `language` isn't configured.
+fn language_section(compatibility: &CompatibilitySnapshot) -> Option<String> {
     let language = compatibility
         .settings
         .get("language")
-        .and_then(|value| value.as_str())
-        .unwrap_or("default");
-
-    [
-        "## Language",
-        &format!(
-            "- Follow the configured interaction language when present. Current setting: {language}."
-        ),
-        "- Keep technical terms precise; do not over-translate code, commands, or file paths.",
-    ]
-    .join("\n")
+        .and_then(|value| value.as_str())?;
+    Some(format!(
+        "# Language\nAlways respond in {language}. Use {language} for all explanations, \
+         comments, and communications with the user. Technical terms and code identifiers \
+         should remain in their original form."
+    ))
 }
 
 fn environment_section(session: &Session, model: &str) -> String {
