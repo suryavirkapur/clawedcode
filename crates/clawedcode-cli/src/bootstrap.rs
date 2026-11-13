@@ -151,6 +151,32 @@ pub fn bootstrap(cli: Cli) -> Result<BootstrappedApp> {
             }
         }
     }
+    // apiKeyHelper: a settings-provided script whose stdout is the API
+    // key. Runs before provider construction (after settings.env, which
+    // may itself configure the helper's environment). An explicit
+    // ANTHROPIC_API_KEY wins like the reference's source precedence.
+    if std::env::var_os("ANTHROPIC_API_KEY").is_none() {
+        if let Some(helper) = compatibility
+            .settings
+            .get("apiKeyHelper")
+            .and_then(|v| v.as_str())
+        {
+            if let Ok(out) = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(helper)
+                .output()
+            {
+                if out.status.success() {
+                    let key = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if !key.is_empty() {
+                        unsafe {
+                            std::env::set_var("ANTHROPIC_API_KEY", key);
+                        }
+                    }
+                }
+            }
+        }
+    }
     let mode = resolve_mode(&cli)?;
     Ok(BootstrappedApp {
         cli,

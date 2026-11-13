@@ -170,7 +170,11 @@ pub async fn execute(boot: BootstrappedApp) -> Result<()> {
 
     // `--agent <name>`: resolve an agent definition (`.claude/agents` or
     // built-ins) and apply its prompt/model/mode/tools to the main runtime.
-    let agent_def = match cli.agent.as_deref() {
+    let agent_def = match cli
+        .agent
+        .as_deref()
+        .or_else(|| compatibility.settings.get("agent").and_then(|v| v.as_str()))
+    {
         Some(name) => Some(
             compat::discover_agents(&cli.cwd)
                 .into_iter()
@@ -1649,6 +1653,34 @@ fn apply_cli_session_overrides(
     }
     if cli.no_session_persistence {
         session.persist = false;
+    }
+    // cleanupPeriodDays: sessions older than N days are pruned; 0
+    // disables persistence entirely (default 30 like the reference).
+    let cleanup_days = runtime
+        .compatibility()
+        .settings
+        .get("cleanupPeriodDays")
+        .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64)))
+        .unwrap_or(30.0);
+    if cleanup_days <= 0.0 {
+        session.persist = false;
+    } else if let Some(dir) = session_store_dir(cli.data_dir.clone()) {
+        let cutoff = std::time::SystemTime::now()
+            - std::time::Duration::from_secs_f64(cleanup_days * 86400.0);
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let Ok(mtime) = path.metadata().and_then(|m| m.modified()) else {
+                    continue;
+                };
+                if mtime < cutoff && path != dir.join(format!("{}.json", session.id)) {
+                    std::fs::remove_file(&path).ok();
+                }
+            }
+        }
     }
     if let Some(name) = &cli.name {
         session.title = Some(name.clone());
