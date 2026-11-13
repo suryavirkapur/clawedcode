@@ -608,6 +608,14 @@ impl Runtime {
 
     pub fn start_session_with_mode(&self, cwd: PathBuf, mode: SessionMode) -> Session {
         let mut session = Session::with_mode(cwd, mode);
+        // Session-start memory counts as loaded — nested-traversal only fires
+        // for files not already in the system prompt.
+        session.loaded_memory = self
+            .compatibility
+            .memory_files
+            .iter()
+            .filter_map(|p| std::fs::canonicalize(p).ok().or_else(|| Some(p.clone())))
+            .collect();
         session.push(Role::System, self.effective_system_prompt_body(&session));
         session
     }
@@ -2581,6 +2589,33 @@ impl Runtime {
             }
         }
         let result = tool.execute(input.clone(), &session.cwd);
+        // Nested-traversal memory: file tools touching paths under
+        // not-yet-loaded CLAUDE.md dirs load them lazily like the reference.
+        if !result.is_error {
+            let touched = input
+                .get("path")
+                .or_else(|| input.get("file_path"))
+                .or_else(|| input.get("notebook_path"))
+                .and_then(|v| v.as_str())
+                .map(|p| {
+                    let p = std::path::PathBuf::from(p);
+                    if p.is_absolute() {
+                        p
+                    } else {
+                        session.cwd.join(p)
+                    }
+                });
+            if let Some(path) = touched {
+                if let Some(memory) = crate::compat::load_nested_memory_for_file(session, &path) {
+                    session.push(
+                        Role::User,
+                        format!(
+                            "<system-reminder>\nThe following memory file(s) were loaded because you accessed a file in their directory. Consider their guidance:\n\n{memory}\n</system-reminder>"
+                        ),
+                    );
+                }
+            }
+        }
         // A `cd` inside a shell command moves the session cwd like the
         // reference's persistent shell — CwdChanged hooks fire on the shift.
         if let Some(new_cwd) = result.new_cwd.clone() {

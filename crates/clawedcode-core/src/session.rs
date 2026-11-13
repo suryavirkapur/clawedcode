@@ -60,6 +60,10 @@ pub struct Session {
     /// restore code + conversation like the reference's checkpointing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checkpoints: Vec<Checkpoint>,
+    /// Memory files already loaded into context — session-start files plus
+    /// any nested-traversal loads, so each file hooks/loads once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loaded_memory: Vec<PathBuf>,
     /// `--no-session-persistence`: when false, `save` is a no-op. Skipped
     /// during serialization and always loaded back as `true`.
     #[serde(skip, default = "default_persist")]
@@ -181,6 +185,7 @@ impl Session {
             additional_allowed_dirs: Vec::new(),
             worktree_origin: None,
             checkpoints: Vec::new(),
+            loaded_memory: Vec::new(),
             persist: true,
         }
         .with_default_task_list_id()
@@ -218,6 +223,7 @@ impl Session {
             additional_allowed_dirs: Vec::new(),
             worktree_origin: None,
             checkpoints: Vec::new(),
+            loaded_memory: Vec::new(),
             persist: true,
         }
     }
@@ -267,6 +273,7 @@ impl Session {
             additional_allowed_dirs: Vec::new(),
             worktree_origin: None,
             checkpoints: Vec::new(),
+            loaded_memory: Vec::new(),
             persist: true,
         }
         .with_default_task_list_id()
@@ -357,6 +364,7 @@ impl Session {
             additional_allowed_dirs: Vec::new(),
             worktree_origin: None,
             checkpoints: Vec::new(),
+            loaded_memory: Vec::new(),
             persist: true,
         }
     }

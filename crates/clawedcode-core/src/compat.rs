@@ -462,6 +462,77 @@ fn memory_search_paths(cwd: &Path, claude_home: Option<&Path>) -> Result<Vec<Pat
     Ok(paths)
 }
 
+/// Lazy nested-traversal memory load, like the reference: when a file tool
+/// touches `file_path`, any CLAUDE.md in the directories between the session
+/// root and that file (not already loaded) fires InstructionsLoaded with
+/// load_reason "nested_traversal" and is injected into context.
+/// Returns the loaded memory text to append to the session.
+pub fn load_nested_memory_for_file(
+    session: &mut crate::session::Session,
+    file_path: &Path,
+) -> Option<String> {
+    if std::env::var_os("CLAWEDCODE_SIMPLE").is_some() {
+        return None;
+    }
+    let dir = if file_path.is_dir() {
+        file_path.to_path_buf()
+    } else {
+        file_path.parent()?.to_path_buf()
+    };
+    let abs_dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+    let abs_cwd = std::fs::canonicalize(&session.cwd).unwrap_or_else(|_| session.cwd.clone());
+
+    // Directories from the file's dir up through the session cwd — do not
+    // traverse above the session root (files outside it load no memory).
+    if !abs_dir.starts_with(&abs_cwd) {
+        return None;
+    }
+    let mut chain: Vec<PathBuf> = abs_dir
+        .ancestors()
+        .take_while(|a| a.starts_with(&abs_cwd))
+        .map(PathBuf::from)
+        .collect();
+    chain.reverse(); // session-root-first ordering
+
+    let mut loaded_text = String::new();
+    for dir in chain {
+        let candidate = dir.join("CLAUDE.md");
+        if !candidate.exists() {
+            continue;
+        }
+        let canonical = std::fs::canonicalize(&candidate).unwrap_or(candidate.clone());
+        if session.loaded_memory.contains(&canonical)
+            || session.loaded_memory.contains(&candidate)
+        {
+            continue;
+        }
+        crate::hooks::run_simple_event_hooks(
+            &crate::hooks::load_hooks(&session.cwd),
+            "InstructionsLoaded",
+            &session.id.to_string(),
+            &session.cwd,
+            serde_json::json!({
+                "file_path": canonical.to_string_lossy(),
+                "memory_type": "Project",
+                "load_reason": "nested_traversal",
+                "trigger_file_path": std::path::absolute(file_path)
+                    .unwrap_or_else(|_| file_path.to_path_buf())
+                    .to_string_lossy(),
+            }),
+        );
+        if let Ok(expanded) = expand_memory_file(&candidate, &mut Vec::new(), 0, &session.cwd) {
+            if !expanded.trim().is_empty() {
+                if !loaded_text.is_empty() {
+                    loaded_text.push_str("\n\n");
+                }
+                loaded_text.push_str(&format!("<!-- {} -->\n{}", canonical.display(), expanded.trim()));
+            }
+        }
+        session.loaded_memory.push(canonical);
+    }
+    (!loaded_text.is_empty()).then_some(loaded_text)
+}
+
 fn expand_memory_file(
     path: &Path,
     stack: &mut Vec<PathBuf>,
