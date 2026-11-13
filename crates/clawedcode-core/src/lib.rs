@@ -5,6 +5,7 @@ pub mod content;
 pub mod crons;
 pub mod hooks;
 pub mod interactive;
+pub mod memdir;
 pub mod onboarding;
 pub mod permissions;
 pub mod prompt;

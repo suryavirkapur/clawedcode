@@ -634,6 +634,14 @@ impl Runtime {
             .iter()
             .filter_map(|p| std::fs::canonicalize(p).ok().or_else(|| Some(p.clone())))
             .collect();
+        // The auto-memory dir sits outside cwd — register it as an allowed
+        // root so the agent can write memory files like the reference.
+        if crate::memdir::auto_memory_enabled(&self.compatibility.settings) {
+            let dir = crate::memdir::auto_memory_dir(&session.cwd, &self.compatibility.settings);
+            if !session.additional_allowed_dirs.contains(&dir) {
+                session.additional_allowed_dirs.push(dir);
+            }
+        }
         session.push(Role::System, self.effective_system_prompt_body(&session));
         session
     }
@@ -675,6 +683,12 @@ impl Runtime {
         );
         if let Some(agent_prompt) = &self.agent_prompt {
             body = format!("{agent_prompt}\n\n{body}");
+        }
+        if let Some(memory_prompt) =
+            crate::memdir::load_memory_prompt(&session.cwd, &self.compatibility.settings)
+        {
+            body.push_str("\n\n");
+            body.push_str(&memory_prompt);
         }
         if let Some(style) = crate::compat::load_output_style(&session.cwd) {
             body.push_str("\n\n");

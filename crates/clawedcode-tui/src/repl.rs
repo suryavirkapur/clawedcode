@@ -7713,10 +7713,27 @@ PR number: {args}"#
                     return Ok(true);
                 }
                 "/memory" => {
-                    let path = ctx.session().cwd.join("CLAUDE.md");
-                    if !path.exists() {
-                        let _ = fs::write(&path, "# CLAUDE.md\n");
-                    }
+                    // The reference's /memory edits memory files — prefer the
+                    // auto-memory index when the subsystem is enabled.
+                    let settings = &ctx.runtime.compatibility().settings;
+                    let path = if clawedcode_core::memdir::auto_memory_enabled(settings) {
+                        let p = clawedcode_core::memdir::auto_memory_dir(
+                            &ctx.session().cwd,
+                            settings,
+                        )
+                        .join(clawedcode_core::memdir::ENTRYPOINT_NAME);
+                        let _ = fs::create_dir_all(p.parent().unwrap());
+                        if !p.exists() {
+                            let _ = fs::write(&p, "# Memory index\n\n");
+                        }
+                        p
+                    } else {
+                        let p = ctx.session().cwd.join("CLAUDE.md");
+                        if !p.exists() {
+                            let _ = fs::write(&p, "# CLAUDE.md\n");
+                        }
+                        p
+                    };
                     match open_path_in_editor(&path) {
                         Ok(()) => handler.push_overlay(format!("[info] Edited {}", path.display())),
                         Err(err) => handler.push_overlay(format!("[error] Editor failed: {err}")),
