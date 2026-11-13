@@ -6027,7 +6027,13 @@ fn drain_turn_events(
                 }
                 TurnWorkerEvent::Finished(mut session) => {
                     if turn.compacting {
-                        compact_session(&mut session);
+                        let context = compact_session(&mut session);
+                        if !context.is_empty() {
+                            ctx.set_pending_prompt_prefix(Some(format!(
+                                "<session-start-hook-context>\n{}\n</session-start-hook-context>",
+                                context.join("\n\n")
+                            )));
+                        }
                     }
                     if turn.ephemeral {
                         let rows = handler.live_rows();
@@ -6165,7 +6171,7 @@ fn to_tui_event(event: &ApiEvent) -> Option<TuiEvent> {
 /// Collapse a finished compaction turn's session down to its system messages
 /// plus the model's summary of the conversation — mirrors Claude Code's
 /// `/compact`, where the summary becomes the new starting context.
-fn compact_session(session: &mut Session) {
+fn compact_session(session: &mut Session) -> Vec<String> {
     clawedcode_core::hooks::run_pre_compact_hooks(
         &clawedcode_core::hooks::load_hooks(&session.cwd),
         &session.id.to_string(),
@@ -6192,6 +6198,15 @@ fn compact_session(session: &mut Session) {
         &session.cwd,
         serde_json::json!({}),
     );
+    // The reference re-fires SessionStart with source "compact" after
+    // compaction; returned context prefixes the next prompt like /clear.
+    clawedcode_core::hooks::run_session_start_hooks(
+        &clawedcode_core::hooks::load_hooks(&session.cwd),
+        &session.id.to_string(),
+        &session.cwd,
+        "compact",
+        "compact",
+    )
 }
 
 fn handle_slash_command(
