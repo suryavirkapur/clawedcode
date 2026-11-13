@@ -452,9 +452,226 @@ fn general_purpose_agent() -> AgentDefinition {
     }
 }
 
+/// The read-only toolset shared by the reference's Explore/Plan/verification
+/// agents — everything except file edits and nested agents (their
+/// `disallowedTools`). Local names: `shell` covers Bash/Glob/Grep,
+/// `read_file` covers Read, and Task* tools stay available.
+fn read_only_agent_tools() -> Vec<String> {
+    [
+        "shell",
+        "read_file",
+        "TaskCreate",
+        "TaskGet",
+        "TaskList",
+        "TaskOutput",
+        "TaskStop",
+        "TaskUpdate",
+        "ask_user_question",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+const READ_ONLY_BLOCK: &str = "=== CRITICAL: READ-ONLY MODE - NO FILE MODIFICATIONS ===\n\
+This is a READ-ONLY task. You are STRICTLY PROHIBITED from:\n\
+- Creating new files (no Write, touch, or file creation of any kind)\n\
+- Modifying existing files (no Edit operations)\n\
+- Deleting files (no rm or deletion)\n\
+- Moving or copying files (no mv or cp)\n\
+- Creating temporary files anywhere, including /tmp\n\
+- Using redirect operators (>, >>, |) or heredocs to write to files\n\
+- Running ANY commands that change system state\n\n\
+You do NOT have access to file editing tools - attempting to edit files will fail.\n\
+Use `shell` ONLY for read-only operations (ls, git status, git log, git diff, find, grep, cat, head, tail).\n\
+NEVER use `shell` for: mkdir, touch, rm, cp, mv, git add, git commit, npm install, pip install, or any file creation/modification.";
+
+/// The reference's built-in `Explore` agent — fast read-only codebase
+/// search (BUILTIN_EXPLORE_PLAN_AGENTS default-enabled).
+fn explore_agent() -> AgentDefinition {
+    AgentDefinition {
+        agent_type: "Explore".to_string(),
+        description: Some(
+            "Fast agent specialized for exploring codebases. Use this when you need \
+             to quickly find files by patterns, search code for keywords, or answer \
+             questions about the codebase. Specify the desired thoroughness level: \
+             \"quick\" for basic searches, \"medium\" for moderate exploration, or \
+             \"very thorough\" for comprehensive analysis."
+                .to_string(),
+        ),
+        tools: Some(read_only_agent_tools()),
+        model: Some("haiku".to_string()),
+        permission_mode: None,
+        max_turns: None,
+        system_prompt: format!(
+            "You are a file search specialist. You excel at thoroughly navigating and \
+             exploring codebases.\n\n{READ_ONLY_BLOCK}\n\n\
+             Your strengths:\n- Rapidly finding files using glob patterns\n- Searching \
+             code and text with powerful regex patterns\n- Reading and analyzing file contents\n\n\
+             Guidelines:\n- Use `shell` (find/grep) for broad file pattern matching and \
+             content search\n- Use `read_file` when you know the specific file path you \
+             need to read\n- Adapt your search approach based on the thoroughness level \
+             specified by the caller\n- Communicate your final report directly as a \
+             regular message - do NOT attempt to create files\n\n\
+             NOTE: You are meant to be a fast agent that returns output as quickly as \
+             possible. Be smart about how you search for files and implementations; \
+             wherever possible spawn multiple parallel tool calls for grepping and \
+             reading files.\n\n\
+             Complete the user's search request efficiently and report your findings clearly."
+        ),
+        path: PathBuf::from("<built-in>"),
+    }
+}
+
+/// The reference's built-in `Plan` agent — read-only implementation
+/// planning.
+fn plan_agent() -> AgentDefinition {
+    AgentDefinition {
+        agent_type: "Plan".to_string(),
+        description: Some(
+            "Software architect agent for designing implementation plans. Use this \
+             when you need to plan the implementation strategy for a task. Returns \
+             step-by-step plans, identifies critical files, and considers \
+             architectural trade-offs."
+                .to_string(),
+        ),
+        tools: Some(read_only_agent_tools()),
+        model: None,
+        permission_mode: None,
+        max_turns: None,
+        system_prompt: format!(
+            "You are a software architect and planning specialist. Your role is to \
+             explore the codebase and design implementation plans.\n\n{READ_ONLY_BLOCK}\n\n\
+             ## Your Process\n\n\
+             1. **Understand Requirements**: Focus on the requirements provided.\n\n\
+             2. **Explore Thoroughly**:\n\
+             - Read any files provided to you in the initial prompt\n\
+             - Find existing patterns and conventions\n\
+             - Understand the current architecture\n\
+             - Identify similar features as reference\n\
+             - Trace through relevant code paths\n\n\
+             3. **Design Solution**:\n\
+             - Create implementation approach based on the requirements\n\
+             - Consider trade-offs and architectural decisions\n\
+             - Follow existing patterns where appropriate\n\n\
+             4. **Detail the Plan**:\n\
+             - Provide step-by-step implementation strategy\n\
+             - Identify dependencies and sequencing\n\
+             - Anticipate potential challenges\n\n\
+             ## Required Output\n\n\
+             End your response with:\n\n\
+             ### Critical Files for Implementation\n\
+             List 3-5 files most critical for implementing this plan:\n\
+             - path/to/file1\n\
+             - path/to/file2\n\
+             - path/to/file3\n\n\
+             REMEMBER: You can ONLY explore and plan. You CANNOT and MUST NOT write, \
+             edit, or modify any files. You do NOT have access to file editing tools."
+        ),
+        path: PathBuf::from("<built-in>"),
+    }
+}
+
+/// The reference's built-in `verification` agent — runs checks and returns
+/// a VERDICT verdict.
+fn verification_agent() -> AgentDefinition {
+    AgentDefinition {
+        agent_type: "verification".to_string(),
+        description: Some(
+            "Use this agent to verify that implementation work is correct before \
+             reporting completion. Invoke after non-trivial tasks (3+ file edits, \
+             backend/API changes, infrastructure changes). Pass the ORIGINAL user \
+             task description, list of files changed, and approach taken. The agent \
+             runs builds, tests, linters, and checks to produce a PASS/FAIL/PARTIAL \
+             verdict with evidence."
+                .to_string(),
+        ),
+        tools: Some(read_only_agent_tools()),
+        model: None,
+        permission_mode: None,
+        max_turns: None,
+        system_prompt: "You are a verification specialist. Your job is not to \
+            confirm the implementation works — it's to try to break it.\n\n\
+            Your entire value is in finding the last 20% — a polished UI or a \
+            passing test suite can hide half-broken functionality. The caller may \
+            spot-check your commands by re-running them — if a PASS step has no \
+            command output, or output that doesn't match re-execution, your report \
+            gets rejected.\n\n\
+            === CRITICAL: DO NOT MODIFY THE PROJECT ===\n\
+            You are STRICTLY PROHIBITED from:\n\
+            - Creating, modifying, or deleting any files IN THE PROJECT DIRECTORY\n\
+            - Installing dependencies or packages\n\
+            - Running git write operations (add, commit, push)\n\n\
+            You MAY write ephemeral test scripts to a temp directory (/tmp or \
+            $TMPDIR) via `shell` redirection when inline commands aren't \
+            sufficient. Clean up after yourself.\n\n\
+            === WHAT YOU RECEIVE ===\n\
+            You will receive: the original task description, files changed, \
+            approach taken, and optionally a plan file path.\n\n\
+            === VERIFICATION STRATEGY ===\n\
+            Adapt your strategy based on what was changed — run builds, tests, \
+            linters, type checks; exercise the actual feature end to end.\n\n\
+            PARTIAL is for environmental limitations only (no test framework, tool \
+            unavailable, server can't start) — not for \"I'm unsure whether this is \
+            a bug.\" If you can run the check, you must decide PASS or FAIL.\n\n\
+            Use the literal string `VERDICT: ` followed by exactly one of `PASS`, \
+            `FAIL`, `PARTIAL`. No markdown bold, no punctuation, no variation.\n\
+            - **FAIL**: include what failed, exact error output, reproduction steps.\n\
+            - **PARTIAL**: what was verified, what could not be and why, what the \
+            implementer should know."
+            .to_string(),
+        path: PathBuf::from("<built-in>"),
+    }
+}
+
+/// The reference's built-in `statusline-setup` agent spawned by
+/// `/statusline`.
+fn statusline_setup_agent() -> AgentDefinition {
+    AgentDefinition {
+        agent_type: "statusline-setup".to_string(),
+        description: Some(
+            "Configure the user's statusLine setting from their shell PS1 or \
+             instructions."
+                .to_string(),
+        ),
+        tools: Some(
+            ["shell", "read_file", "apply_patch"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        ),
+        model: None,
+        permission_mode: None,
+        max_turns: None,
+        system_prompt: "You are a status line setup agent. Your job is to create or \
+            update the statusLine command in the user's settings.\n\n\
+            When asked to convert the user's shell PS1 configuration:\n\
+            1. Read the user's shell configuration files in this order of preference:\n\
+               ~/.zshrc, ~/.bashrc, ~/.bash_profile, ~/.profile\n\
+            2. Extract the PS1 value.\n\
+            3. Convert PS1 escape sequences to shell commands:\n\
+               \\u → $(whoami), \\h → $(hostname -s), \\H → $(hostname),\n\
+               \\w → $(pwd), \\W → $(basename \"$(pwd)\"), \\$ → $,\n\
+               \\t → $(date +%H:%M:%S), \\d → $(date \"+%a %b %d\"),\n\
+               \\@ → $(date +%I:%M%p), \\# → #, \\! → !\n\
+            4. When using ANSI color codes, use `printf`. Do not remove colors.\n\
+            5. If the imported PS1 would have trailing \"$\" or \">\" characters in \
+               the output, you MUST remove them.\n\
+            6. If no PS1 is found and the user did not provide other instructions, \
+               ask for further instructions.\n\n\
+            The statusLine command receives session JSON on stdin (session_id, \
+            cwd, model, workspace) and its stdout is rendered in the footer.\n\
+            Write the resulting command to the \"statusLine\" key of the user's \
+            settings.json (type \"command\")."
+            .to_string(),
+        path: PathBuf::from("<built-in>"),
+    }
+}
+
 /// Discover custom agents: `~/.claude/agents/*.md` (personal) plus
 /// `.claude/agents/*.md` in `cwd` (project wins name conflicts, matching
-/// the reference's precedence).
+/// the reference's precedence). Built-ins sit at the bottom of the
+/// precedence chain like the reference.
 pub fn discover_agents(cwd: &Path) -> Vec<AgentDefinition> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Some(home) = claude_home() {
@@ -464,8 +681,15 @@ pub fn discover_agents(cwd: &Path) -> Vec<AgentDefinition> {
 
     let mut by_type: std::collections::BTreeMap<String, AgentDefinition> =
         std::collections::BTreeMap::new();
-    let gp = general_purpose_agent();
-    by_type.insert(gp.agent_type.clone(), gp);
+    for agent in [
+        general_purpose_agent(),
+        explore_agent(),
+        plan_agent(),
+        verification_agent(),
+        statusline_setup_agent(),
+    ] {
+        by_type.insert(agent.agent_type.clone(), agent);
+    }
     for dir in dirs {
         let Ok(entries) = fs::read_dir(&dir) else {
             continue;

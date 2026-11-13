@@ -424,6 +424,7 @@ const BUILTIN_COMMANDS: &[&str] = &[
     "/init",
     "/resume",
     "/compact",
+    "/statusline",
     "/export",
     "/memory",
     "/mcp",
@@ -6581,6 +6582,35 @@ fn handle_slash_command(
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
+                "/statusline" => {
+                    if active_turn.is_some() {
+                        handler.push_overlay("[info] A turn is already running.".to_string());
+                    } else {
+                        // Reference: a prompt command that delegates to the
+                        // built-in statusline-setup agent.
+                        let arg = prompt
+                            .strip_prefix("/statusline")
+                            .map(str::trim)
+                            .unwrap_or_default();
+                        let task = if arg.is_empty() {
+                            "Configure my statusLine from my shell PS1 configuration"
+                        } else {
+                            arg
+                        };
+                        let execution = format!(
+                            "Create an Agent with subagent_type \"statusline-setup\" and the prompt \"{task}\""
+                        );
+                        handler.begin_live_turn("/statusline".to_string());
+                        *active_turn = Some(spawn_turn_worker(
+                            ctx,
+                            "/statusline".to_string(),
+                            Some(execution),
+                            always_allowed.clone(),
+                        ));
+                    }
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
                 "/commit" => {
                     if active_turn.is_some() {
                         handler.push_overlay("[info] A turn is already running.".to_string());
@@ -7607,6 +7637,11 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
         CommandEntry {
             name: "/compact".to_string(),
             description: "Summarize the conversation and continue with less context".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/statusline".to_string(),
+            description: "Set up the statusLine UI".to_string(),
             source: CommandSource::BuiltIn,
         },
         CommandEntry {
