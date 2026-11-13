@@ -1354,10 +1354,15 @@ fn execute_mcp_serve(
     config: &AppConfig,
     compatibility: &compat::CompatibilitySnapshot,
 ) -> Result<()> {
+    // Serving is server-side: skip client-side MCP discovery entirely.
+    // Without this a `.mcp.json` pointing at `clawedcode mcp serve`
+    // recurses — each spawned server connects back to another.
+    let mut compatibility = compatibility.clone();
+    compatibility.mcp_servers.clear();
     let runtime = Runtime::with_mode(
         config.clone(),
         resolve_prompt(None),
-        compatibility.clone(),
+        compatibility,
         PermissionMode::Bypass,
     );
     let mut session = runtime.start_session_with_mode(cli.cwd.clone(), SessionMode::Headless);
