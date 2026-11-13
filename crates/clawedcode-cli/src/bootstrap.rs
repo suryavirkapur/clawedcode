@@ -115,6 +115,21 @@ struct PromptExecutionPayload {
 
 pub fn bootstrap(cli: Cli) -> Result<BootstrappedApp> {
     init_tracing(&cli);
+    if !cli.plugin_dir.is_empty() {
+        // `--plugin-dir` feeds the same discovery path as CLAWEDCODE_PLUGIN_DIR.
+        let existing = std::env::var("CLAWEDCODE_PLUGIN_DIR").unwrap_or_default();
+        let mut dirs: Vec<String> = existing
+            .split(':')
+            .filter(|d| !d.is_empty())
+            .map(String::from)
+            .collect();
+        for d in &cli.plugin_dir {
+            dirs.push(d.display().to_string());
+        }
+        unsafe {
+            std::env::set_var("CLAWEDCODE_PLUGIN_DIR", dirs.join(":"));
+        }
+    }
     let config = AppConfig::load(cli.config.as_deref())?;
     ensure_default_config_exists(cli.config.as_deref())?;
     let compatibility = compat::discover(&cli.cwd)?;
@@ -614,6 +629,7 @@ mod tests {
             include_partial_messages: false,
             include_hook_events: false,
             permission_prompt_tool: None,
+            plugin_dir: Vec::new(),
         }
     }
 
@@ -898,6 +914,7 @@ mod tests {
             include_partial_messages: false,
             include_hook_events: false,
             permission_prompt_tool: None,
+            plugin_dir: Vec::new(),
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Tui));
@@ -971,6 +988,7 @@ mod tests {
             include_partial_messages: false,
             include_hook_events: false,
             permission_prompt_tool: None,
+            plugin_dir: Vec::new(),
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -1044,6 +1062,7 @@ mod tests {
             include_partial_messages: false,
             include_hook_events: false,
             permission_prompt_tool: None,
+            plugin_dir: Vec::new(),
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));
@@ -1120,6 +1139,7 @@ mod tests {
             include_partial_messages: false,
             include_hook_events: false,
             permission_prompt_tool: None,
+            plugin_dir: Vec::new(),
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::DirectConnect(_)));
@@ -1196,6 +1216,7 @@ mod tests {
             include_partial_messages: false,
             include_hook_events: false,
             permission_prompt_tool: None,
+            plugin_dir: Vec::new(),
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Ssh(_)));
@@ -1279,6 +1300,7 @@ mod tests {
             include_partial_messages: false,
             include_hook_events: false,
             permission_prompt_tool: None,
+            plugin_dir: Vec::new(),
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -1366,6 +1388,7 @@ mod tests {
             include_partial_messages: false,
             include_hook_events: false,
             permission_prompt_tool: None,
+            plugin_dir: Vec::new(),
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));

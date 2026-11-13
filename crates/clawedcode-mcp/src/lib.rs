@@ -379,7 +379,9 @@ impl McpStdioClient {
         let mut body = vec![0u8; content_length];
         let mut filled = 0usize;
         while filled < content_length {
-            let buffered = stdout.fill_buf().map_err(|e| format!("read body error: {e}"))?;
+            let buffered = stdout
+                .fill_buf()
+                .map_err(|e| format!("read body error: {e}"))?;
             let take = buffered.len().min(content_length - filled);
             body[filled..filled + take].copy_from_slice(&buffered[..take]);
             stdout.consume(take);

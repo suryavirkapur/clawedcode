@@ -50,10 +50,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub append_system_prompt: Option<String>,
     /// Restrict the session to these tool names (comma-separated).
-    #[arg(long, global = true, value_delimiter = ',')]
+    #[arg(long, alias = "allowedTools", global = true, value_delimiter = ',')]
     pub allowed_tools: Vec<String>,
     /// Remove these tool names from the session (comma-separated).
-    #[arg(long, global = true, value_delimiter = ',')]
+    #[arg(long, alias = "disallowedTools", global = true, value_delimiter = ',')]
     pub disallowed_tools: Vec<String>,
     /// Use a specific session id for the new session.
     #[arg(long, global = true)]
@@ -86,7 +86,7 @@ pub struct Cli {
     #[arg(short = 'p', long)]
     pub print: bool,
     /// Continue the most recent session.
-    #[arg(short = 'c', long)]
+    #[arg(short = 'c', long = "continue")]
     pub continue_session: bool,
     /// Resume a session by id; bare --resume opens the session picker.
     #[arg(short = 'r', long, num_args = 0..=1, default_missing_value = "")]
@@ -174,6 +174,9 @@ pub struct Cli {
     /// Write debug logs to a file (implies --debug).
     #[arg(long, global = true)]
     pub debug_file: Option<PathBuf>,
+    /// Additional plugin directory to load (repeatable).
+    #[arg(long, global = true)]
+    pub plugin_dir: Vec<PathBuf>,
     /// MCP tool (mcp__server__tool) that decides tool-permission prompts.
     #[arg(long, global = true)]
     pub permission_prompt_tool: Option<String>,
@@ -489,6 +492,7 @@ mod tests {
             include_partial_messages: false,
             include_hook_events: false,
             permission_prompt_tool: None,
+            plugin_dir: Vec::new(),
         }
     }
 
@@ -565,6 +569,7 @@ mod tests {
             include_partial_messages: false,
             include_hook_events: false,
             permission_prompt_tool: None,
+            plugin_dir: Vec::new(),
         }
     }
 

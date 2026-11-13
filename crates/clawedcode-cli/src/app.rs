@@ -3471,6 +3471,7 @@ mod tests {
             include_partial_messages: false,
             include_hook_events: false,
             permission_prompt_tool: None,
+            plugin_dir: Vec::new(),
         }
     }
 
