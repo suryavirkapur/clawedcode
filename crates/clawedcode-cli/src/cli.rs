@@ -416,9 +416,24 @@ pub enum PluginAction {
         action: MarketplaceAction,
     },
     /// Install a plugin from a marketplace: `plugin install name@marketplace`.
-    Install { spec: String },
+    Install {
+        spec: String,
+        /// Enablement scope (user, project, or local settings).
+        #[arg(short = 's', long, default_value = "user")]
+        scope: String,
+    },
     /// Uninstall a marketplace-installed plugin.
-    Uninstall { spec: String },
+    Uninstall {
+        spec: String,
+        /// Enablement scope to clear (user, project, or local).
+        #[arg(short = 's', long, default_value = "user")]
+        scope: String,
+        /// Keep plugin data files on disk (only clear enablement).
+        #[arg(long)]
+        keep_data: bool,
+    },
+    /// Refresh an installed plugin from its marketplace source.
+    Update { spec: String },
 }
 
 #[derive(Debug, Clone, Subcommand)]

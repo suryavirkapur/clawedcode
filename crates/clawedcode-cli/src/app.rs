@@ -692,11 +692,18 @@ fn execute_plugin(cli: &Cli, action: crate::cli::PluginAction) -> Result<()> {
         PluginAction::Marketplace { action } => {
             execute_marketplace(cli, action)?;
         }
-        PluginAction::Install { spec } => {
-            execute_plugin_install(cli, &spec)?;
+        PluginAction::Install { spec, scope } => {
+            execute_plugin_install(cli, &spec, &scope)?;
         }
-        PluginAction::Uninstall { spec } => {
-            execute_plugin_uninstall(cli, &spec)?;
+        PluginAction::Uninstall {
+            spec,
+            scope,
+            keep_data,
+        } => {
+            execute_plugin_uninstall(cli, &spec, &scope, keep_data)?;
+        }
+        PluginAction::Update { spec } => {
+            execute_plugin_update(cli, &spec)?;
         }
     }
     Ok(())
@@ -890,7 +897,21 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 /// `plugin install name@marketplace` — resolve a local marketplace entry and
 /// copy the plugin into ~/.claude/plugins/<name>, like the reference's
 /// install of a locally-sourced plugin.
-fn execute_plugin_install(cli: &Cli, spec: &str) -> Result<()> {
+/// Settings file receiving enabledPlugins for a plugin-install scope:
+/// user → ~/.claude/settings.json, project → .claude/settings.json,
+/// local → .claude/settings.local.json.
+fn plugin_scope_settings_path(cli: &Cli, scope: &str) -> Result<PathBuf> {
+    match scope {
+        "user" => compat::claude_home()
+            .map(|h| h.join("settings.json"))
+            .ok_or_else(|| anyhow::anyhow!("no ~/.claude path")),
+        "project" => Ok(cli.cwd.join(".claude").join("settings.json")),
+        "local" => Ok(cli.cwd.join(".claude").join("settings.local.json")),
+        other => anyhow::bail!("invalid scope '{other}' (expected user, project, or local)"),
+    }
+}
+
+fn execute_plugin_install(cli: &Cli, spec: &str, scope: &str) -> Result<()> {
     let (plugin_name, market_name) = spec
         .rsplit_once('@')
         .ok_or_else(|| anyhow::anyhow!("expected 'name@marketplace', e.g. plugin install fmt@tools"))?;
@@ -927,30 +948,35 @@ fn execute_plugin_install(cli: &Cli, spec: &str) -> Result<()> {
     }
     copy_dir_recursive(&plugin_dir, &dest)?;
     // Record enablement like the reference: enabledPlugins["name@market"]=true
-    // in user settings.
-    let settings_path = home.join("settings.json");
+    // in the settings file for the requested scope.
+    let settings_path = plugin_scope_settings_path(cli, scope)?;
     let mut settings: serde_json::Value = std::fs::read_to_string(&settings_path)
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_else(|| serde_json::json!({}));
     settings["enabledPlugins"][format!("{plugin_name}@{market_name}")] = serde_json::json!(true);
-    std::fs::create_dir_all(&home)?;
+    if let Some(parent) = settings_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
     println!("Installed '{plugin_name}' from '{market_name}' to {}", dest.display());
     Ok(())
 }
 
-fn execute_plugin_uninstall(cli: &Cli, spec: &str) -> Result<()> {
+fn execute_plugin_uninstall(cli: &Cli, spec: &str, scope: &str, keep_data: bool) -> Result<()> {
     let (plugin_name, market_name) = spec
         .rsplit_once('@')
         .ok_or_else(|| anyhow::anyhow!("expected 'name@marketplace'"))?;
     let home = compat::claude_home().ok_or_else(|| anyhow::anyhow!("no ~/.claude path"))?;
     let dest = home.join("plugins").join(plugin_name);
-    if !dest.exists() {
-        anyhow::bail!("Plugin '{plugin_name}' is not installed");
+    if dest.exists() {
+        if keep_data {
+            println!("Kept plugin files at {}", dest.display());
+        } else {
+            std::fs::remove_dir_all(&dest)?;
+        }
     }
-    std::fs::remove_dir_all(&dest)?;
-    let settings_path = home.join("settings.json");
+    let settings_path = plugin_scope_settings_path(cli, scope)?;
     if let Ok(raw) = std::fs::read_to_string(&settings_path) {
         if let Ok(mut settings) = serde_json::from_str::<serde_json::Value>(&raw) {
             if let Some(obj) = settings["enabledPlugins"].as_object_mut() {
@@ -961,6 +987,48 @@ fn execute_plugin_uninstall(cli: &Cli, spec: &str) -> Result<()> {
         }
     }
     println!("Uninstalled '{plugin_name}'");
+    Ok(())
+}
+
+/// `plugin update name@marketplace` — re-materialize the installed copy from
+/// the marketplace source (a re-copy for local sources).
+fn execute_plugin_update(cli: &Cli, spec: &str) -> Result<()> {
+    let (plugin_name, market_name) = spec
+        .rsplit_once('@')
+        .ok_or_else(|| anyhow::anyhow!("expected 'name@marketplace'"))?;
+    let doc = load_known_marketplaces()?;
+    let entry = doc
+        .get(market_name)
+        .ok_or_else(|| anyhow::anyhow!("No marketplace named '{market_name}'"))?;
+    let source_path = entry["source"]["path"]
+        .as_str()
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("marketplace '{market_name}' is not a local source"))?;
+    let (_, manifest, base) = read_marketplace_manifest(&source_path)?;
+    let plugins = manifest["plugins"].as_array().unwrap();
+    let entry = plugins
+        .iter()
+        .find(|p| {
+            p.get("name").and_then(|n| n.as_str()) == Some(plugin_name)
+                || p.get("id").and_then(|n| n.as_str()) == Some(plugin_name)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("Plugin '{plugin_name}' not found in marketplace '{market_name}'")
+        })?;
+    let rel = entry
+        .get("source")
+        .and_then(|s| s.as_str())
+        .ok_or_else(|| anyhow::anyhow!("plugin '{plugin_name}' has no source path"))?;
+    let plugin_dir = std::fs::canonicalize(base.join(rel))
+        .with_context(|| format!("plugin source '{rel}' not found in '{market_name}'"))?;
+    let home = compat::claude_home().ok_or_else(|| anyhow::anyhow!("no ~/.claude path"))?;
+    let dest = home.join("plugins").join(plugin_name);
+    if !dest.exists() {
+        anyhow::bail!("Plugin '{plugin_name}' is not installed — use plugin install");
+    }
+    std::fs::remove_dir_all(&dest)?;
+    copy_dir_recursive(&plugin_dir, &dest)?;
+    println!("Updated '{plugin_name}' from '{market_name}'");
     Ok(())
 }
 
