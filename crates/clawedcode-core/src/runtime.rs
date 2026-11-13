@@ -28,7 +28,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -1717,6 +1717,113 @@ impl Runtime {
         )
     }
 
+    /// `EnterWorktree`/`ExitWorktree` — create/remove a `.claude/worktrees`
+    /// git worktree and switch `session.cwd` like the reference.
+    fn execute_worktree_tool(
+        &self,
+        tool_use_id: &str,
+        input: serde_json::Value,
+        session: &mut Session,
+        enter: bool,
+    ) -> ContentBlock {
+        let run_git = |args: &[&str], cwd: &Path| -> Result<String, String> {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .map_err(|e| format!("git unavailable: {e}"))?;
+            if out.status.success() {
+                Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+            } else {
+                Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+            }
+        };
+        let in_worktree = session.cwd.to_string_lossy().contains(".claude/worktrees");
+
+        if enter {
+            if in_worktree {
+                return ContentBlock::tool_error(
+                    tool_use_id,
+                    "Already in a worktree session".to_string(),
+                );
+            }
+            let slug = input
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("worktree")
+                .to_string();
+            let valid = slug.len() <= 64
+                && slug.split('/').all(|seg| {
+                    !seg.is_empty()
+                        && seg
+                            .chars()
+                            .all(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-'))
+                });
+            if !valid {
+                return ContentBlock::tool_error(
+                    tool_use_id,
+                    format!("Invalid worktree name: {slug}"),
+                );
+            }
+            let root = match run_git(&["rev-parse", "--show-toplevel"], &session.cwd) {
+                Ok(r) => PathBuf::from(r),
+                Err(e) => return ContentBlock::tool_error(tool_use_id, e),
+            };
+            let flat = slug.replace('/', "-");
+            let path = root.join(".claude/worktrees").join(&flat);
+            let branch = format!("worktree-{flat}");
+            if let Err(e) = run_git(
+                &["worktree", "add", &path.to_string_lossy(), "-b", &branch],
+                &root,
+            ) {
+                return ContentBlock::tool_error(
+                    tool_use_id,
+                    format!("Failed to create worktree: {e}"),
+                );
+            }
+            session.cwd = path.clone();
+            ContentBlock::tool_result(
+                tool_use_id,
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "worktreePath": path.to_string_lossy(),
+                    "worktreeBranch": branch,
+                }))
+                .unwrap_or_default(),
+            )
+        } else {
+            if !in_worktree {
+                return ContentBlock::tool_error(
+                    tool_use_id,
+                    "Not in a worktree session".to_string(),
+                );
+            }
+            let path = session.cwd.clone();
+            let root = match run_git(&["rev-parse", "--show-toplevel"], &path) {
+                Ok(r) => PathBuf::from(r),
+                Err(e) => return ContentBlock::tool_error(tool_use_id, e),
+            };
+            // The worktree's toplevel IS the worktree path — main repo is the
+            // parent of .claude/worktrees/<slug>.
+            let main = path
+                .ancestors()
+                .find(|a| a.ends_with("worktrees"))
+                .and_then(|w| w.parent())
+                .and_then(|p| p.parent())
+                .map(|p| p.to_path_buf())
+                .unwrap_or(root);
+            session.cwd = main;
+            // Try removing the worktree; dirty worktrees are left in place.
+            let _ = run_git(
+                &["worktree", "remove", &path.to_string_lossy()],
+                &session.cwd,
+            );
+            ContentBlock::tool_result(
+                tool_use_id,
+                format!("Exited worktree; returned to {}", session.cwd.display()),
+            )
+        }
+    }
+
     /// `Sleep` — wait a bounded duration, interruptible like the reference.
     fn execute_sleep_tool(&self, tool_use_id: &str, input: serde_json::Value) -> ContentBlock {
         let seconds = input
@@ -1860,7 +1967,7 @@ impl Runtime {
             "Skill" | "SendMessage" | "Sleep" | "EnterPlanMode" | "ExitPlanMode" | "WebSearch" => {
                 Some((false, false))
             }
-            "WebFetch" => Some((true, false)),
+            "WebFetch" | "EnterWorktree" | "ExitWorktree" => Some((true, false)),
             _ if is_agent_tool(tool_name) => Some((false, false)),
             _ if is_task_store_tool(tool_name) => Some((false, false)),
             _ => None,
@@ -1965,6 +2072,14 @@ impl Runtime {
 
         if tool_name == "Sleep" {
             return self.execute_sleep_tool(tool_use_id, input);
+        }
+
+        if tool_name == "EnterWorktree" {
+            return self.execute_worktree_tool(tool_use_id, input, session, true);
+        }
+
+        if tool_name == "ExitWorktree" {
+            return self.execute_worktree_tool(tool_use_id, input, session, false);
         }
 
         if tool_name == "EnterPlanMode" {

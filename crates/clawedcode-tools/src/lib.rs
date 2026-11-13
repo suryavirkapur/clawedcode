@@ -851,6 +851,26 @@ pub fn builtin_tools() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: "EnterWorktree".to_string(),
+            description: "Create an isolated git worktree (.claude/worktrees/<name>) and switch the session into it.".to_string(),
+            needs_approval: true,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Optional name; each /-separated segment may contain letters, digits, dots, underscores, dashes"
+                    }
+                }
+            }),
+        },
+        ToolSpec {
+            name: "ExitWorktree".to_string(),
+            description: "Leave the session's isolated git worktree and return to the main repository.".to_string(),
+            needs_approval: true,
+            input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
             name: "Sleep".to_string(),
             description: "Wait for a specified duration (seconds). Prefer this over `shell` sleep — it doesn't hold a shell process.".to_string(),
             needs_approval: false,
