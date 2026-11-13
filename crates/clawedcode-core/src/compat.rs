@@ -46,7 +46,7 @@ struct RuleFrontmatter {
 pub fn discover(cwd: &Path) -> Result<CompatibilitySnapshot> {
     let (settings_files, settings) = discover_settings(cwd)?;
     let skills = discover_skills(cwd)?;
-    let (memory_files, memory) = discover_memory(cwd)?;
+    let (memory_files, memory) = discover_memory_with_settings(cwd, &settings)?;
     let mcp_servers = discover_mcp_servers(cwd, &settings)?;
 
     Ok(CompatibilitySnapshot {
@@ -376,18 +376,60 @@ pub fn discover_skills(cwd: &Path) -> Result<Vec<SkillDescriptor>> {
     Ok(unique)
 }
 
+#[allow(dead_code)]
 fn discover_memory(cwd: &Path) -> Result<(Vec<PathBuf>, String)> {
-    discover_memory_with_reason(cwd, "session_start")
+    discover_memory_with_settings(cwd, &serde_json::Value::Null)
+}
+
+fn discover_memory_with_settings(
+    cwd: &Path,
+    settings: &serde_json::Value,
+) -> Result<(Vec<PathBuf>, String)> {
+    discover_memory_with_reason(cwd, "session_start", settings)
 }
 
 /// Re-fire InstructionsLoaded for each memory file with a non-startup
 /// reason (e.g. "compact") — the reference re-emits the hook when caches
 /// are cleared post-compaction.
 pub fn refire_instructions_loaded(cwd: &Path, reason: &str) {
-    let _ = discover_memory_with_reason(cwd, reason);
+    let _ = discover_memory_with_reason(cwd, reason, &serde_json::Value::Null);
 }
 
-fn discover_memory_with_reason(cwd: &Path, load_reason: &str) -> Result<(Vec<PathBuf>, String)> {
+/// `settings.claudeMdExcludes` — picomatch-style patterns matched against
+/// the memory file path (dot:true). Only User/Project/Local files exclude;
+/// managed/rules paths always load. Matches the normalized and the
+/// realpath-resolved path like the reference.
+fn claude_md_excluded(path: &Path, settings: &serde_json::Value) -> bool {
+    let Some(patterns) = settings
+        .get("claudeMdExcludes")
+        .and_then(|v| v.as_array())
+    else {
+        return false;
+    };
+    let patterns: Vec<String> = patterns
+        .iter()
+        .filter_map(|p| p.as_str())
+        .map(|p| p.replace('\\', "/"))
+        .filter(|p| !p.is_empty())
+        .collect();
+    if patterns.is_empty() {
+        return false;
+    }
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let normalized = abs.to_string_lossy().replace('\\', "/");
+    let resolved = std::fs::canonicalize(&abs)
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| normalized.clone());
+    patterns.iter().any(|pat| {
+        glob_match(pat, &normalized) || glob_match(pat, &resolved)
+    })
+}
+
+fn discover_memory_with_reason(
+    cwd: &Path,
+    load_reason: &str,
+    settings: &serde_json::Value,
+) -> Result<(Vec<PathBuf>, String)> {
     // `--bare`: minimal mode skips CLAUDE.md auto-discovery like the reference.
     if std::env::var_os("CLAWEDCODE_SIMPLE").is_some() {
         return Ok((Vec::new(), String::new()));
@@ -400,13 +442,20 @@ fn discover_memory_with_reason(cwd: &Path, load_reason: &str) -> Result<(Vec<Pat
             continue;
         }
         // Conditional rules (paths: frontmatter) defer to path_glob_match.
-        if path.parent().map(|p| p.ends_with("rules")).unwrap_or(false) {
+        let in_rules_dir = path.parent().map(|p| p.ends_with("rules")).unwrap_or(false);
+        if in_rules_dir {
             if let Ok(raw) = fs::read_to_string(&path) {
                 let (fm, _): (RuleFrontmatter, String) = parse_frontmatter_and_body(&raw);
                 if fm.paths.as_ref().is_some_and(|g| !g.is_empty()) {
                     continue;
                 }
             }
+        }
+
+        // claudeMdExcludes — only User/Project/Local memory files; rules
+        // (managed-type equivalent here) are never excluded.
+        if !in_rules_dir && claude_md_excluded(&path, settings) {
+            continue;
         }
 
         let expanded = expand_memory_file(&path, &mut Vec::new(), 0, cwd)?;
@@ -1756,6 +1805,39 @@ mod tests {
         unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
     }
 
+    #[test]
+    fn claude_md_excludes_skip_matching_memory_files() {
+        let _guard = env_lock();
+        let dir = std::env::temp_dir().join(format!("clawed-excludes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let project = dir.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("CLAUDE.md"), "project memory").unwrap();
+        std::fs::write(dir.join("CLAUDE.md"), "ancestor memory").unwrap();
+        unsafe {
+            std::env::set_var("CLAUDE_CONFIG_DIR", dir.join("cfg"));
+        }
+
+        let settings = serde_json::json!({
+            "claudeMdExcludes": ["**/proj/CLAUDE.md"]
+        });
+        let (files, memory) =
+            discover_memory_with_settings(&project, &settings).unwrap();
+        assert!(!files.iter().any(|p| p == &project.join("CLAUDE.md")));
+        assert!(files.iter().any(|p| p == &dir.join("CLAUDE.md")));
+        assert!(!memory.contains("project memory"));
+        assert!(memory.contains("ancestor memory"));
+
+        // No excludes → both load.
+        let (files, _) =
+            discover_memory_with_settings(&project, &serde_json::Value::Null).unwrap();
+        assert!(files.iter().any(|p| p == &project.join("CLAUDE.md")));
+
+        unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn discover_memory_merges_layers_in_priority_order() {
         let _guard = env_lock();
         let root = temp_dir("layers");

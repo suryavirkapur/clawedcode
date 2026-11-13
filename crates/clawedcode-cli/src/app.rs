@@ -1545,11 +1545,21 @@ fn apply_cli_config_overrides(config: &mut AppConfig, cli: &Cli) {
             if cli.effort.is_none() {
                 if let Some(effort) = json.get("effortLevel").and_then(|v| v.as_str()) {
                     config.runtime.effort = Some(effort.to_string());
+                } else if json.get("fastMode").and_then(|v| v.as_bool()) == Some(true)
+                    && config.runtime.effort.is_none()
+                {
+                    // fastMode on → the reference's fast inference mode; we map
+                    // it to the low-effort toggle like alt+o does.
+                    config.runtime.effort = Some("low".to_string());
                 }
             }
             // alwaysThinkingEnabled: last file wins like merged settings.
             if let Some(v) = json.get("alwaysThinkingEnabled").and_then(|v| v.as_bool()) {
                 thinking_enabled = Some(v);
+            }
+            // showThinkingSummaries: shows thinking in the transcript view.
+            if let Some(v) = json.get("showThinkingSummaries").and_then(|v| v.as_bool()) {
+                config.ui.show_thinking = v;
             }
         }
         // alwaysThinkingEnabled: false disables thinking unless --thinking
@@ -4638,6 +4648,45 @@ mod tests {
                 mode
             );
         }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn settings_fast_mode_seeds_low_effort() {
+        let _guard = env_lock();
+        let dir = temp_sessions_dir("fastmode_settings");
+        let fake_home = dir.join("home");
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".claude")).unwrap();
+        std::fs::create_dir_all(&fake_home).unwrap();
+        unsafe {
+            std::env::set_var("HOME", &fake_home);
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+            std::env::remove_var("CLAWEDCODE_SETTING_SOURCES");
+            std::env::remove_var("CLAWEDCODE_SETTINGS");
+        }
+        std::fs::write(
+            project.join(".claude/settings.json"),
+            r#"{"fastMode": true}"#,
+        )
+        .unwrap();
+
+        let mut cli = make_cli(&dir.join("data"));
+        cli.cwd = project.clone();
+        let mut config = AppConfig::default();
+        apply_cli_config_overrides(&mut config, &cli);
+        assert_eq!(config.runtime.effort.as_deref(), Some("low"));
+
+        // An explicit effortLevel wins over fastMode.
+        std::fs::write(
+            project.join(".claude/settings.json"),
+            r#"{"fastMode": true, "effortLevel": "high"}"#,
+        )
+        .unwrap();
+        let mut config = AppConfig::default();
+        apply_cli_config_overrides(&mut config, &cli);
+        assert_eq!(config.runtime.effort.as_deref(), Some("high"));
 
         std::fs::remove_dir_all(&dir).ok();
     }

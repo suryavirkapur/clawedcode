@@ -196,6 +196,10 @@ static CUSTOM_SPINNER_VERBS: std::sync::RwLock<Option<Vec<String>>> =
 static CUSTOM_SPINNER_TIPS: std::sync::RwLock<Option<(bool, Vec<String>)>> =
     std::sync::RwLock::new(None);
 
+/// `settings.spinnerTipsEnabled` (default true) hides the tip row entirely.
+static SPINNER_TIPS_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
 const DEFAULT_SPINNER_TIPS: &[&str] = &[
     "Use /help to see all available commands",
     "Press shift+tab to cycle permission modes",
@@ -220,6 +224,12 @@ fn apply_spinner_tips(settings: &serde_json::Value) {
     });
     if let Ok(mut slot) = CUSTOM_SPINNER_TIPS.write() {
         *slot = tips;
+    }
+    if let Some(enabled) = settings
+        .get("spinnerTipsEnabled")
+        .and_then(|v| v.as_bool())
+    {
+        SPINNER_TIPS_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -3590,6 +3600,34 @@ fn welcome_lines(ctx: &TuiContext, width: usize) -> Vec<Line<'static>> {
         let _ = right_width;
         lines.push(Line::from(spans));
     }
+
+    // `settings.companyAnnouncements` — one announcement shown at startup,
+    // randomly selected like the reference's LogoV2.
+    if let Some(announcement) = ctx
+        .runtime
+        .compatibility()
+        .settings
+        .get("companyAnnouncements")
+        .and_then(|a| a.as_array())
+        .and_then(|a| {
+            let items: Vec<&str> = a.iter().filter_map(|v| v.as_str()).collect();
+            if items.is_empty() {
+                return None;
+            }
+            let pick = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() as usize)
+                .unwrap_or(0))
+                % items.len();
+            Some(items[pick])
+        })
+    {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!(" ※ {announcement}"),
+            Style::default().fg(pal().muted).add_modifier(Modifier::ITALIC),
+        )));
+    }
     lines
 }
 
@@ -4253,6 +4291,9 @@ fn spinner_line(turn_started_at: Option<std::time::Instant>, tokens: u64) -> Lin
 }
 
 fn spinner_tip_line(turn_started_at: Option<std::time::Instant>) -> Line<'static> {
+    if !SPINNER_TIPS_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return Line::from("");
+    }
     let elapsed = turn_started_at
         .map(|start| start.elapsed().as_millis())
         .unwrap_or(0);

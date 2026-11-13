@@ -450,6 +450,24 @@ impl Runtime {
             .collect();
         let mut tools = builtin_tools();
 
+        // includeGitInstructions (default true) + CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS
+        // strip the git workflow block from the shell tool description.
+        let git_env = std::env::var("CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        let git_setting = compatibility
+            .settings
+            .get("includeGitInstructions")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        if git_env || !git_setting {
+            if let Some(spec) = tools.iter_mut().find(|t| t.name == "shell") {
+                if let Some((base, _)) = spec.description.split_once("# Committing changes with git") {
+                    spec.description = base.trim_end().to_string();
+                }
+            }
+        }
+
         for (server_name, discovered_tools) in discover_mcp_tools_sync(&compatibility.mcp_servers) {
             let Some(config) = compatibility.mcp_servers.get(&server_name) else {
                 continue;
