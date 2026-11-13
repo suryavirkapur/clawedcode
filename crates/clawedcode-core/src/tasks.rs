@@ -412,8 +412,91 @@ pub fn execute_task_tool(
         TASK_UPDATE_TOOL_NAME => {
             execute_task_update(TaskStore::for_session(session)?, input).map(Some)
         }
+        "TodoWrite" => execute_todo_write(TaskStore::for_session(session)?, input).map(Some),
         _ => Ok(None),
     }
+}
+
+/// The reference's legacy `TodoWrite`: `todos: [{content, status,
+/// activeForm?}]` replaces the whole list. When every item is completed,
+/// the list clears entirely.
+fn execute_todo_write(store: TaskStore, input: Value) -> Result<ToolResult, String> {
+    let Some(todos) = input.get("todos").and_then(Value::as_array) else {
+        return Ok(missing_param("todos"));
+    };
+    let all_done = !todos.is_empty()
+        && todos
+            .iter()
+            .all(|t| t.get("status").and_then(Value::as_str) == Some("completed"));
+    let mut existing = store.list_tasks()?;
+
+    if all_done {
+        for task in &existing {
+            let _ = store.delete_task(&task.id)?;
+        }
+        return Ok(ToolResult {
+            content: "Todos have been modified successfully.".to_string(),
+            is_error: false,
+        });
+    }
+
+    for (index, todo) in todos.iter().enumerate() {
+        let content = todo
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let status = todo
+            .get("status")
+            .and_then(Value::as_str)
+            .and_then(|s| TaskStatus::from_input(s).ok().flatten())
+            .unwrap_or(TaskStatus::Pending);
+        let active_form = todo
+            .get("activeForm")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if let Some(task) = existing.get_mut(index) {
+            store.update_task(
+                &task.id,
+                TaskPatch {
+                    subject: Some(content),
+                    description: None,
+                    active_form,
+                    status: Some(Some(status)),
+                    owner: None,
+                    metadata_merge: None,
+                    add_blocks: Vec::new(),
+                    add_blocked_by: Vec::new(),
+                },
+            )?;
+        } else {
+            let created = store.create_task(content.clone(), content, active_form, None)?;
+            if status != TaskStatus::Pending {
+                store.update_task(
+                    &created.id,
+                    TaskPatch {
+                        subject: None,
+                        description: None,
+                        active_form: None,
+                        status: Some(Some(status)),
+                        owner: None,
+                        metadata_merge: None,
+                        add_blocks: Vec::new(),
+                        add_blocked_by: Vec::new(),
+                    },
+                )?;
+            }
+            // Preserve list order for subsequent updates.
+            existing.push(created);
+        }
+    }
+    for task in existing.iter().skip(todos.len()) {
+        let _ = store.delete_task(&task.id)?;
+    }
+    Ok(ToolResult {
+        content: "Todos have been modified successfully. Ensure that you continue to use the todo list to track your progress.".to_string(),
+        is_error: false,
+    })
 }
 
 pub fn sanitize_path_component(input: &str) -> String {

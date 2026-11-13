@@ -851,6 +851,48 @@ pub fn builtin_tools() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: "TodoWrite".to_string(),
+            description: "Replace the session todo list. Mark work in_progress as you go and completed when done.".to_string(),
+            needs_approval: false,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string"},
+                                "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                                "activeForm": {"type": "string"}
+                            },
+                            "required": ["content", "status"]
+                        }
+                    }
+                },
+                "required": ["todos"]
+            }),
+        },
+        ToolSpec {
+            name: "ToolSearch".to_string(),
+            description: "Search available tools by keyword. Use \"select:<tool_name>\" to fetch a tool's full schema.".to_string(),
+            needs_approval: false,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Keywords to search, or select:<tool_name>"
+                    },
+                    "max_results": {
+                        "type": "number",
+                        "description": "Maximum results (default 5)"
+                    }
+                },
+                "required": ["query"]
+            }),
+        },
+        ToolSpec {
             name: "EnterWorktree".to_string(),
             description: "Create an isolated git worktree (.claude/worktrees/<name>) and switch the session into it.".to_string(),
             needs_approval: true,

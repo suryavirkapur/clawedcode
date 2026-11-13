@@ -1717,6 +1717,65 @@ impl Runtime {
         )
     }
 
+    /// `ToolSearch` — keyword search over the runtime's available tools,
+    /// with `select:<name>` returning the full schema like the reference.
+    fn execute_tool_search(&self, tool_use_id: &str, input: serde_json::Value) -> ContentBlock {
+        let Some(query) = input.get("query").and_then(|v| v.as_str()) else {
+            return ContentBlock::tool_error(tool_use_id, "Missing 'query' parameter");
+        };
+        let max = input
+            .get("max_results")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(5) as usize;
+
+        if let Some(name) = query.strip_prefix("select:") {
+            let name = name.trim();
+            return match self.tools.iter().find(|t| t.name == name) {
+                Some(spec) => ContentBlock::tool_result(
+                    tool_use_id,
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "matches": [spec.name],
+                        "query": query,
+                        "schema": spec.input_schema,
+                        "total_deferred_tools": 0,
+                    }))
+                    .unwrap_or_default(),
+                ),
+                None => ContentBlock::tool_error(tool_use_id, format!("No tool named {name}")),
+            };
+        }
+
+        let terms: Vec<String> = query
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_lowercase())
+            .collect();
+        let mut scored: Vec<(usize, &clawedcode_tools::ToolSpec)> = self
+            .tools
+            .iter()
+            .filter_map(|spec| {
+                let hay = format!("{} {}", spec.name, spec.description).to_lowercase();
+                let score = terms.iter().filter(|t| hay.contains(t.as_str())).count();
+                (score > 0).then_some((score, spec))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.name.cmp(&b.1.name)));
+        let matches: Vec<String> = scored
+            .iter()
+            .take(max)
+            .map(|(_, s)| s.name.clone())
+            .collect();
+        ContentBlock::tool_result(
+            tool_use_id,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "matches": matches,
+                "query": query,
+                "total_deferred_tools": 0,
+            }))
+            .unwrap_or_default(),
+        )
+    }
+
     /// `EnterWorktree`/`ExitWorktree` — create/remove a `.claude/worktrees`
     /// git worktree and switch `session.cwd` like the reference.
     fn execute_worktree_tool(
@@ -1964,9 +2023,8 @@ impl Runtime {
         match tool_name {
             TASK_OUTPUT_TOOL_NAME => Some((false, false)),
             TASK_STOP_TOOL_NAME => Some((true, true)),
-            "Skill" | "SendMessage" | "Sleep" | "EnterPlanMode" | "ExitPlanMode" | "WebSearch" => {
-                Some((false, false))
-            }
+            "Skill" | "SendMessage" | "Sleep" | "EnterPlanMode" | "ExitPlanMode" | "WebSearch"
+            | "ToolSearch" => Some((false, false)),
             "WebFetch" | "EnterWorktree" | "ExitWorktree" => Some((true, false)),
             _ if is_agent_tool(tool_name) => Some((false, false)),
             _ if is_task_store_tool(tool_name) => Some((false, false)),
@@ -2090,6 +2148,10 @@ impl Runtime {
                  the plan."
                     .to_string(),
             );
+        }
+
+        if tool_name == "ToolSearch" {
+            return self.execute_tool_search(tool_use_id, input);
         }
 
         if tool_name == "WebSearch" {
@@ -2635,7 +2697,7 @@ fn is_write_like(tool_name: &str) -> bool {
 fn is_task_store_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "TaskCreate" | "TaskList" | "TaskGet" | "TaskUpdate"
+        "TaskCreate" | "TaskList" | "TaskGet" | "TaskUpdate" | "TodoWrite"
     )
 }
 
