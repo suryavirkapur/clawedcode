@@ -730,6 +730,7 @@ pub fn run_with_context(mut ctx: TuiContext) -> Result<()> {
         &ctx.session().cwd,
     );
     apply_spinner_tips(&ctx.runtime.compatibility().settings);
+    apply_respect_gitignore(&ctx.runtime.compatibility().settings);
     enable_raw_mode()?;
     execute!(
         stdout(),
@@ -8203,10 +8204,65 @@ fn file_palette_query(input: &str, cursor: usize) -> Option<(usize, String)> {
 
 /// Builds the cwd-relative file index once (lazy). Skips hidden dirs and the
 /// usual heavy directories, like Claude Code's file palette.
+/// `settings.respectGitignore` (default true) — controls whether the
+/// @-picker's git index excludes ignored files.
+static RESPECT_GITIGNORE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+fn apply_respect_gitignore(settings: &serde_json::Value) {
+    let respect = settings
+        .get("respectGitignore")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    RESPECT_GITIGNORE.store(respect, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `git ls-files --cached --others` — respects .gitignore via
+/// `--exclude-standard` unless `respectGitignore` is false (the reference's
+/// untrackedArgs). Synthesizes directory entries for the palette.
+fn git_file_index(cwd: &std::path::Path, max: usize) -> Option<Vec<String>> {
+    let mut args = vec!["ls-files", "--cached", "--others", "-z"];
+    if RESPECT_GITIGNORE.load(std::sync::atomic::Ordering::Relaxed) {
+        args.push("--exclude-standard");
+    }
+    let out = std::process::Command::new("git")
+        .args(&args)
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let mut entries: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for path in String::from_utf8_lossy(&out.stdout).split('\0') {
+        let path = path.trim();
+        if path.is_empty() {
+            continue;
+        }
+        // Parent directory entries like the manual walk emits.
+        let mut prefix = String::new();
+        let segments: Vec<&str> = path.split('/').collect();
+        for seg in &segments[..segments.len().saturating_sub(1)] {
+            prefix.push_str(seg);
+            prefix.push('/');
+            entries.insert(prefix.clone());
+        }
+        entries.insert(path.to_string());
+        if entries.len() >= max {
+            break;
+        }
+    }
+    Some(entries.into_iter().collect())
+}
+
 fn build_file_index(cwd: &std::path::Path) -> Vec<String> {
     const SKIP: &[&str] = &[".git", "target", "node_modules", "vendor", "dist", "build"];
     const MAX_ENTRIES: usize = 5000;
     const MAX_DEPTH: usize = 8;
+
+    if let Some(git_entries) = git_file_index(cwd, MAX_ENTRIES) {
+        return git_entries;
+    }
 
     let mut entries = Vec::new();
     let mut stack = vec![(cwd.to_path_buf(), String::new(), 0usize)];
@@ -12062,6 +12118,41 @@ mod command_policy_tests {
             let out =
                 with_image_references("describe", Some("describe".to_string()), &images).unwrap();
             assert_eq!(out, "describe");
+        }
+
+        #[test]
+        fn git_file_index_honors_respect_gitignore() {
+            let dir = std::env::temp_dir().join(format!(
+                "clawed-gitindex-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("src")).unwrap();
+            std::fs::write(dir.join("src/main.rs"), "fn main() {}").unwrap();
+            std::fs::write(dir.join("secret.log"), "log").unwrap();
+            std::fs::write(dir.join(".gitignore"), "*.log\n").unwrap();
+            let init = std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&dir)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if init {
+                std::process::Command::new("git")
+                    .args(["add", "."])
+                    .current_dir(&dir)
+                    .status()
+                    .unwrap();
+                RESPECT_GITIGNORE.store(true, std::sync::atomic::Ordering::Relaxed);
+                let respected = git_file_index(&dir, 5000).unwrap();
+                assert!(respected.iter().any(|e| e == "src/main.rs"));
+                assert!(!respected.iter().any(|e| e == "secret.log"));
+                RESPECT_GITIGNORE.store(false, std::sync::atomic::Ordering::Relaxed);
+                let all = git_file_index(&dir, 5000).unwrap();
+                assert!(all.iter().any(|e| e == "secret.log"));
+                RESPECT_GITIGNORE.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         #[test]
