@@ -1606,6 +1606,33 @@ impl Runtime {
                 })
             })
         {
+            if !result.is_error {
+                let event = match tool_name {
+                    "TaskCreate" => Some("TaskCreated"),
+                    "TaskUpdate"
+                        if input
+                            .get("status")
+                            .and_then(|s| s.as_str())
+                            .is_some_and(|s| s == "completed") =>
+                    {
+                        Some("TaskCompleted")
+                    }
+                    _ => None,
+                };
+                if let Some(event) = event {
+                    crate::hooks::run_simple_event_hooks(
+                        &crate::hooks::load_hooks(&session.cwd),
+                        event,
+                        &session.id.to_string(),
+                        &session.cwd,
+                        serde_json::json!({
+                            "tool_name": tool_name,
+                            "tool_input": input,
+                            "tool_response": result.content.chars().take(500).collect::<String>(),
+                        }),
+                    );
+                }
+            }
             return finish_tool_result(tool_use_id, result);
         }
 

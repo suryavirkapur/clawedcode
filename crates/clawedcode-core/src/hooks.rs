@@ -597,6 +597,24 @@ pub fn run_notification_hooks(config: &HooksConfig, session_id: &str, cwd: &Path
     }
 }
 
+/// Generic fire-and-forget runner for events whose payload is just the
+/// shared base plus an extra object (TaskCreated, TaskCompleted, …).
+pub fn run_simple_event_hooks(
+    config: &HooksConfig,
+    event: &str,
+    session_id: &str,
+    cwd: &Path,
+    extra: serde_json::Value,
+) {
+    if config.disabled {
+        return;
+    }
+    let stdin = session_hook_input(event, session_id, cwd, extra);
+    for hook in hooks_for_event(config, event) {
+        let _ = run_hook_command(&hook.command, cwd, &stdin);
+    }
+}
+
 /// Run `PreCompact` hooks before session compaction — fire-and-forget.
 pub fn run_pre_compact_hooks(config: &HooksConfig, session_id: &str, cwd: &Path) {
     if config.disabled {
