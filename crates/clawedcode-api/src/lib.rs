@@ -532,7 +532,9 @@ impl Provider for MockWriteProvider {
 /// A mock provider that emits an `ask_user_question` ToolUse — exercising
 /// the interactive question dialog — then a final text response.
 #[derive(Debug, Default, Clone)]
-pub struct MockAskProvider;
+pub struct MockAskProvider {
+    pub multi_select: bool,
+}
 
 impl Provider for MockAskProvider {
     fn complete(
@@ -545,6 +547,7 @@ impl Provider for MockAskProvider {
 
     fn stream(&self, request: &CompletionRequest) -> EventStream {
         let req = request.clone();
+        let multi = self.multi_select;
         let (tx, rx) = mpsc::channel::<Result<ApiEvent, ProviderError>>(32);
 
         tokio::spawn(async move {
@@ -562,9 +565,10 @@ impl Provider for MockAskProvider {
                                     "header": "Approach",
                                     "options": [
                                         {"label": "Incremental", "description": "Small safe steps, verify each"},
-                                        {"label": "Rewrite", "description": "Replace the module in one pass"}
+                                        {"label": "Rewrite", "description": "Replace the module in one pass"},
+                                        {"label": "Delegate", "description": "Hand off to a sub-agent"}
                                     ],
-                                    "multiSelect": false
+                                    "multiSelect": multi
                                 }]
                             })
                             .to_string(),
@@ -1673,7 +1677,11 @@ pub fn create_provider() -> BoxedProvider {
             }
             "mock_ask" => {
                 tracing::info!("Using mock ask provider");
-                return Box::new(MockAskProvider);
+                return Box::new(MockAskProvider::default());
+            }
+            "mock_ask_multi" => {
+                tracing::info!("Using mock ask provider (multiSelect)");
+                return Box::new(MockAskProvider { multi_select: true });
             }
             #[cfg(feature = "openai")]
             "deepseek" => {

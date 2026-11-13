@@ -983,6 +983,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     let mut vim_pending: char = '\0';
     let mut vim_register = String::new();
     let mut question_answers: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    let mut question_multi: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
     let mut active_turn: Option<ActiveTurn> = None;
     let mut background_turns: Vec<BackgroundTurn> = Vec::new();
     let mut bg_approval_owner: Option<usize> = None;
@@ -1052,6 +1053,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
             approval_explain = false;
             question_index = 0;
             question_answers.clear();
+            question_multi.clear();
             approval_debug = false;
         }
 
@@ -1199,6 +1201,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                     question_index,
                     approval_selection,
                     approval_amend.as_deref(),
+                    &question_multi,
                 );
             } else if awaiting_approval.is_some() && approval_height > 0 {
                 render_approval_selector(
@@ -1649,6 +1652,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                                         &mut awaiting_approval,
                                         &mut question_index,
                                         &mut question_answers,
+                                        &mut question_multi,
                                         &mut approval_selection,
                                         &mut handler,
                                         &active_turn,
@@ -1714,11 +1718,49 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                                 }
                                 question_index = 0;
                                 question_answers.clear();
+                                question_multi.clear();
+                            }
+                            KeyCode::Char(' ')
+                                if q.as_ref().map(|q| q.multi_select).unwrap_or(false)
+                                    && approval_selection < option_count - 1 =>
+                            {
+                                // multiSelect: space toggles the focused option.
+                                if !question_multi.insert(approval_selection) {
+                                    question_multi.remove(&approval_selection);
+                                }
                             }
                             KeyCode::Enter => {
                                 let is_other = approval_selection == option_count - 1;
+                                let multi = q.as_ref().map(|q| q.multi_select).unwrap_or(false);
                                 if is_other {
                                     approval_amend = Some(String::new());
+                                } else if multi {
+                                    // Comma-separated labels per the reference's
+                                    // multiSelect answer format.
+                                    if question_multi.is_empty() {
+                                        continue;
+                                    }
+                                    let joined = question_multi
+                                        .iter()
+                                        .filter_map(|i| {
+                                            q.as_ref()
+                                                .and_then(|q| q.options.get(*i))
+                                                .map(|o| o.label.clone())
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(", ");
+                                    advance_question(
+                                        Some(joined),
+                                        &mut awaiting_approval,
+                                        &mut question_index,
+                                        &mut question_answers,
+                                        &mut question_multi,
+                                        &mut approval_selection,
+                                        &mut handler,
+                                        &active_turn,
+                                        &background_turns,
+                                        &mut bg_approval_owner,
+                                    );
                                 } else {
                                     let label = q
                                         .as_ref()
@@ -1729,6 +1771,7 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                                         &mut awaiting_approval,
                                         &mut question_index,
                                         &mut question_answers,
+                                        &mut question_multi,
                                         &mut approval_selection,
                                         &mut handler,
                                         &active_turn,
@@ -3235,6 +3278,7 @@ fn advance_question(
     awaiting_approval: &mut Option<ApprovalRequest>,
     question_index: &mut usize,
     question_answers: &mut serde_json::Map<String, serde_json::Value>,
+    question_multi: &mut std::collections::BTreeSet<usize>,
     selection: &mut usize,
     handler: &mut ReplHandler,
     active_turn: &Option<ActiveTurn>,
@@ -3253,6 +3297,7 @@ fn advance_question(
     if *question_index + 1 < questions.len() {
         *question_index += 1;
         *selection = 0;
+        question_multi.clear();
         return;
     }
 
@@ -3272,6 +3317,7 @@ fn advance_question(
     }
     *question_index = 0;
     question_answers.clear();
+    question_multi.clear();
     *selection = 0;
     handler.state = AppState::Idle;
 }
@@ -3364,6 +3410,7 @@ fn render_question_dialog(
     question_index: usize,
     selected: usize,
     amend: Option<&str>,
+    multi_selected: &std::collections::BTreeSet<usize>,
 ) {
     if area.height == 0 {
         return;
@@ -3403,9 +3450,18 @@ fn render_question_dialog(
         } else {
             Style::default().fg(pal().text)
         };
+        let checkbox = if question.multi_select {
+            if multi_selected.contains(&index) {
+                "[x] "
+            } else {
+                "[ ] "
+            }
+        } else {
+            ""
+        };
         lines.push(Line::from(vec![
             Span::styled(format!(" {marker} "), style),
-            Span::styled(option.label.clone(), style),
+            Span::styled(format!("{checkbox}{}", option.label), style),
         ]));
         lines.push(Line::from(Span::styled(
             format!("    {}", option.description),
@@ -3442,6 +3498,8 @@ fn render_question_dialog(
     };
     let footer = if amend.is_some() {
         format!(" Enter to submit · Esc to cancel{progress}")
+    } else if question.multi_select {
+        format!(" ↑/↓ select · Space to toggle · Enter to submit · Esc to skip{progress}")
     } else {
         format!(" ↑/↓ select · Enter to answer · Esc to skip{progress}")
     };
@@ -7264,9 +7322,18 @@ fn apply_model_choice(ctx: &mut TuiContext, handler: &mut ReplHandler, model: &s
 /// One row in the `/tasks` dialog — parked model turns (foregroundable),
 /// background shell tasks (killable with `x`), and sub-agent tasks.
 enum TaskEntry {
-    Turn { index: usize, label: String },
-    Shell { id: String, desc: String, status: String },
-    Agent { line: String },
+    Turn {
+        index: usize,
+        label: String,
+    },
+    Shell {
+        id: String,
+        desc: String,
+        status: String,
+    },
+    Agent {
+        line: String,
+    },
 }
 
 fn task_entries(ctx: &TuiContext, background_turns: &[BackgroundTurn]) -> Vec<TaskEntry> {
