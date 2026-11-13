@@ -27,6 +27,7 @@ use std::{
 
 use crate::bootstrap::{BootstrappedApp, ExecutionMode};
 use crate::cli::Cli;
+use clap::CommandFactory;
 
 #[derive(Debug, Serialize)]
 struct ResolvedConfig<'a> {
@@ -389,6 +390,11 @@ pub async fn execute(boot: BootstrappedApp) -> Result<()> {
                     println!("{} · {}", agent.agent_type, model);
                 }
             }
+            Ok(())
+        }
+        ExecutionMode::Completion(shell) => {
+            let mut cmd = Cli::command();
+            clap_complete::generate(shell, &mut cmd, "clawedcode", &mut std::io::stdout());
             Ok(())
         }
     }

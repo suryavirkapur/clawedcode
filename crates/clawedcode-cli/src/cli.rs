@@ -263,6 +263,8 @@ pub enum Command {
     Doctor,
     /// List configured agents (reference `claude agents`).
     Agents,
+    /// Generate shell completion script (bash, zsh, fish, powershell, elvish).
+    Completion { shell: clap_complete::Shell },
     /// Manage plugins (reference `claude plugin`).
     Plugin {
         #[command(subcommand)]
@@ -367,7 +369,7 @@ impl Cli {
             Some(Command::Remote { .. }) => Intent::Remote,
             Some(Command::Mcp { .. }) => Intent::Mcp,
             Some(Command::Doctor) | Some(Command::Plugin { .. }) => Intent::Interactive,
-            Some(Command::Agents) => Intent::Interactive,
+            Some(Command::Agents) | Some(Command::Completion { .. }) => Intent::Interactive,
             None => Intent::Interactive,
         }
     }

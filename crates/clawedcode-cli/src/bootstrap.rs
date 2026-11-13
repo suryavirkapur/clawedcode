@@ -32,6 +32,7 @@ pub enum ExecutionMode {
     Doctor,
     Plugin(crate::cli::PluginAction),
     Agents,
+    Completion(clap_complete::Shell),
 }
 
 #[derive(Debug, Clone)]
@@ -366,6 +367,7 @@ pub fn resolve_mode(cli: &Cli) -> Result<ExecutionMode> {
         Command::Mcp { action } => Ok(ExecutionMode::Mcp(action)),
         Command::Doctor => Ok(ExecutionMode::Doctor),
         Command::Agents => Ok(ExecutionMode::Agents),
+        Command::Completion { shell } => Ok(ExecutionMode::Completion(shell)),
         Command::Plugin { action } => Ok(ExecutionMode::Plugin(action)),
     }
 }

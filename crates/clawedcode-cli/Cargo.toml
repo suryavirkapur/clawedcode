@@ -23,6 +23,8 @@ clawedcode-core = { path = "../clawedcode-core", version = "0.1.1" }
 clawedcode-mcp = { path = "../clawedcode-mcp", version = "0.1.1" }
 clawedcode-tui = { path = "../clawedcode-tui", version = "0.1.1" }
 clawedcode-tools = { path = "../clawedcode-tools", version = "0.1.1" }
+clap_complete = "4.6.11"
+libc = "0.2.191"
 
 [[bin]]
 name = "clawedcode"
