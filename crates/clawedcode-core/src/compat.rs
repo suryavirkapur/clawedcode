@@ -328,6 +328,35 @@ fn discover_memory(cwd: &Path) -> Result<(Vec<PathBuf>, String)> {
 
         memory_files.push(path.clone());
         sections.push(format!("<!-- {} -->\n{}", path.display(), expanded.trim()));
+
+        // Fire InstructionsLoaded per loaded memory file like the reference.
+        let memory_type = if claude_home()
+            .map(|h| path == h.join("CLAUDE.md"))
+            .unwrap_or(false)
+        {
+            "User"
+        } else if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.contains("local"))
+        {
+            "Local"
+        } else {
+            "Project"
+        };
+        crate::hooks::run_simple_event_hooks(
+            &crate::hooks::load_hooks(cwd),
+            "InstructionsLoaded",
+            "",
+            cwd,
+            serde_json::json!({
+                "file_path": std::path::absolute(&path)
+                    .unwrap_or_else(|_| path.clone())
+                    .to_string_lossy(),
+                "memory_type": memory_type,
+                "load_reason": "session_start",
+            }),
+        );
     }
 
     Ok((memory_files, sections.join("\n\n")))
