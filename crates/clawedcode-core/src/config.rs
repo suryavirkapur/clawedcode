@@ -31,6 +31,9 @@ pub struct UiConfig {
 pub struct RuntimeConfig {
     pub max_turns: u16,
     pub session_history_limit: usize,
+    /// Optional reasoning effort level: low|medium|high|max.
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +55,7 @@ impl Default for AppConfig {
                 show_thinking: false,
             },
             runtime: RuntimeConfig {
+                effort: None,
                 max_turns: 64,
                 session_history_limit: 2_000,
             },

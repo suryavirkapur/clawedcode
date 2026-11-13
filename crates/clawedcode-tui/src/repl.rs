@@ -459,6 +459,8 @@ const BUILTIN_COMMANDS: &[&str] = &[
     "/branch",
     "/cost",
     "/session",
+    "/effort",
+    "/fast",
     "/output-style",
     "/commit-push-pr",
     "/pr-comments",
@@ -5528,6 +5530,60 @@ PR number: {args}"#
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
+                "/effort" => {
+                    let arg = prompt
+                        .strip_prefix("/effort")
+                        .map(str::trim)
+                        .unwrap_or_default();
+                    if arg.is_empty() {
+                        let cur = ctx.effort().unwrap_or("default");
+                        handler.show_panel(
+                            "Effort".to_string(),
+                            vec![
+                                format!("Current: {cur}"),
+                                "Levels: low, medium, high, max".to_string(),
+                                "Use /effort <level> to set, /effort off to clear.".to_string(),
+                            ],
+                        );
+                    } else {
+                        match arg {
+                            "off" | "none" | "clear" | "default" => {
+                                ctx.set_effort(None);
+                                persist_runtime_key("effort", None);
+                                handler.push_overlay("[info] Effort reset to default".to_string());
+                            }
+                            level => {
+                                if clawedcode_api::EffortLevel::parse(level).is_some() {
+                                    ctx.set_effort(Some(level));
+                                    persist_runtime_key("effort", Some(level));
+                                    handler.push_overlay(format!("[info] Effort set to {level}"));
+                                } else {
+                                    handler.push_overlay(format!(
+                                        "[error] Unknown effort \"{level}\" — expected low|medium|high|max"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/fast" => {
+                    // Fast mode = lowest reasoning effort, like the reference's
+                    // speed toggle.
+                    let was_fast = ctx.effort() == Some("low");
+                    if was_fast {
+                        ctx.set_effort(None);
+                        persist_runtime_key("effort", None);
+                        handler.push_overlay("[info] Fast mode off".to_string());
+                    } else {
+                        ctx.set_effort(Some("low"));
+                        persist_runtime_key("effort", Some("low"));
+                        handler.push_overlay("[info] Fast mode on (effort: low)".to_string());
+                    }
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
                 "/output-style" => {
                     handler.show_panel(
                         "Output style".to_string(),
@@ -6327,6 +6383,16 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
             source: CommandSource::BuiltIn,
         },
         CommandEntry {
+            name: "/effort".to_string(),
+            description: "Show or set reasoning effort".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/fast".to_string(),
+            description: "Toggle fast mode (low reasoning effort)".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
             name: "/output-style".to_string(),
             description: "Show or pick output style".to_string(),
             source: CommandSource::BuiltIn,
@@ -7065,44 +7131,71 @@ fn render_theme_picker(frame: &mut Frame, area: Rect, selected: usize) {
     );
 }
 
-/// Write `key = "value"` (or `key = value` for bools) inside the `[ui]`
-/// section of config.toml, appending the section when absent.
-fn persist_ui_key(key: &str, value: &str) {
+/// Write `key = "value"` (or `key = value` for bools) inside the `[section]`
+/// table of config.toml, appending the table when absent. `None` removes
+/// the key.
+fn persist_config_key(section: &str, key: &str, value: Option<&str>) {
     let Some(path) = clawedcode_core::config::default_config_path() else {
         return;
     };
     let Ok(existing) = fs::read_to_string(&path) else {
         return;
     };
-    let rendered = if value == "on" || value == "off" {
-        format!("{key} = {}", value == "on")
-    } else {
-        format!("{key} = \"{value}\"")
-    };
-    let mut in_ui = false;
+    let rendered = value.map(|v| {
+        if v == "on" || v == "off" {
+            format!("{key} = {}", v == "on")
+        } else {
+            format!("{key} = \"{v}\"")
+        }
+    });
+    let header = format!("[{section}]");
+    let mut in_section = false;
+    let mut section_seen = false;
+    let mut section_end = 0usize;
     let mut found = false;
-    let updated: String = existing
+    let mut updated: Vec<String> = existing
         .lines()
-        .map(|line| {
+        .enumerate()
+        .filter_map(|(index, line)| {
             let t = line.trim_start();
             if t.starts_with('[') {
-                in_ui = t.starts_with("[ui]");
-                return line.to_string();
+                if in_section {
+                    section_end = index;
+                }
+                in_section = t.starts_with(&header);
+                section_seen |= in_section;
+                return Some(line.to_string());
             }
-            if in_ui && t.starts_with(key) && t.contains('=') {
+            if in_section && t.starts_with(key) && t.contains('=') {
                 found = true;
                 return rendered.clone();
             }
-            line.to_string()
+            Some(line.to_string())
         })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let updated = if found {
-        updated
-    } else {
-        format!("{updated}\n[ui]\n{rendered}\n")
-    };
-    let _ = fs::write(&path, updated);
+        .collect();
+    if in_section {
+        section_end = updated.len();
+    }
+    if !found {
+        if let Some(rendered) = rendered {
+            if section_seen {
+                // Insert at the end of the existing `[section]` table.
+                updated.insert(section_end, rendered);
+            } else {
+                updated.push(header);
+                updated.push(rendered);
+            }
+        }
+    }
+    let _ = fs::write(&path, updated.join("\n"));
+}
+
+fn persist_ui_key(key: &str, value: &str) {
+    persist_config_key("ui", key, Some(value));
+}
+
+fn persist_runtime_key(key: &str, value: Option<&str>) {
+    persist_config_key("runtime", key, value);
 }
 
 fn apply_theme_choice(ctx: &mut TuiContext, handler: &mut ReplHandler, theme: &str) {

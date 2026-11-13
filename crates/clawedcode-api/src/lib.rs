@@ -10,6 +10,47 @@ use tokio::sync::mpsc;
 
 // --- Request / Response types ---
 
+/// Reasoning effort level surfaced to providers that support it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffortLevel {
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
+impl EffortLevel {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_lowercase().as_str() {
+            "low" => Some(Self::Low),
+            "medium" | "med" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "max" | "maximum" => Some(Self::Max),
+            _ => None,
+        }
+    }
+
+    /// OpenAI-style `reasoning_effort` value.
+    pub fn openai_value(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Max => "high",
+        }
+    }
+
+    /// Anthropic-style `thinking.budget_tokens` value.
+    pub fn anthropic_budget(self) -> u64 {
+        match self {
+            Self::Low => 1024,
+            Self::Medium => 8192,
+            Self::High => 32768,
+            Self::Max => 64000,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CompletionRequest {
     pub model: String,
@@ -22,6 +63,7 @@ pub struct CompletionRequest {
     pub tools: Vec<ToolSpec>,
     pub skill_count: usize,
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
+    pub effort: Option<EffortLevel>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -769,6 +811,12 @@ pub mod anthropic_provider {
                     "system": req.system_prompt_body,
                     "messages": messages,
                 });
+                if let Some(effort) = req.effort {
+                    body["thinking"] = serde_json::json!({
+                        "type": "enabled",
+                        "budget_tokens": effort.anthropic_budget(),
+                    });
+                }
                 if !tools.is_null() {
                     body["tools"] = tools;
                 }
@@ -894,6 +942,12 @@ pub mod anthropic_provider {
                     "messages": messages,
                     "stream": true,
                 });
+                if let Some(effort) = req.effort {
+                    body["thinking"] = serde_json::json!({
+                        "type": "enabled",
+                        "budget_tokens": effort.anthropic_budget(),
+                    });
+                }
                 if !tools.is_null() {
                     body["tools"] = tools;
                 }
@@ -1302,6 +1356,9 @@ pub mod openai_provider {
                     "model": req.model,
                     "messages": messages,
                 });
+                if let Some(effort) = req.effort {
+                    body["reasoning_effort"] = effort.openai_value().into();
+                }
                 if !tools.is_null() {
                     body["tools"] = tools;
                     body["tool_choice"] = "auto".into();
@@ -1412,6 +1469,9 @@ pub mod openai_provider {
                     "messages": messages,
                     "stream": true,
                 });
+                if let Some(effort) = req.effort {
+                    body["reasoning_effort"] = effort.openai_value().into();
+                }
                 if !tools.is_null() {
                     body["tools"] = tools;
                     body["tool_choice"] = "auto".into();
@@ -1732,6 +1792,7 @@ mod tests {
             tools: vec![],
             skill_count: 0,
             mcp_servers: BTreeMap::new(),
+            effort: None,
         };
 
         let events: Vec<_> = provider
@@ -1757,6 +1818,7 @@ mod tests {
             tools: vec![],
             skill_count: 0,
             mcp_servers: BTreeMap::new(),
+            effort: None,
         };
 
         let events: Vec<_> = provider
@@ -1792,6 +1854,7 @@ mod tests {
             tools: vec![],
             skill_count: 0,
             mcp_servers: BTreeMap::new(),
+            effort: None,
         };
 
         let direct = provider.complete(&request).await.unwrap();

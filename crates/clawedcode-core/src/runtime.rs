@@ -607,6 +607,12 @@ impl Runtime {
             tools: self.tools.clone(),
             skill_count: self.compatibility.skills.len(),
             mcp_servers: self.compatibility.mcp_servers.clone(),
+            effort: self
+                .config
+                .runtime
+                .effort
+                .as_deref()
+                .and_then(clawedcode_api::EffortLevel::parse),
         };
         if let Some(prompt_override) = prompt_override {
             apply_prompt_override(&mut request.messages, prompt_override);

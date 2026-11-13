@@ -484,6 +484,15 @@ impl TuiContext {
         &self.runtime.config.provider.api_key_env
     }
 
+    /// Configured reasoning-effort level, if any (`low|medium|high|max`).
+    pub fn effort(&self) -> Option<&str> {
+        self.runtime.config.runtime.effort.as_deref()
+    }
+
+    pub fn set_effort(&mut self, effort: Option<&str>) {
+        self.runtime.config.runtime.effort = effort.map(str::to_string);
+    }
+
     pub fn skills(&self) -> &[SkillDescriptor] {
         &self.runtime.compatibility.skills
     }
