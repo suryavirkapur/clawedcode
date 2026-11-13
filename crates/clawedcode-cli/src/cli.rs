@@ -174,6 +174,9 @@ pub struct Cli {
     /// Write debug logs to a file (implies --debug).
     #[arg(long, global = true)]
     pub debug_file: Option<PathBuf>,
+    /// Include hook lifecycle records in stream-json output.
+    #[arg(long, global = true)]
+    pub include_hook_events: bool,
     /// Include partial message deltas as stream_event records (stream-json).
     #[arg(long, global = true)]
     pub include_partial_messages: bool,
@@ -481,6 +484,7 @@ mod tests {
             max_budget_usd: None,
             enable_auth_status: false,
             include_partial_messages: false,
+            include_hook_events: false,
         }
     }
 
@@ -555,6 +559,7 @@ mod tests {
             max_budget_usd: None,
             enable_auth_status: false,
             include_partial_messages: false,
+            include_hook_events: false,
         }
     }
 

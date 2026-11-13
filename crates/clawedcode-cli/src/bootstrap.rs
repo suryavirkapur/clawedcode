@@ -612,6 +612,7 @@ mod tests {
             max_budget_usd: None,
             enable_auth_status: false,
             include_partial_messages: false,
+            include_hook_events: false,
         }
     }
 
@@ -894,6 +895,7 @@ mod tests {
             max_budget_usd: None,
             enable_auth_status: false,
             include_partial_messages: false,
+            include_hook_events: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Tui));
@@ -965,6 +967,7 @@ mod tests {
             max_budget_usd: None,
             enable_auth_status: false,
             include_partial_messages: false,
+            include_hook_events: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -1036,6 +1039,7 @@ mod tests {
             max_budget_usd: None,
             enable_auth_status: false,
             include_partial_messages: false,
+            include_hook_events: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));
@@ -1110,6 +1114,7 @@ mod tests {
             max_budget_usd: None,
             enable_auth_status: false,
             include_partial_messages: false,
+            include_hook_events: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::DirectConnect(_)));
@@ -1184,6 +1189,7 @@ mod tests {
             max_budget_usd: None,
             enable_auth_status: false,
             include_partial_messages: false,
+            include_hook_events: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Ssh(_)));
@@ -1265,6 +1271,7 @@ mod tests {
             max_budget_usd: None,
             enable_auth_status: false,
             include_partial_messages: false,
+            include_hook_events: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -1350,6 +1357,7 @@ mod tests {
             max_budget_usd: None,
             enable_auth_status: false,
             include_partial_messages: false,
+            include_hook_events: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));

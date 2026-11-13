@@ -1246,6 +1246,23 @@ async fn execute_streaming_submit_with_json_protocol(
         &stdout,
         &stream_json_init_record(runtime, session, &cli.betas),
     );
+    if cli.include_hook_events {
+        let hook_stdout = Arc::clone(&stdout);
+        let hook_session_id = session_id.clone();
+        clawedcode_core::hooks::set_hook_event_sink(Some(Box::new(move |record| {
+            let subtype = match record["stage"].as_str() {
+                Some("started") => "hook_started",
+                _ => "hook_response",
+            };
+            let mut wire = record.clone();
+            wire["type"] = serde_json::json!("system");
+            wire["subtype"] = serde_json::json!(subtype);
+            wire["session_id"] = serde_json::json!(hook_session_id);
+            wire["uuid"] = serde_json::json!(uuid::Uuid::new_v4().to_string());
+            let _ = wire.as_object_mut().map(|m| m.remove("stage"));
+            emit_json_protocol_record(&hook_stdout, &wire);
+        })));
+    }
     if cli.enable_auth_status {
         let authenticated = std::env::var("ANTHROPIC_API_KEY").is_ok()
             || std::env::var("CLAUDE_CODE_OAUTH_TOKEN").is_ok();
@@ -3395,6 +3412,7 @@ mod tests {
             max_budget_usd: None,
             enable_auth_status: false,
             include_partial_messages: false,
+            include_hook_events: false,
         }
     }
 

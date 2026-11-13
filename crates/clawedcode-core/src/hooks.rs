@@ -252,6 +252,21 @@ fn run_hook_command(
     cwd: &Path,
     stdin_json: &str,
 ) -> std::io::Result<std::process::Output> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdin_json).unwrap_or(serde_json::Value::Null);
+    let hook_event = parsed["hook_event_name"].as_str().unwrap_or("unknown");
+    let tool_name = parsed["tool_name"].as_str().unwrap_or_default();
+    let session_id = parsed["session_id"].as_str().unwrap_or_default();
+    let hook_id = format!("{}:{}", hook_event, &command[..command.len().min(40)]);
+    emit_hook_lifecycle(&serde_json::json!({
+        "stage": "started",
+        "hook_id": hook_id,
+        "hook_name": command,
+        "hook_event": hook_event,
+        "tool_name": tool_name,
+        "session_id": session_id,
+    }));
+
     let mut child = std::process::Command::new("sh")
         .arg("-lc")
         .arg(command)
@@ -263,7 +278,40 @@ fn run_hook_command(
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(stdin_json.as_bytes());
     }
-    child.wait_with_output()
+    let out = child.wait_with_output()?;
+    emit_hook_lifecycle(&serde_json::json!({
+        "stage": "response",
+        "hook_id": hook_id,
+        "hook_name": command,
+        "hook_event": hook_event,
+        "tool_name": tool_name,
+        "session_id": session_id,
+        "stdout": String::from_utf8_lossy(&out.stdout),
+        "stderr": String::from_utf8_lossy(&out.stderr),
+        "exit_code": out.status.code(),
+        "outcome": if out.status.success() { "success" } else { "non_blocking_error" },
+    }));
+    Ok(out)
+}
+
+/// `--include-hook-events`: a process-global sink that receives
+/// hook-lifecycle records (`hook_started`/`hook_response`) so the
+/// stream-json protocol can forward them.
+static HOOK_EVENT_SINK: std::sync::Mutex<Option<Box<dyn Fn(&serde_json::Value) + Send + Sync>>> =
+    std::sync::Mutex::new(None);
+
+pub fn set_hook_event_sink(sink: Option<Box<dyn Fn(&serde_json::Value) + Send + Sync>>) {
+    if let Ok(mut guard) = HOOK_EVENT_SINK.lock() {
+        *guard = sink;
+    }
+}
+
+fn emit_hook_lifecycle(record: &serde_json::Value) {
+    if let Ok(guard) = HOOK_EVENT_SINK.lock() {
+        if let Some(sink) = guard.as_ref() {
+            sink(record);
+        }
+    }
 }
 
 /// Run `PreToolUse` hooks matching `tool_name`. First blocking hook wins.
