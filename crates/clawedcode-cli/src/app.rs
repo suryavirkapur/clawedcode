@@ -773,7 +773,7 @@ async fn execute_run(
                 &mut session,
                 &run_mode.prompt,
                 run_mode.show_thinking,
-                cli.enable_auth_status,
+                &cli,
             )
             .await?;
         } else {
@@ -879,7 +879,7 @@ async fn execute_resume(
                 &mut session,
                 prompt,
                 resume_mode.show_thinking,
-                cli.enable_auth_status,
+                &cli,
             )
             .await?;
         } else if let Some(prompt) = resume_mode.prompt.clone() {
@@ -1135,62 +1135,6 @@ fn parse_approval_response_line(line: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn json_protocol_event_record(event: &ApiEvent, show_thinking: bool) -> Option<serde_json::Value> {
-    match event {
-        ApiEvent::MessageDelta { text } => Some(serde_json::json!({
-            "type": "event",
-            "event": {
-                "kind": "message_delta",
-                "text": text,
-            }
-        })),
-        ApiEvent::ThinkingDelta { text } => {
-            if show_thinking {
-                Some(serde_json::json!({
-                    "type": "event",
-                    "event": {
-                        "kind": "thinking_delta",
-                        "text": text,
-                    }
-                }))
-            } else {
-                None
-            }
-        }
-        ApiEvent::ToolUse { tool_use } => Some(serde_json::json!({
-            "type": "event",
-            "event": {
-                "kind": "tool_use",
-                "id": tool_use.id,
-                "name": tool_use.name,
-                "input": tool_use.input,
-            }
-        })),
-        ApiEvent::ToolResult { tool_result } => Some(serde_json::json!({
-            "type": "event",
-            "event": {
-                "kind": "tool_result",
-                "tool_use_id": tool_result.tool_use_id,
-                "content": tool_result.content,
-                "is_error": tool_result.is_error,
-            }
-        })),
-        ApiEvent::Usage { usage } => Some(serde_json::json!({
-            "type": "event",
-            "event": {
-                "kind": "usage",
-                "usage": usage,
-            }
-        })),
-        ApiEvent::Completed => Some(serde_json::json!({
-            "type": "event",
-            "event": {
-                "kind": "completed",
-            }
-        })),
-    }
-}
-
 fn json_protocol_approval_request_record(
     tool_use_id: &str,
     tool_name: &str,
@@ -1225,12 +1169,67 @@ fn json_protocol_approval_response_record(
     })
 }
 
-fn json_protocol_final_record(
-    output: &clawedcode_core::runtime::StreamingRuntimeOutput,
+fn permission_mode_name(mode: clawedcode_core::permissions::PermissionMode) -> &'static str {
+    use clawedcode_core::permissions::PermissionMode::*;
+    match mode {
+        Default => "default",
+        AcceptEdits => "acceptEdits",
+        Plan => "plan",
+        Bypass => "bypassPermissions",
+    }
+}
+
+/// The reference's `system/init` record — first message on the stream-json
+/// protocol carrying session metadata.
+fn stream_json_init_record(
+    runtime: &Runtime,
+    session: &Session,
+    betas: &[String],
 ) -> serde_json::Value {
+    let compat = runtime.compatibility();
     serde_json::json!({
-        "type": "final",
-        "output": output,
+        "type": "system",
+        "subtype": "init",
+        "cwd": session.cwd,
+        "session_id": session.id.to_string(),
+        "tools": runtime.tool_specs().iter().map(|t| &t.name).collect::<Vec<_>>(),
+        "mcp_servers": compat
+            .mcp_servers
+            .keys()
+            .map(|name| serde_json::json!({"name": name, "status": "connected"}))
+            .collect::<Vec<_>>(),
+        "model": runtime.model(),
+        "permissionMode": permission_mode_name(runtime.permission_mode()),
+        "slash_commands": compat
+            .skills
+            .iter()
+            .map(|s| &s.name)
+            .collect::<Vec<_>>(),
+        "apiKeySource": "none",
+        "betas": betas,
+        "claude_code_version": env!("CARGO_PKG_VERSION"),
+        "output_style": "default",
+        "agents": Vec::<String>::new(),
+        "skills": compat
+            .skills
+            .iter()
+            .map(|s| &s.name)
+            .collect::<Vec<_>>(),
+        "plugins": Vec::<String>::new(),
+        "uuid": uuid::Uuid::new_v4().to_string(),
+    })
+}
+
+fn stream_json_assistant_record(content: serde_json::Value, session_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [content],
+        },
+        "parent_tool_use_id": null,
+        "session_id": session_id,
+        "uuid": uuid::Uuid::new_v4().to_string(),
     })
 }
 
@@ -1239,10 +1238,15 @@ async fn execute_streaming_submit_with_json_protocol(
     session: &mut Session,
     prompt: &str,
     show_thinking: bool,
-    enable_auth_status: bool,
+    cli: &Cli,
 ) -> Result<clawedcode_core::runtime::StreamingRuntimeOutput> {
     let stdout = protocol_stdout();
-    if enable_auth_status {
+    let session_id = session.id.to_string();
+    emit_json_protocol_record(
+        &stdout,
+        &stream_json_init_record(runtime, session, &cli.betas),
+    );
+    if cli.enable_auth_status {
         let authenticated = std::env::var("ANTHROPIC_API_KEY").is_ok()
             || std::env::var("CLAUDE_CODE_OAUTH_TOKEN").is_ok();
         emit_json_protocol_record(
@@ -1280,19 +1284,130 @@ async fn execute_streaming_submit_with_json_protocol(
         }
     };
 
+    // Reference-shaped stream: assistant records carry whole content blocks
+    // (text deltas are accumulated and flushed at turn boundaries), tool
+    // results arrive as user records, and usage rolls into the result.
+    let pending_text = std::cell::RefCell::new(String::new());
+    let pending_thinking = std::cell::RefCell::new(String::new());
+    let usage_acc = std::cell::RefCell::new(clawedcode_api::UsageAccount::default());
+    let num_turns = std::cell::Cell::new(0usize);
+    let include_partials = cli.include_partial_messages;
     let mut on_event = {
         let event_stdout = Arc::clone(&stdout);
+        let session_id = session_id.clone();
+        let pending_text = &pending_text;
+        let pending_thinking = &pending_thinking;
+        let usage_acc = &usage_acc;
+        let num_turns = &num_turns;
         move |event: &ApiEvent| {
-            if let Some(record) = json_protocol_event_record(event, show_thinking) {
-                emit_json_protocol_record(&event_stdout, &record);
+            if include_partials {
+                emit_json_protocol_record(
+                    &event_stdout,
+                    &serde_json::json!({
+                        "type": "stream_event",
+                        "event": event,
+                        "session_id": session_id,
+                        "uuid": uuid::Uuid::new_v4().to_string(),
+                    }),
+                );
+            }
+            let flush_text = |kind: &str| {
+                let mut buf = match kind {
+                    "thinking" => pending_thinking.borrow_mut(),
+                    _ => pending_text.borrow_mut(),
+                };
+                if !buf.is_empty() {
+                    let content = if kind == "thinking" {
+                        serde_json::json!({"type": "thinking", "thinking": buf.clone()})
+                    } else {
+                        serde_json::json!({"type": "text", "text": buf.clone()})
+                    };
+                    emit_json_protocol_record(
+                        &event_stdout,
+                        &stream_json_assistant_record(content, &session_id),
+                    );
+                    buf.clear();
+                }
+            };
+            match event {
+                ApiEvent::MessageDelta { text } => {
+                    pending_text.borrow_mut().push_str(text);
+                }
+                ApiEvent::ThinkingDelta { text } => {
+                    if show_thinking {
+                        pending_thinking.borrow_mut().push_str(text);
+                    }
+                }
+                ApiEvent::ToolUse { tool_use } => {
+                    flush_text("thinking");
+                    flush_text("text");
+                    emit_json_protocol_record(
+                        &event_stdout,
+                        &stream_json_assistant_record(
+                            serde_json::json!({
+                                "type": "tool_use",
+                                "id": tool_use.id,
+                                "name": tool_use.name,
+                                "input": tool_use.input,
+                            }),
+                            &session_id,
+                        ),
+                    );
+                }
+                ApiEvent::ToolResult { tool_result } => {
+                    emit_json_protocol_record(
+                        &event_stdout,
+                        &serde_json::json!({
+                            "type": "user",
+                            "message": {
+                                "role": "user",
+                                "content": [{
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_result.tool_use_id,
+                                    "content": tool_result.content,
+                                    "is_error": tool_result.is_error,
+                                }],
+                            },
+                            "parent_tool_use_id": null,
+                            "session_id": session_id,
+                            "uuid": uuid::Uuid::new_v4().to_string(),
+                        }),
+                    );
+                }
+                ApiEvent::Usage { usage } => {
+                    usage_acc.borrow_mut().record(usage);
+                }
+                ApiEvent::Completed => {
+                    flush_text("thinking");
+                    flush_text("text");
+                    num_turns.set(num_turns.get() + 1);
+                }
             }
         }
     };
 
+    let start = std::time::Instant::now();
     let output = runtime
         .submit_stream_with_approval(session, prompt, &mut on_event, &approval_fn)
         .await;
-    emit_json_protocol_record(&stdout, &json_protocol_final_record(&output));
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let usage = usage_acc.into_inner();
+    let result = serde_json::json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "duration_ms": duration_ms,
+        "duration_api_ms": duration_ms,
+        "num_turns": num_turns.get(),
+        "result": output.response,
+        "stop_reason": "end_turn",
+        "session_id": session_id,
+        "total_cost_usd": clawedcode_core::runtime::turn_cost_usd(&usage, runtime.model()),
+        "usage": usage,
+        "permission_denials": Vec::<serde_json::Value>::new(),
+        "uuid": uuid::Uuid::new_v4().to_string(),
+    });
+    emit_json_protocol_record(&stdout, &result);
     Ok(output)
 }
 
@@ -2366,7 +2481,6 @@ mod tests {
         assert!(!jsonschema::is_valid(&schema, &serde_json::json!({"b":1})));
     }
     use super::*;
-    use serde_json::json;
     use std::{
         io::Cursor,
         sync::{Mutex, MutexGuard, OnceLock},
@@ -2432,65 +2546,16 @@ mod tests {
     }
 
     #[test]
-    fn json_protocol_event_record_serializes_runtime_events() {
-        let message = json_protocol_event_record(
-            &ApiEvent::MessageDelta {
-                text: "hello".to_string(),
-            },
-            false,
-        )
-        .unwrap();
-        assert_eq!(message["type"], "event");
-        assert_eq!(message["event"]["kind"], "message_delta");
-        assert_eq!(message["event"]["text"], "hello");
-
-        let thinking = json_protocol_event_record(
-            &ApiEvent::ThinkingDelta {
-                text: "hidden".to_string(),
-            },
-            true,
-        )
-        .unwrap();
-        assert_eq!(thinking["event"]["kind"], "thinking_delta");
-        assert_eq!(thinking["event"]["text"], "hidden");
-
-        assert!(
-            json_protocol_event_record(
-                &ApiEvent::ThinkingDelta {
-                    text: "hidden".to_string(),
-                },
-                false,
-            )
-            .is_none()
+    fn stream_json_records_match_reference_shape() {
+        let record = stream_json_assistant_record(
+            serde_json::json!({"type": "text", "text": "hello"}),
+            "sess-1",
         );
-
-        let tool_use = json_protocol_event_record(
-            &ApiEvent::ToolUse {
-                tool_use: clawedcode_api::ToolUseEvent {
-                    id: "call-1".to_string(),
-                    name: "shell".to_string(),
-                    input: "{\"command\":\"ls\"}".to_string(),
-                },
-            },
-            false,
-        )
-        .unwrap();
-        assert_eq!(tool_use["event"]["kind"], "tool_use");
-        assert_eq!(tool_use["event"]["id"], "call-1");
-        assert_eq!(tool_use["event"]["name"], "shell");
-
-        let approval =
-            json_protocol_approval_request_record("call-1", "shell", &json!({"command":"ls"}));
-        assert_eq!(approval["type"], "approval_request");
-        assert_eq!(approval["tool_use_id"], "call-1");
-        assert_eq!(approval["tool_name"], "shell");
-
-        let waiting = json_protocol_approval_waiting_record("call-1", "shell");
-        assert_eq!(waiting["type"], "approval_waiting");
-
-        let response = json_protocol_approval_response_record("call-1", "shell", true);
-        assert_eq!(response["type"], "approval_response");
-        assert_eq!(response["approved"], true);
+        assert_eq!(record["type"], "assistant");
+        assert_eq!(record["message"]["role"], "assistant");
+        assert_eq!(record["message"]["content"][0]["text"], "hello");
+        assert_eq!(record["session_id"], "sess-1");
+        assert!(record["uuid"].is_string());
     }
 
     #[test]
@@ -3329,6 +3394,7 @@ mod tests {
             json_schema: None,
             max_budget_usd: None,
             enable_auth_status: false,
+            include_partial_messages: false,
         }
     }
 

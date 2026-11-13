@@ -266,7 +266,7 @@ fn model_prices_mtok(model: &str) -> (f64, f64) {
     }
 }
 
-fn turn_cost_usd(usage: &clawedcode_api::UsageAccount, model: &str) -> f64 {
+pub fn turn_cost_usd(usage: &clawedcode_api::UsageAccount, model: &str) -> f64 {
     let (input, output) = model_prices_mtok(model);
     (usage.total_input_tokens as f64 * input
         + usage.total_output_tokens as f64 * output
@@ -387,6 +387,14 @@ impl From<bool> for ApprovalOutcome {
 pub type ApprovalFn = Box<dyn Fn(&str, &str, &serde_json::Value) -> ApprovalOutcome + Send + Sync>;
 
 impl Runtime {
+    pub fn model(&self) -> &str {
+        &self.config.model
+    }
+
+    pub fn compatibility(&self) -> &crate::compat::CompatibilitySnapshot {
+        &self.compatibility
+    }
+
     pub fn tool_specs(&self) -> &[ToolSpec] {
         &self.tools
     }
@@ -1306,6 +1314,13 @@ impl Runtime {
                     record.result = Some(content.clone());
                     record.is_error = *is_error;
                 }
+                on_event(&ApiEvent::ToolResult {
+                    tool_result: clawedcode_api::ToolResultEvent {
+                        tool_use_id: tool_use_id.clone(),
+                        content: content.clone(),
+                        is_error: *is_error,
+                    },
+                });
             }
             result_blocks.push(result);
             tools_executed += 1;

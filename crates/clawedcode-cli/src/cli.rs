@@ -174,6 +174,9 @@ pub struct Cli {
     /// Write debug logs to a file (implies --debug).
     #[arg(long, global = true)]
     pub debug_file: Option<PathBuf>,
+    /// Include partial message deltas as stream_event records (stream-json).
+    #[arg(long, global = true)]
+    pub include_partial_messages: bool,
     /// Include auth status information in stream-json output.
     #[arg(long, global = true)]
     pub enable_auth_status: bool,
@@ -477,6 +480,7 @@ mod tests {
             json_schema: None,
             max_budget_usd: None,
             enable_auth_status: false,
+            include_partial_messages: false,
         }
     }
 
@@ -550,6 +554,7 @@ mod tests {
             json_schema: None,
             max_budget_usd: None,
             enable_auth_status: false,
+            include_partial_messages: false,
         }
     }
 
