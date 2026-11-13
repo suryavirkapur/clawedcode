@@ -2450,7 +2450,13 @@ impl Runtime {
                             &pre_context,
                         );
                     }
-                    Some(crate::hooks::PermissionHookDecision::Deny) => {
+                    Some(crate::hooks::PermissionHookDecision::Deny { interrupt }) => {
+                        if interrupt {
+                            // Reference: interrupt ends the turn like a
+                            // user interrupt — reuse the shared flag.
+                            self.interrupt_flag
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
                         let reason = format!("Tool '{tool_name}' denied by PermissionRequest hook");
                         crate::hooks::run_permission_denied_hooks(
                             &hook_configs,

@@ -895,7 +895,8 @@ pub enum PermissionHookDecision {
         /// apply when the decision allows.
         updates: Vec<crate::permissions::PermissionUpdate>,
     },
-    Deny,
+    /// Denied — `interrupt: true` also ends the turn, not just this call.
+    Deny { interrupt: bool },
     Ask,
 }
 
@@ -943,7 +944,14 @@ pub fn run_permission_request_hooks(
                             .unwrap_or_default(),
                     })
                 }
-                Some("deny") => return Some(PermissionHookDecision::Deny),
+                Some("deny") => {
+                    return Some(PermissionHookDecision::Deny {
+                        interrupt: decision
+                            .get("interrupt")
+                            .and_then(|i| i.as_bool())
+                            .unwrap_or(false),
+                    })
+                }
                 _ => {}
             }
         }
@@ -954,7 +962,7 @@ pub fn run_permission_request_hooks(
                     updates: Vec::new(),
                 })
             }
-            Some("deny") => return Some(PermissionHookDecision::Deny),
+            Some("deny") => return Some(PermissionHookDecision::Deny { interrupt: false }),
             Some("ask") => return Some(PermissionHookDecision::Ask),
             _ => {}
         }
