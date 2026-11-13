@@ -559,6 +559,7 @@ impl TuiContext {
                 permission_mode: self.runtime.permission_mode(),
                 agent_system_prompt: None,
                 allowed_tools: None,
+                agent_type: None,
             },
         )
     }
@@ -580,6 +581,7 @@ impl TuiContext {
                 permission_mode: self.runtime.permission_mode(),
                 agent_system_prompt: None,
                 allowed_tools: None,
+                agent_type: None,
             },
         )
     }

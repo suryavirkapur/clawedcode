@@ -257,6 +257,38 @@ pub fn run_pre_tool_hooks(
         let Ok(out) = run_hook_command(&hook.command, cwd, &stdin) else {
             continue;
         };
+        // JSON stdout can carry a programmatic permission decision, like
+        // the reference's hookSpecificOutput.permissionDecision.
+        if let Ok(json) =
+            serde_json::from_str::<serde_json::Value>(String::from_utf8_lossy(&out.stdout).trim())
+        {
+            let decision = json
+                .get("hookSpecificOutput")
+                .and_then(|o| o.get("permissionDecision"))
+                .and_then(|d| d.as_str());
+            match decision {
+                Some("deny") => {
+                    let reason = json
+                        .get("reason")
+                        .and_then(|r| r.as_str())
+                        .filter(|r| !r.trim().is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("Blocked by hook `{}`", hook.command));
+                    return PreHookOutcome::Block(reason);
+                }
+                Some("allow") | Some("ask") => continue,
+                _ => {}
+            }
+            if json.get("continue").and_then(|v| v.as_bool()) == Some(false) {
+                let reason = json
+                    .get("stopReason")
+                    .and_then(|r| r.as_str())
+                    .filter(|r| !r.trim().is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("Stopped by hook `{}`", hook.command));
+                return PreHookOutcome::Block(reason);
+            }
+        }
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         match out.status.code() {
             Some(0) => {}
@@ -445,6 +477,105 @@ pub fn run_subagent_stop_hooks(config: &HooksConfig, session_id: &str, cwd: &Pat
         serde_json::json!({ "agent_id": agent_id }),
     );
     for hook in hooks_for_event(config, "SubagentStop") {
+        let _ = run_hook_command(&hook.command, cwd, &stdin);
+    }
+}
+
+/// Decision returned by `PermissionRequest` hooks — they can resolve a
+/// permission prompt programmatically via JSON stdout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionHookDecision {
+    Allow,
+    Deny,
+    Ask,
+}
+
+/// Run `PermissionRequest` hooks when a permission prompt would be raised.
+/// A hook's `hookSpecificOutput.permissionDecision` (`allow`|`deny`|`ask`)
+/// short-circuits the prompt; `deny`/`ask` also carry an optional reason.
+pub fn run_permission_request_hooks(
+    config: &HooksConfig,
+    session_id: &str,
+    cwd: &Path,
+    tool_name: &str,
+    input: &serde_json::Value,
+) -> Option<PermissionHookDecision> {
+    if config.disabled {
+        return None;
+    }
+    for hook in hooks_for_event(config, "PermissionRequest") {
+        if !matcher_matches(hook.matcher.as_deref(), tool_name) {
+            continue;
+        }
+        let stdin = hook_input_json("PermissionRequest", tool_name, input, session_id, cwd);
+        let Ok(out) = run_hook_command(&hook.command, cwd, &stdin) else {
+            continue;
+        };
+        let Ok(json) =
+            serde_json::from_str::<serde_json::Value>(String::from_utf8_lossy(&out.stdout).trim())
+        else {
+            continue;
+        };
+        match json
+            .get("hookSpecificOutput")
+            .and_then(|o| o.get("permissionDecision"))
+            .and_then(|d| d.as_str())
+        {
+            Some("allow") => return Some(PermissionHookDecision::Allow),
+            Some("deny") => return Some(PermissionHookDecision::Deny),
+            Some("ask") => return Some(PermissionHookDecision::Ask),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Run `PermissionDenied` hooks when a tool call is denied — fire-and-forget.
+pub fn run_permission_denied_hooks(
+    config: &HooksConfig,
+    session_id: &str,
+    cwd: &Path,
+    tool_name: &str,
+    reason: &str,
+) {
+    if config.disabled {
+        return;
+    }
+    let stdin = session_hook_input(
+        "PermissionDenied",
+        session_id,
+        cwd,
+        serde_json::json!({ "tool_name": tool_name, "reason": reason }),
+    );
+    for hook in hooks_for_event(config, "PermissionDenied") {
+        if !matcher_matches(hook.matcher.as_deref(), tool_name) {
+            continue;
+        }
+        let _ = run_hook_command(&hook.command, cwd, &stdin);
+    }
+}
+
+/// Run `SubagentStart` hooks when a child agent begins — fire-and-forget.
+pub fn run_subagent_start_hooks(
+    config: &HooksConfig,
+    session_id: &str,
+    cwd: &Path,
+    agent_id: &str,
+    agent_type: Option<&str>,
+) {
+    if config.disabled {
+        return;
+    }
+    let stdin = session_hook_input(
+        "SubagentStart",
+        session_id,
+        cwd,
+        serde_json::json!({
+            "agent_id": agent_id,
+            "agent_type": agent_type.unwrap_or("general-purpose"),
+        }),
+    );
+    for hook in hooks_for_event(config, "SubagentStart") {
         let _ = run_hook_command(&hook.command, cwd, &stdin);
     }
 }

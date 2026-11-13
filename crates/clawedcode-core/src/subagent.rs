@@ -24,6 +24,8 @@ pub struct SubAgentConfig {
     /// Tool allowlist from the agent frontmatter — `None` or `["*"]` means
     /// all tools.
     pub allowed_tools: Option<Vec<String>>,
+    /// The resolved `subagent_type` name, for hook payloads.
+    pub agent_type: Option<String>,
 }
 
 impl Default for SubAgentConfig {
@@ -34,6 +36,7 @@ impl Default for SubAgentConfig {
             permission_mode: PermissionMode::Bypass,
             agent_system_prompt: None,
             allowed_tools: None,
+            agent_type: None,
         }
     }
 }
@@ -105,6 +108,13 @@ impl SubAgentRuntime {
     pub fn spawn(&self, subagent: SubAgentConfig) -> Result<SubAgentResult> {
         let runtime = self.build_runtime(&subagent);
         let mut session = runtime.start_session(self.cwd.clone());
+        crate::hooks::run_subagent_start_hooks(
+            &crate::hooks::load_hooks(&session.cwd),
+            &session.id.to_string(),
+            &session.cwd,
+            &session.id.to_string(),
+            subagent.agent_type.as_deref(),
+        );
         let output = runtime.submit(&mut session, &subagent.prompt);
         session.save(&self.sessions_dir)?;
         crate::hooks::run_subagent_stop_hooks(
@@ -165,6 +175,13 @@ impl SubAgentRuntime {
         if fresh {
             session.push(Role::System, runtime.effective_system_prompt_body(&session));
         }
+        crate::hooks::run_subagent_start_hooks(
+            &crate::hooks::load_hooks(&session.cwd),
+            &parent_session.id.to_string(),
+            &session.cwd,
+            &session.id.to_string(),
+            subagent.agent_type.as_deref(),
+        );
         let output = runtime.submit(&mut session, &subagent.prompt);
         session.save(&self.sessions_dir)?;
         crate::hooks::run_subagent_stop_hooks(
@@ -191,6 +208,13 @@ impl SubAgentRuntime {
         child_session.save(&self.sessions_dir)?;
 
         parent_session.add_child(child_session.id);
+        crate::hooks::run_subagent_start_hooks(
+            &crate::hooks::load_hooks(&child_session.cwd),
+            &parent_session.id.to_string(),
+            &child_session.cwd,
+            &child_session.id.to_string(),
+            subagent.agent_type.as_deref(),
+        );
 
         let state = SubAgentTaskState {
             child_session_id: child_session.id,
@@ -454,6 +478,7 @@ mod tests {
                 permission_mode: PermissionMode::Bypass,
                 agent_system_prompt: None,
                 allowed_tools: None,
+                agent_type: None,
             })
             .unwrap();
 
@@ -473,6 +498,7 @@ mod tests {
                 permission_mode: PermissionMode::Bypass,
                 agent_system_prompt: None,
                 allowed_tools: None,
+                agent_type: None,
             })
             .unwrap();
 
@@ -497,6 +523,7 @@ mod tests {
                     permission_mode: PermissionMode::Bypass,
                     agent_system_prompt: None,
                     allowed_tools: None,
+                    agent_type: None,
                 },
             )
             .unwrap();
@@ -530,6 +557,7 @@ mod tests {
                     permission_mode: PermissionMode::Bypass,
                     agent_system_prompt: None,
                     allowed_tools: None,
+                    agent_type: None,
                 },
             )
             .unwrap();
@@ -557,6 +585,7 @@ mod tests {
                     permission_mode: PermissionMode::Bypass,
                     agent_system_prompt: None,
                     allowed_tools: None,
+                    agent_type: None,
                 },
             )
             .unwrap();
@@ -598,6 +627,7 @@ mod tests {
                     permission_mode: PermissionMode::Bypass,
                     agent_system_prompt: None,
                     allowed_tools: None,
+                    agent_type: None,
                 },
             )
             .unwrap();
@@ -627,6 +657,7 @@ mod tests {
                 permission_mode: PermissionMode::Bypass,
                 agent_system_prompt: None,
                 allowed_tools: None,
+                agent_type: None,
             })
             .unwrap();
 
@@ -649,6 +680,7 @@ mod tests {
                     permission_mode: PermissionMode::Bypass,
                     agent_system_prompt: None,
                     allowed_tools: None,
+                    agent_type: None,
                 },
             )
             .unwrap();
@@ -682,6 +714,7 @@ mod tests {
                     permission_mode: PermissionMode::Bypass,
                     agent_system_prompt: None,
                     allowed_tools: None,
+                    agent_type: None,
                 },
             )
             .unwrap();

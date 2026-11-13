@@ -316,6 +316,7 @@ struct ResolvedAgentRun {
     max_turns: usize,
     agent_system_prompt: Option<String>,
     allowed_tools: Option<Vec<String>>,
+    agent_type: Option<String>,
 }
 
 fn apply_prompt_override(messages: &mut [clawedcode_api::ProviderMessage], prompt_override: &str) {
@@ -1261,6 +1262,7 @@ impl Runtime {
                                 permission_mode: run.permission_mode,
                                 agent_system_prompt: run.agent_system_prompt,
                                 allowed_tools: run.allowed_tools,
+                                agent_type: run.agent_type,
                             },
                         )
                         .map_err(|err| err.to_string())?;
@@ -1334,10 +1336,12 @@ impl Runtime {
             max_turns: self.max_turns(),
             agent_system_prompt: None,
             allowed_tools: None,
+            agent_type: None,
         };
         if let Some(agent) = agent {
             run.agent_system_prompt = Some(agent.system_prompt.clone());
             run.allowed_tools = agent.tools.clone();
+            run.agent_type = parsed.subagent_type.clone();
             if let Some(model) = &agent.model {
                 run.config.model = model.clone();
             }
@@ -1396,6 +1400,7 @@ impl Runtime {
                 permission_mode: run.permission_mode,
                 agent_system_prompt: run.agent_system_prompt,
                 allowed_tools: run.allowed_tools,
+                agent_type: run.agent_type,
             },
         ) {
             Ok(result) => {
@@ -1436,16 +1441,49 @@ impl Runtime {
         let decision = self.permission_engine.decide(needs_approval, write_like);
 
         match decision {
-            PermissionDecision::Deny => ContentBlock::tool_error(
-                tool_use_id,
-                format!(
+            PermissionDecision::Deny => {
+                let reason = format!(
                     "Tool '{tool_name}' denied in {:?} mode",
                     self.permission_engine.mode()
-                ),
-            ),
-            PermissionDecision::Ask => {
-                crate::hooks::run_notification_hooks(
+                );
+                crate::hooks::run_permission_denied_hooks(
                     &crate::hooks::load_hooks(&session.cwd),
+                    &session.id.to_string(),
+                    &session.cwd,
+                    tool_name,
+                    &reason,
+                );
+                ContentBlock::tool_error(tool_use_id, reason)
+            }
+            PermissionDecision::Ask => {
+                let hook_configs = crate::hooks::load_hooks(&session.cwd);
+                // PermissionRequest hooks can resolve the prompt
+                // programmatically (reference: hooks-as-permission-backends).
+                match crate::hooks::run_permission_request_hooks(
+                    &hook_configs,
+                    &session.id.to_string(),
+                    &session.cwd,
+                    tool_name,
+                    &input,
+                ) {
+                    Some(crate::hooks::PermissionHookDecision::Allow) => {
+                        return self.execute_tool_hooked(tool_use_id, tool_name, input, session);
+                    }
+                    Some(crate::hooks::PermissionHookDecision::Deny) => {
+                        let reason = format!("Tool '{tool_name}' denied by PermissionRequest hook");
+                        crate::hooks::run_permission_denied_hooks(
+                            &hook_configs,
+                            &session.id.to_string(),
+                            &session.cwd,
+                            tool_name,
+                            &reason,
+                        );
+                        return ContentBlock::tool_error(tool_use_id, reason);
+                    }
+                    _ => {}
+                }
+                crate::hooks::run_notification_hooks(
+                    &hook_configs,
                     &session.id.to_string(),
                     &session.cwd,
                     &format!("Claude needs your permission to use {tool_name}"),
@@ -1458,6 +1496,13 @@ impl Runtime {
                         }
                         _ => format!("Tool '{tool_name}' denied by user"),
                     };
+                    crate::hooks::run_permission_denied_hooks(
+                        &hook_configs,
+                        &session.id.to_string(),
+                        &session.cwd,
+                        tool_name,
+                        &reason,
+                    );
                     return ContentBlock::tool_error(tool_use_id, reason);
                 }
                 if tool_name == clawedcode_tools::ASK_USER_QUESTION_TOOL_NAME {
