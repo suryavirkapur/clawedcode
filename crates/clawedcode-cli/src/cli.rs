@@ -117,6 +117,12 @@ pub struct Cli {
     /// Pre-fill the interactive input with this text.
     #[arg(long, global = true)]
     pub prefill: Option<String>,
+    /// Reasoning effort level: low, medium, high, or max.
+    #[arg(long, global = true)]
+    pub effort: Option<String>,
+    /// Explicit thinking budget in tokens (overrides effort-derived budget).
+    #[arg(long, global = true)]
+    pub max_thinking_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -376,6 +382,8 @@ mod tests {
             tools: None,
             no_session_persistence: false,
             prefill: None,
+            effort: None,
+            max_thinking_tokens: None,
         }
     }
 
@@ -425,6 +433,8 @@ mod tests {
             tools: None,
             no_session_persistence: false,
             prefill: None,
+            effort: None,
+            max_thinking_tokens: None,
         }
     }
 

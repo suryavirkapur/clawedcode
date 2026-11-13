@@ -541,6 +541,8 @@ mod tests {
             tools: None,
             no_session_persistence: false,
             prefill: None,
+            effort: None,
+            max_thinking_tokens: None,
         }
     }
 
@@ -798,6 +800,8 @@ mod tests {
             tools: None,
             no_session_persistence: false,
             prefill: None,
+            effort: None,
+            max_thinking_tokens: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Tui));
@@ -844,6 +848,8 @@ mod tests {
             tools: None,
             no_session_persistence: false,
             prefill: None,
+            effort: None,
+            max_thinking_tokens: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -890,6 +896,8 @@ mod tests {
             tools: None,
             no_session_persistence: false,
             prefill: None,
+            effort: None,
+            max_thinking_tokens: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));
@@ -939,6 +947,8 @@ mod tests {
             tools: None,
             no_session_persistence: false,
             prefill: None,
+            effort: None,
+            max_thinking_tokens: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::DirectConnect(_)));
@@ -988,6 +998,8 @@ mod tests {
             tools: None,
             no_session_persistence: false,
             prefill: None,
+            effort: None,
+            max_thinking_tokens: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Ssh(_)));
@@ -1044,6 +1056,8 @@ mod tests {
             tools: None,
             no_session_persistence: false,
             prefill: None,
+            effort: None,
+            max_thinking_tokens: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -1104,6 +1118,8 @@ mod tests {
             tools: None,
             no_session_persistence: false,
             prefill: None,
+            effort: None,
+            max_thinking_tokens: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));

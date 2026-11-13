@@ -64,6 +64,8 @@ pub struct CompletionRequest {
     pub skill_count: usize,
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
     pub effort: Option<EffortLevel>,
+    /// `--max-thinking-tokens`: overrides the effort-derived budget when set.
+    pub thinking_budget: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -944,7 +946,7 @@ pub mod anthropic_provider {
                 if let Some(effort) = req.effort {
                     body["thinking"] = serde_json::json!({
                         "type": "enabled",
-                        "budget_tokens": effort.anthropic_budget(),
+                        "budget_tokens": req.thinking_budget.unwrap_or_else(|| effort.anthropic_budget()),
                     });
                 }
                 if !tools.is_null() {
@@ -1075,7 +1077,7 @@ pub mod anthropic_provider {
                 if let Some(effort) = req.effort {
                     body["thinking"] = serde_json::json!({
                         "type": "enabled",
-                        "budget_tokens": effort.anthropic_budget(),
+                        "budget_tokens": req.thinking_budget.unwrap_or_else(|| effort.anthropic_budget()),
                     });
                 }
                 if !tools.is_null() {
@@ -1931,6 +1933,7 @@ mod tests {
             skill_count: 0,
             mcp_servers: BTreeMap::new(),
             effort: None,
+            thinking_budget: None,
         };
 
         let events: Vec<_> = provider
@@ -1957,6 +1960,7 @@ mod tests {
             skill_count: 0,
             mcp_servers: BTreeMap::new(),
             effort: None,
+            thinking_budget: None,
         };
 
         let events: Vec<_> = provider
@@ -1993,6 +1997,7 @@ mod tests {
             skill_count: 0,
             mcp_servers: BTreeMap::new(),
             effort: None,
+            thinking_budget: None,
         };
 
         let direct = provider.complete(&request).await.unwrap();

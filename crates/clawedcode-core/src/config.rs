@@ -34,6 +34,9 @@ pub struct RuntimeConfig {
     /// Optional reasoning effort level: low|medium|high|max.
     #[serde(default)]
     pub effort: Option<String>,
+    /// Optional explicit thinking budget in tokens (`--max-thinking-tokens`).
+    #[serde(default)]
+    pub thinking_budget: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +59,7 @@ impl Default for AppConfig {
             },
             runtime: RuntimeConfig {
                 effort: None,
+                thinking_budget: None,
                 max_turns: 64,
                 session_history_limit: 2_000,
             },

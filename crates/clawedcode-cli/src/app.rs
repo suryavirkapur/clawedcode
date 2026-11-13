@@ -529,6 +529,12 @@ fn apply_cli_config_overrides(config: &mut AppConfig, cli: &Cli) {
     if let Some(turns) = cli.max_turns {
         config.runtime.max_turns = turns;
     }
+    if let Some(effort) = &cli.effort {
+        config.runtime.effort = Some(effort.clone());
+    }
+    if let Some(budget) = cli.max_thinking_tokens {
+        config.runtime.thinking_budget = Some(budget);
+    }
 }
 
 /// Apply the reference's print-mode flag overrides to a runtime+session:
@@ -3068,6 +3074,8 @@ mod tests {
             tools: None,
             no_session_persistence: false,
             prefill: None,
+            effort: None,
+            max_thinking_tokens: None,
         }
     }
 

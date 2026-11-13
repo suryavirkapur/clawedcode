@@ -695,6 +695,7 @@ impl Runtime {
                 .effort
                 .as_deref()
                 .and_then(clawedcode_api::EffortLevel::parse),
+            thinking_budget: self.config.runtime.thinking_budget,
         };
         if let Some(prompt_override) = prompt_override {
             apply_prompt_override(&mut request.messages, prompt_override);
@@ -1754,6 +1755,7 @@ impl Runtime {
             skill_count: 0,
             mcp_servers: Default::default(),
             effort: None,
+            thinking_budget: None,
         };
         let result = self
             .run_in_runtime(self.provider.complete(&request))
