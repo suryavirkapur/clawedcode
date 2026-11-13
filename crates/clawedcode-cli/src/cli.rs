@@ -34,6 +34,30 @@ pub struct Cli {
     /// With `resume`, fork the session instead of resuming it in place.
     #[arg(long, global = true)]
     pub fork_session: bool,
+    /// Additional directories to grant tool access to (repeatable).
+    #[arg(long, global = true)]
+    pub add_dir: Vec<PathBuf>,
+    /// Permission mode: default, acceptEdits, plan, or bypassPermissions.
+    #[arg(long, global = true)]
+    pub permission_mode: Option<String>,
+    /// Override the configured model for this run.
+    #[arg(long, global = true)]
+    pub model: Option<String>,
+    /// Maximum agentic turns before stopping.
+    #[arg(long, global = true)]
+    pub max_turns: Option<u16>,
+    /// Extra text appended to the system prompt.
+    #[arg(long, global = true)]
+    pub append_system_prompt: Option<String>,
+    /// Restrict the session to these tool names (comma-separated).
+    #[arg(long, global = true, value_delimiter = ',')]
+    pub allowed_tools: Vec<String>,
+    /// Remove these tool names from the session (comma-separated).
+    #[arg(long, global = true, value_delimiter = ',')]
+    pub disallowed_tools: Vec<String>,
+    /// Use a specific session id for the new session.
+    #[arg(long, global = true)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -215,6 +239,14 @@ mod tests {
             worktree: None,
             agent: None,
             fork_session: false,
+            add_dir: Vec::new(),
+            permission_mode: None,
+            model: None,
+            max_turns: None,
+            append_system_prompt: None,
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+            session_id: None,
         }
     }
 
@@ -237,6 +269,14 @@ mod tests {
             worktree: None,
             agent: None,
             fork_session: false,
+            add_dir: Vec::new(),
+            permission_mode: None,
+            model: None,
+            max_turns: None,
+            append_system_prompt: None,
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+            session_id: None,
         }
     }
 

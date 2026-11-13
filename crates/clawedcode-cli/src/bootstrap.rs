@@ -422,6 +422,14 @@ mod tests {
             worktree: None,
             agent: None,
             fork_session: false,
+            add_dir: Vec::new(),
+            permission_mode: None,
+            model: None,
+            max_turns: None,
+            append_system_prompt: None,
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+            session_id: None,
         }
     }
 
@@ -652,6 +660,14 @@ mod tests {
             worktree: None,
             agent: None,
             fork_session: false,
+            add_dir: Vec::new(),
+            permission_mode: None,
+            model: None,
+            max_turns: None,
+            append_system_prompt: None,
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+            session_id: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Tui));
@@ -671,6 +687,14 @@ mod tests {
             worktree: None,
             agent: None,
             fork_session: false,
+            add_dir: Vec::new(),
+            permission_mode: None,
+            model: None,
+            max_turns: None,
+            append_system_prompt: None,
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+            session_id: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -690,6 +714,14 @@ mod tests {
             worktree: None,
             agent: None,
             fork_session: false,
+            add_dir: Vec::new(),
+            permission_mode: None,
+            model: None,
+            max_turns: None,
+            append_system_prompt: None,
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+            session_id: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));
@@ -712,6 +744,14 @@ mod tests {
             worktree: None,
             agent: None,
             fork_session: false,
+            add_dir: Vec::new(),
+            permission_mode: None,
+            model: None,
+            max_turns: None,
+            append_system_prompt: None,
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+            session_id: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::DirectConnect(_)));
@@ -734,6 +774,14 @@ mod tests {
             worktree: None,
             agent: None,
             fork_session: false,
+            add_dir: Vec::new(),
+            permission_mode: None,
+            model: None,
+            max_turns: None,
+            append_system_prompt: None,
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+            session_id: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Ssh(_)));
@@ -763,6 +811,14 @@ mod tests {
             worktree: None,
             agent: None,
             fork_session: false,
+            add_dir: Vec::new(),
+            permission_mode: None,
+            model: None,
+            max_turns: None,
+            append_system_prompt: None,
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+            session_id: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -796,6 +852,14 @@ mod tests {
             worktree: None,
             agent: None,
             fork_session: false,
+            add_dir: Vec::new(),
+            permission_mode: None,
+            model: None,
+            max_turns: None,
+            append_system_prompt: None,
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+            session_id: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));

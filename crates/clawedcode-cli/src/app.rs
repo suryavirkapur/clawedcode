@@ -145,17 +145,20 @@ pub async fn execute(boot: BootstrappedApp) -> Result<()> {
         ExecutionMode::Tui => {
             let sessions_dir = session_store_dir(cli.data_dir.clone())
                 .context("no sessions directory available")?;
+            let mut config = config;
+            apply_cli_config_overrides(&mut config, &cli);
             let mut ctx = TuiContext::new(
                 config,
                 resolve_prompt(None),
                 compatibility,
-                cli.cwd,
+                cli.cwd.clone(),
                 sessions_dir,
             );
             ctx.session.worktree_origin = worktree_origin;
             if let Some(agent) = &agent_def {
                 ctx.runtime.apply_agent(agent);
             }
+            apply_cli_session_overrides(&mut ctx.runtime, &mut ctx.session, &cli)?;
             tui::run_with_context(ctx)
         }
         ExecutionMode::Config => {
@@ -268,6 +271,56 @@ fn build_approval_fn(yes: bool) -> ApprovalFn {
     }
 }
 
+/// Apply `--model`/`--max-turns` before the runtime is built.
+fn apply_cli_config_overrides(config: &mut AppConfig, cli: &Cli) {
+    if let Some(model) = &cli.model {
+        config.model = model.clone();
+    }
+    if let Some(turns) = cli.max_turns {
+        config.runtime.max_turns = turns;
+    }
+}
+
+/// Apply the reference's print-mode flag overrides to a runtime+session:
+/// `--permission-mode`, `--append-system-prompt`, `--allowedTools`,
+/// `--disallowedTools`, `--add-dir`, and `--session-id`.
+fn apply_cli_session_overrides(
+    runtime: &mut Runtime,
+    session: &mut Session,
+    cli: &Cli,
+) -> Result<()> {
+    if let Some(mode) = cli.permission_mode.as_deref() {
+        let parsed = match mode.to_ascii_lowercase().as_str() {
+            "default" | "dontask" => PermissionMode::Default,
+            "acceptedits" => PermissionMode::AcceptEdits,
+            "plan" => PermissionMode::Plan,
+            "bypasspermissions" => PermissionMode::Bypass,
+            _ => anyhow::bail!("unknown --permission-mode: {mode}"),
+        };
+        runtime.set_permission_mode(parsed);
+    }
+    if let Some(text) = &cli.append_system_prompt {
+        runtime.append_system_prompt(text.clone());
+    }
+    if !cli.allowed_tools.is_empty() {
+        runtime.allow_only_tools(&cli.allowed_tools);
+    }
+    if !cli.disallowed_tools.is_empty() {
+        runtime.deny_tools(&cli.disallowed_tools);
+    }
+    for dir in &cli.add_dir {
+        let abs = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        if !session.additional_allowed_dirs.contains(&abs) {
+            session.additional_allowed_dirs.push(abs);
+        }
+    }
+    if let Some(id) = &cli.session_id {
+        session.id =
+            uuid::Uuid::parse_str(id).with_context(|| format!("invalid --session-id: {id}"))?;
+    }
+    Ok(())
+}
+
 async fn execute_run(
     cli: Cli,
     config: AppConfig,
@@ -278,6 +331,8 @@ async fn execute_run(
 ) -> Result<()> {
     let data_dir = cli.data_dir.clone();
     let model = config.model.clone();
+    let mut config = config;
+    apply_cli_config_overrides(&mut config, &cli);
     let mut runtime = Runtime::with_mode(
         config,
         resolve_prompt(run_mode.system_prompt.as_deref()),
@@ -287,8 +342,9 @@ async fn execute_run(
     if let Some(agent) = &agent_def {
         runtime.apply_agent(agent);
     }
-    let mut session = runtime.start_session_with_mode(cli.cwd, SessionMode::Headless);
+    let mut session = runtime.start_session_with_mode(cli.cwd.clone(), SessionMode::Headless);
     session.worktree_origin = worktree_origin.clone();
+    apply_cli_session_overrides(&mut runtime, &mut session, &cli)?;
     let approval_fn = build_approval_fn(run_mode.yes);
     // SessionStart hooks: stdout becomes context prepended to the prompt.
     let start_context = clawedcode_core::hooks::run_session_start_hooks(
@@ -376,6 +432,8 @@ async fn execute_resume(
         session.worktree_origin = worktree_origin.clone();
     }
 
+    let mut config = config;
+    apply_cli_config_overrides(&mut config, &cli);
     let mut runtime = Runtime::with_mode(
         config,
         resolve_prompt(None),
@@ -385,6 +443,7 @@ async fn execute_resume(
     if let Some(agent) = &agent_def {
         runtime.apply_agent(agent);
     }
+    apply_cli_session_overrides(&mut runtime, &mut session, &cli)?;
     let approval_fn = build_approval_fn(resume_mode.yes);
 
     session.execution_mode = SessionMode::Resume;
@@ -454,6 +513,8 @@ async fn execute_continue(
         session.worktree_origin = worktree_origin.clone();
     }
 
+    let mut config = config;
+    apply_cli_config_overrides(&mut config, &cli);
     let mut runtime = Runtime::with_mode(
         config,
         resolve_prompt(None),
@@ -463,6 +524,7 @@ async fn execute_continue(
     if let Some(agent) = &agent_def {
         runtime.apply_agent(agent);
     }
+    apply_cli_session_overrides(&mut runtime, &mut session, &cli)?;
     let approval_fn = build_approval_fn(continue_mode.yes);
 
     session.execution_mode = SessionMode::Continue;
@@ -778,6 +840,8 @@ async fn execute_headless(
 
     let data_dir = cli.data_dir.clone();
     let model = config.model.clone();
+    let mut config = config;
+    apply_cli_config_overrides(&mut config, &cli);
     let mut runtime = Runtime::with_mode(
         config,
         resolve_prompt(system_prompt.as_deref()),
@@ -787,8 +851,9 @@ async fn execute_headless(
     if let Some(agent) = &agent_def {
         runtime.apply_agent(agent);
     }
-    let mut session = runtime.start_session_with_mode(cli.cwd, SessionMode::Headless);
+    let mut session = runtime.start_session_with_mode(cli.cwd.clone(), SessionMode::Headless);
     session.worktree_origin = worktree_origin.clone();
+    apply_cli_session_overrides(&mut runtime, &mut session, &cli)?;
     let approval_fn = build_approval_fn(yes);
     // SessionStart hooks: stdout becomes context prepended to the prompt.
     let start_context = clawedcode_core::hooks::run_session_start_hooks(
@@ -2680,6 +2745,14 @@ mod tests {
             worktree: None,
             agent: None,
             fork_session: false,
+            add_dir: Vec::new(),
+            permission_mode: None,
+            model: None,
+            max_turns: None,
+            append_system_prompt: None,
+            allowed_tools: Vec::new(),
+            disallowed_tools: Vec::new(),
+            session_id: None,
         }
     }
 

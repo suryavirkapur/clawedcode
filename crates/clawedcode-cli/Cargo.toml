@@ -16,6 +16,7 @@ clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+uuid.workspace = true
 tracing-subscriber.workspace = true
 clawedcode-api = { path = "../clawedcode-api", version = "0.1.1", features = ["anthropic", "openai"] }
 clawedcode-core = { path = "../clawedcode-core", version = "0.1.1" }

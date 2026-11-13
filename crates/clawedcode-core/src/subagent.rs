@@ -353,7 +353,7 @@ impl SubAgentRuntime {
 
 /// Canonical Claude tool names → our tool names, so agent frontmatter
 /// written for the reference format resolves against our registry.
-fn agent_tool_aliases(name: &str) -> &'static [&'static str] {
+pub(crate) fn agent_tool_aliases(name: &str) -> &'static [&'static str] {
     match name.to_ascii_lowercase().as_str() {
         "bash" | "glob" | "grep" | "ls" => &["shell"],
         "read" | "file_read" | "fileread" => &["read_file"],

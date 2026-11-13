@@ -195,6 +195,7 @@ pub struct Runtime {
     /// Custom-agent system prompt (`.claude/agents/*.md` bodies) — set when a
     /// `Task(subagent_type=...)` run selects an agent definition.
     pub(crate) agent_prompt: Option<String>,
+    appended_system_prompt: Option<String>,
     pub(crate) tools: Vec<ToolSpec>,
     tool_instances: HashMap<String, Box<dyn Tool>>,
     pub(crate) compatibility: CompatibilitySnapshot,
@@ -494,6 +495,7 @@ impl Runtime {
             config,
             system_prompt,
             agent_prompt: None,
+            appended_system_prompt: None,
             tools,
             tool_instances,
             compatibility,
@@ -512,6 +514,33 @@ impl Runtime {
         self.tool_instances.retain(|name, _| {
             allowed.contains(&name.to_ascii_lowercase()) || name.starts_with("mcp__")
         });
+    }
+
+    /// `--append-system-prompt`: extra text appended after the system prompt
+    /// (and output style) on every request.
+    pub fn append_system_prompt(&mut self, text: String) {
+        self.appended_system_prompt = Some(text);
+    }
+
+    /// `--allowedTools`: restrict the pool to these names (Claude-format
+    /// names like `Bash`/`Read` resolve via the agent-tool alias map).
+    pub fn allow_only_tools(&mut self, names: &[String]) {
+        crate::subagent::apply_allowed_tools(self, &Some(names.to_vec()));
+    }
+
+    /// `--disallowedTools`: remove the named tools from the pool.
+    pub fn deny_tools(&mut self, names: &[String]) {
+        let mut denied = std::collections::HashSet::new();
+        for name in names {
+            denied.insert(name.to_ascii_lowercase());
+            for alias in crate::subagent::agent_tool_aliases(name) {
+                denied.insert(alias.to_string());
+            }
+        }
+        self.tools
+            .retain(|t| !denied.contains(&t.name.to_ascii_lowercase()));
+        self.tool_instances
+            .retain(|n, _| !denied.contains(&n.to_ascii_lowercase()));
     }
 
     pub fn set_agent_prompt(&mut self, prompt: Option<String>) {
@@ -569,6 +598,10 @@ impl Runtime {
         if let Some(style) = crate::compat::load_output_style(&session.cwd) {
             body.push_str("\n\n");
             body.push_str(&style);
+        }
+        if let Some(appended) = &self.appended_system_prompt {
+            body.push_str("\n\n");
+            body.push_str(appended);
         }
         body
     }
