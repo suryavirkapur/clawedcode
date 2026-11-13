@@ -3425,12 +3425,77 @@ pub fn create_session_worktree(
     let flat = slug.replace('/', "-");
     let path = root.join(".claude/worktrees").join(&flat);
     let branch = format!("worktree-{flat}");
-    run_git(
-        &["worktree", "add", &path.to_string_lossy(), "-b", &branch],
-        &root,
-    )
-    .map_err(|e| format!("Failed to create worktree: {e}"))?;
+
+    // settings.worktree.sparsePaths → --no-checkout + sparse-checkout;
+    // settings.worktree.symlinkDirectories → repo-root dirs linked into
+    // the worktree (like the reference's createWorktree).
+    let (sparse, symlink_dirs) = worktree_settings(cwd);
+    let path_str = path.to_string_lossy().to_string();
+    let mut add_args = vec!["worktree", "add"];
+    if !sparse.is_empty() {
+        add_args.push("--no-checkout");
+    }
+    add_args.extend([&path_str, "-b", branch.as_str()]);
+    run_git(&add_args, &root).map_err(|e| format!("Failed to create worktree: {e}"))?;
+
+    if !sparse.is_empty() {
+        let teardown = |msg: String| -> String {
+            let _ = run_git(&["worktree", "remove", "--force", &path_str], &root);
+            msg
+        };
+        let mut sparse_args = vec!["sparse-checkout", "set", "--cone", "--"];
+        sparse_args.extend(sparse.iter().map(String::as_str));
+        if let Err(e) = run_git(&sparse_args, &path) {
+            return Err(teardown(format!("Failed to configure sparse-checkout: {e}")));
+        }
+        if let Err(e) = run_git(&["checkout", "HEAD"], &path) {
+            return Err(teardown(format!("Failed to checkout worktree: {e}")));
+        }
+    }
+
+    for dir in symlink_dirs {
+        // Skip anything that could escape the repository, like the
+        // reference's containsPathTraversal check.
+        if dir.contains("..") || dir.starts_with('/') || dir.starts_with('~') {
+            continue;
+        }
+        let source = root.join(&dir);
+        let dest = path.join(&dir);
+        if !source.is_dir() || dest.exists() {
+            continue;
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&source, &dest).ok();
+    }
+
     Ok((path, Some(branch)))
+}
+
+/// `worktree.sparsePaths` / `worktree.symlinkDirectories` from merged
+/// settings (union across files, like other list settings).
+fn worktree_settings(cwd: &Path) -> (Vec<String>, Vec<String>) {
+    let mut sparse = Vec::new();
+    let mut symlinks = Vec::new();
+    for path in crate::hooks::settings_file_paths(cwd) {
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let Some(wt) = value.get("worktree") else {
+            continue;
+        };
+        for (key, out) in [
+            ("sparsePaths", &mut sparse),
+            ("symlinkDirectories", &mut symlinks),
+        ] {
+            if let Some(arr) = wt.get(key).and_then(|v| v.as_array()) {
+                out.extend(arr.iter().filter_map(|v| v.as_str()).map(str::to_string));
+            }
+        }
+    }
+    (sparse, symlinks)
 }
 
 /// Parse a PR reference like the reference's `parsePRReference`: `#123`,

@@ -42,6 +42,8 @@ pub struct HookCommand {
     /// evaluated against the payload's tool_name/tool_input; hooks with a
     /// non-matching condition are skipped before spawning.
     pub if_condition: Option<String>,
+    /// `"once": true` — hook runs a single time per process.
+    pub once: bool,
     /// Settings file the hook came from (for display in `/hooks`).
     pub source: std::path::PathBuf,
 }
@@ -74,6 +76,9 @@ struct HookSpec {
     /// Permission-rule-syntax precondition, like the reference's `if`.
     #[serde(rename = "if", default)]
     if_condition: Option<String>,
+    /// `"once": true` — run once, then skip (reference parity).
+    #[serde(default)]
+    once: bool,
     /// Timeout in seconds, like the reference's hook timeout field.
     timeout: Option<u64>,
 }
@@ -169,6 +174,7 @@ pub fn load_hooks(cwd: &Path) -> HooksConfig {
                         headers: spec.headers.clone(),
                         allowed_env_vars: spec.allowed_env_vars.clone(),
                         if_condition: spec.if_condition.clone(),
+                        once: spec.once,
                         source: path.clone(),
                     });
                 }
@@ -371,6 +377,18 @@ fn run_hook_command(
                 )
             });
         if !matched {
+            return Ok(HookOutput {
+                code: Some(0),
+                success: true,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            });
+        }
+    }
+    if hook.once {
+        let key = format!("{}:{}:{}", hook.source.display(), hook.event, hook.command);
+        let mut consumed = CONSUMED_ONCE_HOOKS.lock().unwrap();
+        if !consumed.insert(key) {
             return Ok(HookOutput {
                 code: Some(0),
                 success: true,
@@ -720,6 +738,12 @@ fn interpolate_header_env(
 /// stream-json protocol can forward them.
 /// Filesystem paths hooks asked us to watch (`hookSpecificOutput.
 /// watchPaths`) — polled by `start_file_watcher` to fire `FileChanged`.
+/// `"once": true` hooks that already ran this process, keyed by
+/// `source:event:command`.
+static CONSUMED_ONCE_HOOKS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
 static WATCH_PATHS: std::sync::RwLock<std::collections::BTreeSet<String>> =
     std::sync::RwLock::new(std::collections::BTreeSet::new());
 
