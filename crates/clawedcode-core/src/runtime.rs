@@ -523,7 +523,7 @@ impl Runtime {
 
     fn effective_system_prompt_body(&self, session: &Session) -> String {
         let tool_names: Vec<String> = self.tools.iter().map(|tool| tool.name.clone()).collect();
-        render_system_prompt(
+        let mut body = render_system_prompt(
             &self.system_prompt,
             &PromptRenderContext {
                 session,
@@ -531,7 +531,12 @@ impl Runtime {
                 tool_names: &tool_names,
                 compatibility: &self.compatibility,
             },
-        )
+        );
+        if let Some(style) = crate::compat::load_output_style(&session.cwd) {
+            body.push_str("\n\n");
+            body.push_str(&style);
+        }
+        body
     }
 
     pub fn build_request(&self, session: &Session) -> CompletionRequest {

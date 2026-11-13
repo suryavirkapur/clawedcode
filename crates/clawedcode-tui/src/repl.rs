@@ -5603,9 +5603,18 @@ PR number: {args}"#
                     return Ok(true);
                 }
                 "/output-style" => {
+                    // Matches the reference: deprecated in favor of /config.
+                    let current = output_style_setting(&ctx.session().cwd)
+                        .unwrap_or_else(|| "default".to_string());
                     handler.show_panel(
                         "Output style".to_string(),
-                        vec!["default — no other output styles installed.".to_string()],
+                        vec![
+                            format!("Current: {current}"),
+                            "/output-style is deprecated — use /config output-style <name>,"
+                                .to_string(),
+                            "or set outputStyle in .claude/settings.local.json.".to_string(),
+                            "Styles live in .claude/output-styles/<name>.md.".to_string(),
+                        ],
                     );
                     let _ = ctx.save_session();
                     return Ok(true);
@@ -5816,6 +5825,12 @@ PR number: {args}"#
                             }
                             "theme" if !value.is_empty() => {
                                 apply_theme_choice(ctx, handler, value);
+                            }
+                            "output-style" | "outputstyle" if !value.is_empty() => {
+                                set_output_style(&ctx.session().cwd, value);
+                                handler.push_overlay(format!(
+                                    "[info] Output style set to {value} (applies next session)"
+                                ));
                             }
                             "thinking" if matches!(value, "on" | "off") => {
                                 ctx.show_thinking = value == "on";
@@ -7212,6 +7227,40 @@ fn persist_config_key(section: &str, key: &str, value: Option<&str>) {
         }
     }
     let _ = fs::write(&path, updated.join("\n"));
+}
+
+/// Read the configured `outputStyle` name from the project settings files
+/// (local file checked first, like the reference precedence).
+fn output_style_setting(cwd: &Path) -> Option<String> {
+    [".claude/settings.local.json", ".claude/settings.json"]
+        .iter()
+        .filter_map(|name| fs::read_to_string(cwd.join(name)).ok())
+        .filter_map(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .find_map(|json| {
+            json.get("outputStyle")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+}
+
+/// Persist `outputStyle` into `.claude/settings.local.json`, preserving any
+/// existing keys.
+fn set_output_style(cwd: &Path, style: &str) {
+    let path = cwd.join(".claude").join("settings.local.json");
+    let _ = fs::create_dir_all(path.parent().unwrap_or(cwd));
+    let mut json = fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if style.eq_ignore_ascii_case("default") {
+        json.as_object_mut().map(|obj| obj.remove("outputStyle"));
+    } else {
+        json["outputStyle"] = style.into();
+    }
+    let _ = fs::write(
+        &path,
+        serde_json::to_string_pretty(&json).unwrap_or_default(),
+    );
 }
 
 fn persist_ui_key(key: &str, value: &str) {

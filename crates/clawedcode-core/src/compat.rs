@@ -91,6 +91,50 @@ fn settings_search_paths(cwd: &Path) -> Vec<PathBuf> {
     paths
 }
 
+/// `outputStyle` from `.claude/settings.json` / `settings.local.json`:
+/// the setting names a markdown file under `.claude/output-styles/` whose
+/// body is appended to the system prompt (the reference applies it on the
+/// next session).
+pub fn load_output_style(cwd: &Path) -> Option<String> {
+    let style_name = [".claude/settings.local.json", ".claude/settings.json"]
+        .iter()
+        .filter_map(|name| std::fs::read_to_string(cwd.join(name)).ok())
+        .filter_map(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .filter_map(|json| {
+            json.get("outputStyle")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .next()?;
+    if style_name.eq_ignore_ascii_case("default") {
+        return None;
+    }
+    let file_name = format!("{}.md", style_name);
+    let mut candidates = vec![cwd.join(".claude").join("output-styles").join(&file_name)];
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(
+            PathBuf::from(home)
+                .join(".claude")
+                .join("output-styles")
+                .join(&file_name),
+        );
+    }
+    for path in candidates {
+        if let Ok(body) = std::fs::read_to_string(&path) {
+            // Reuse the frontmatter stripper so `description:` metadata does
+            // not leak into the prompt.
+            let (_frontmatter, body) = parse_frontmatter_and_body(&body);
+            let body = body.trim();
+            if !body.is_empty() {
+                return Some(body.to_string());
+            }
+        }
+    }
+    // A configured style with no resolvable file still records the intent —
+    // the name itself becomes the instruction.
+    Some(format!("Output style: {style_name}"))
+}
+
 fn discover_skills(cwd: &Path) -> Result<Vec<SkillDescriptor>> {
     let mut paths: Vec<(PathBuf, bool)> = Vec::new();
 
