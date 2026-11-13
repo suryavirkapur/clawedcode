@@ -36,6 +36,13 @@ struct SkillFrontmatter {
     when_to_use: Option<String>,
 }
 
+/// `.claude/rules/*.md` frontmatter — `paths:` globs make a rule conditional:
+/// it defers loading until a touched file matches (path_glob_match).
+#[derive(Debug, Default, serde::Deserialize)]
+struct RuleFrontmatter {
+    paths: Option<Vec<String>>,
+}
+
 pub fn discover(cwd: &Path) -> Result<CompatibilitySnapshot> {
     let (settings_files, settings) = discover_settings(cwd)?;
     let skills = discover_skills(cwd)?;
@@ -392,6 +399,15 @@ fn discover_memory_with_reason(cwd: &Path, load_reason: &str) -> Result<(Vec<Pat
         if !path.exists() {
             continue;
         }
+        // Conditional rules (paths: frontmatter) defer to path_glob_match.
+        if path.parent().map(|p| p.ends_with("rules")).unwrap_or(false) {
+            if let Ok(raw) = fs::read_to_string(&path) {
+                let (fm, _): (RuleFrontmatter, String) = parse_frontmatter_and_body(&raw);
+                if fm.paths.as_ref().is_some_and(|g| !g.is_empty()) {
+                    continue;
+                }
+            }
+        }
 
         let expanded = expand_memory_file(&path, &mut Vec::new(), 0, cwd)?;
         if expanded.trim().is_empty() {
@@ -462,6 +478,47 @@ fn memory_search_paths(cwd: &Path, claude_home: Option<&Path>) -> Result<Vec<Pat
     Ok(paths)
 }
 
+/// `**` spans directories; `*`/`?` stay within a segment.
+fn glob_match(pattern: &str, path: &str) -> bool {
+    fn seg_match(pat: &[&str], parts: &[&str]) -> bool {
+        match (pat.first(), parts.first()) {
+            (None, None) => true,
+            (Some(&"**"), _) => {
+                seg_match(&pat[1..], parts) || (!parts.is_empty() && seg_match(pat, &parts[1..]))
+            }
+            (Some(p), Some(s)) => wildcard_match(p, s) && seg_match(&pat[1..], &parts[1..]),
+            _ => false,
+        }
+    }
+    fn wildcard_match(pat: &str, s: &str) -> bool {
+        let (p, s): (Vec<char>, Vec<char>) = (pat.chars().collect(), s.chars().collect());
+        let (mut i, mut j, mut star, mut mark) = (0usize, 0usize, usize::MAX, 0usize);
+        while j < s.len() {
+            if i < p.len() && (p[i] == '?' || p[i] == s[j]) {
+                i += 1;
+                j += 1;
+            } else if i < p.len() && p[i] == '*' {
+                star = i;
+                i += 1;
+                mark = j;
+            } else if star != usize::MAX {
+                i = star + 1;
+                mark += 1;
+                j = mark;
+            } else {
+                return false;
+            }
+        }
+        while i < p.len() && p[i] == '*' {
+            i += 1;
+        }
+        i == p.len()
+    }
+    let pat_parts: Vec<&str> = pattern.split('/').collect();
+    let path_parts: Vec<&str> = path.split('/').collect();
+    seg_match(&pat_parts, &path_parts)
+}
+
 /// Lazy nested-traversal memory load, like the reference: when a file tool
 /// touches `file_path`, any CLAUDE.md in the directories between the session
 /// root and that file (not already loaded) fires InstructionsLoaded with
@@ -496,6 +553,69 @@ pub fn load_nested_memory_for_file(
 
     let mut loaded_text = String::new();
     for dir in chain {
+        // Conditional rules: .claude/rules/*.md with paths: frontmatter whose
+        // globs match the touched file (relative to the rule's project dir).
+        let rules_dir = dir.join(".claude").join("rules");
+        if rules_dir.is_dir() {
+            if let Ok(entries) = fs::read_dir(&rules_dir) {
+                let mut rule_files: Vec<PathBuf> = entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md"))
+                    .collect();
+                rule_files.sort();
+                for rule in rule_files {
+                    let canonical = std::fs::canonicalize(&rule).unwrap_or_else(|_| rule.clone());
+                    if session.loaded_memory.contains(&canonical)
+                        || session.loaded_memory.contains(&rule)
+                    {
+                        continue;
+                    }
+                    let Ok(raw) = fs::read_to_string(&rule) else { continue };
+                    let (fm, _): (RuleFrontmatter, String) =
+                        parse_frontmatter_and_body(&raw);
+                    let Some(globs) = fm.paths.filter(|g| !g.is_empty()) else { continue };
+                    let rel = file_path
+                        .strip_prefix(&dir)
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| file_path.to_string_lossy().to_string());
+                    if !globs.iter().any(|g| glob_match(g, &rel)) {
+                        continue;
+                    }
+                    crate::hooks::run_simple_event_hooks(
+                        &crate::hooks::load_hooks(&session.cwd),
+                        "InstructionsLoaded",
+                        &session.id.to_string(),
+                        &session.cwd,
+                        serde_json::json!({
+                            "file_path": canonical.to_string_lossy(),
+                            "memory_type": "Project",
+                            "load_reason": "path_glob_match",
+                            "globs": globs,
+                            "trigger_file_path": std::path::absolute(file_path)
+                                .unwrap_or_else(|_| file_path.to_path_buf())
+                                .to_string_lossy(),
+                        }),
+                    );
+                    if let Ok(expanded) =
+                        expand_memory_file(&canonical, &mut Vec::new(), 0, &session.cwd)
+                    {
+                        if !expanded.trim().is_empty() {
+                            if !loaded_text.is_empty() {
+                                loaded_text.push_str("\n\n");
+                            }
+                            loaded_text.push_str(&format!(
+                                "<!-- {} -->\n{}",
+                                canonical.display(),
+                                expanded.trim()
+                            ));
+                        }
+                    }
+                    session.loaded_memory.push(canonical);
+                }
+            }
+        }
+
         let candidate = dir.join("CLAUDE.md");
         if !candidate.exists() {
             continue;
