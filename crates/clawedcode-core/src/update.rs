@@ -85,15 +85,22 @@ pub fn plan_self_update() -> Result<UpdatePlan> {
                 "--force".to_string(),
             ],
         }),
-        InstallMethod::Npm => Ok(UpdatePlan {
-            method: InstallMethod::Npm,
-            program: npm_program_name(),
-            args: vec![
-                "install".to_string(),
-                "-g".to_string(),
-                "clawedcode@latest".to_string(),
-            ],
-        }),
+        InstallMethod::Npm => {
+            // settings.autoUpdatesChannel: latest|stable → the npm dist-tag.
+            let channel = std::env::var("CLAWEDCODE_UPDATE_CHANNEL")
+                .ok()
+                .or_else(|| update_channel_from_settings())
+                .unwrap_or_else(|| "latest".to_string());
+            Ok(UpdatePlan {
+                method: InstallMethod::Npm,
+                program: npm_program_name(),
+                args: vec![
+                    "install".to_string(),
+                    "-g".to_string(),
+                    format!("clawedcode@{channel}"),
+                ],
+            })
+        }
         InstallMethod::LocalBuild => bail!(
             "self-update is not supported for a local build; rebuild locally or install via cargo or npm"
         ),
@@ -126,6 +133,16 @@ pub fn run_self_update() -> Result<UpdateOutcome> {
         method: plan.method,
         command,
     })
+}
+
+fn update_channel_from_settings() -> Option<String> {
+    let home = crate::compat::claude_home()?;
+    let text = std::fs::read_to_string(home.join("settings.json")).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    json.get("autoUpdatesChannel")
+        .and_then(|v| v.as_str())
+        .filter(|c| matches!(*c, "latest" | "stable"))
+        .map(str::to_string)
 }
 
 fn npm_program_name() -> String {
@@ -181,6 +198,25 @@ mod tests {
         );
 
         unsafe { std::env::remove_var("CLAWEDCODE_INSTALL_METHOD") };
+    }
+
+    #[test]
+    fn update_channel_from_settings_honors_stable() {
+        let dir = std::env::temp_dir().join(format!(
+            "clawed-channel-{}",
+            std::process::id()
+        ));
+        let home = dir.join("cfg");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("settings.json"), r#"{"autoUpdatesChannel": "stable"}"#)
+            .unwrap();
+        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", &home) };
+        assert_eq!(update_channel_from_settings().as_deref(), Some("stable"));
+        std::fs::write(home.join("settings.json"), r#"{"autoUpdatesChannel": "nightly"}"#)
+            .unwrap();
+        assert_eq!(update_channel_from_settings(), None);
+        unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

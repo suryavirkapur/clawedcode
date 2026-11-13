@@ -835,11 +835,8 @@ fn execute_marketplace(cli: &Cli, action: crate::cli::MarketplaceAction) -> Resu
                 let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
                     continue;
                 };
-                let Some(blocked) = json.get("blockedMarketplaces").and_then(|v| v.as_array()) else {
-                    continue;
-                };
-                for entry in blocked {
-                    let matches = entry
+                let source_matches = |entry: &serde_json::Value| {
+                    entry
                         .get("path")
                         .or_else(|| entry.get("url"))
                         .or_else(|| entry.get("repo"))
@@ -858,10 +855,23 @@ fn execute_marketplace(cli: &Cli, action: crate::cli::MarketplaceAction) -> Resu
                                     })
                                     .unwrap_or(false)
                         })
-                        .unwrap_or(false);
-                    if matches {
+                        .unwrap_or(false)
+                };
+                if let Some(blocked) = json.get("blockedMarketplaces").and_then(|v| v.as_array()) {
+                    if blocked.iter().any(source_matches) {
                         anyhow::bail!(
                             "Marketplace source '{source}' is blocked by managed settings"
+                        );
+                    }
+                }
+                // strictKnownMarketplaces — ONLY listed sources may be added.
+                if let Some(allowed) = json
+                    .get("strictKnownMarketplaces")
+                    .and_then(|v| v.as_array())
+                {
+                    if !allowed.is_empty() && !allowed.iter().any(source_matches) {
+                        anyhow::bail!(
+                            "Marketplace source '{source}' is not in the strictKnownMarketplaces allowlist"
                         );
                     }
                 }
