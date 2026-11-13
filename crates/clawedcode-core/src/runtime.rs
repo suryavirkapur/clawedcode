@@ -1563,6 +1563,22 @@ impl Runtime {
             }
             _ => String::new(),
         };
+        let failed = matches!(result, ContentBlock::ToolResult { is_error: true, .. });
+        if failed {
+            // PostToolUseFailure runs alongside PostToolUse on error
+            // results — fire-and-forget like the reference.
+            crate::hooks::run_simple_event_hooks(
+                &hooks,
+                "PostToolUseFailure",
+                &session.id.to_string(),
+                &session.cwd,
+                serde_json::json!({
+                    "tool_name": tool_name,
+                    "tool_input": input,
+                    "error": preview,
+                }),
+            );
+        }
         if let Some(feedback) = crate::hooks::run_post_tool_hooks(
             &hooks,
             &session.id.to_string(),

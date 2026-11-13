@@ -5829,6 +5829,13 @@ fn compact_session(session: &mut Session) {
             format!("Previous conversation summary:\n\n{summary}"),
         );
     }
+    clawedcode_core::hooks::run_simple_event_hooks(
+        &clawedcode_core::hooks::load_hooks(&session.cwd),
+        "PostCompact",
+        &session.id.to_string(),
+        &session.cwd,
+        serde_json::json!({}),
+    );
 }
 
 fn handle_slash_command(
