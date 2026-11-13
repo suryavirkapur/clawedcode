@@ -393,7 +393,7 @@ fn discover_memory_with_reason(cwd: &Path, load_reason: &str) -> Result<(Vec<Pat
             continue;
         }
 
-        let expanded = expand_memory_file(&path, &mut Vec::new(), 0)?;
+        let expanded = expand_memory_file(&path, &mut Vec::new(), 0, cwd)?;
         if expanded.trim().is_empty() {
             continue;
         }
@@ -462,7 +462,12 @@ fn memory_search_paths(cwd: &Path, claude_home: Option<&Path>) -> Result<Vec<Pat
     Ok(paths)
 }
 
-fn expand_memory_file(path: &Path, stack: &mut Vec<PathBuf>, depth: usize) -> Result<String> {
+fn expand_memory_file(
+    path: &Path,
+    stack: &mut Vec<PathBuf>,
+    depth: usize,
+    hooks_cwd: &Path,
+) -> Result<String> {
     const MAX_MEMORY_INCLUDE_DEPTH: usize = 16;
 
     if depth >= MAX_MEMORY_INCLUDE_DEPTH {
@@ -483,7 +488,25 @@ fn expand_memory_file(path: &Path, stack: &mut Vec<PathBuf>, depth: usize) -> Re
         let trimmed = line.trim();
         if let Some(include_target) = trimmed.strip_prefix("@include ") {
             let include_path = resolve_include_path(path, include_target.trim());
-            let nested = expand_memory_file(&include_path, stack, depth + 1)?;
+            // InstructionsLoaded fires per @-included file with reason
+            // "include" and the including file as parent_file_path.
+            crate::hooks::run_simple_event_hooks(
+                &crate::hooks::load_hooks(hooks_cwd),
+                "InstructionsLoaded",
+                "",
+                hooks_cwd,
+                serde_json::json!({
+                    "file_path": std::path::absolute(&include_path)
+                        .unwrap_or_else(|_| include_path.clone())
+                        .to_string_lossy(),
+                    "memory_type": "Project",
+                    "load_reason": "include",
+                    "parent_file_path": std::path::absolute(path)
+                        .unwrap_or_else(|_| path.to_path_buf())
+                        .to_string_lossy(),
+                }),
+            );
+            let nested = expand_memory_file(&include_path, stack, depth + 1, hooks_cwd)?;
             if !nested.trim().is_empty() {
                 expanded.push(nested);
             }
@@ -1302,7 +1325,7 @@ mod tests {
         )
         .unwrap();
 
-        let expanded = expand_memory_file(&main, &mut Vec::new(), 0).unwrap();
+        let expanded = expand_memory_file(&main, &mut Vec::new(), 0, &root).unwrap();
         assert!(expanded.contains("start"));
         assert!(expanded.contains("relative content"));
         assert!(expanded.contains("absolute content"));
@@ -1320,7 +1343,7 @@ mod tests {
         fs::write(&a, "@include b.md\nfrom a").unwrap();
         fs::write(&b, "@include a.md\nfrom b").unwrap();
 
-        let expanded = expand_memory_file(&a, &mut Vec::new(), 0).unwrap();
+        let expanded = expand_memory_file(&a, &mut Vec::new(), 0, &root).unwrap();
         assert!(expanded.contains("from a"));
         assert!(expanded.contains("from b"));
         assert_eq!(expanded.matches("from a").count(), 1);
