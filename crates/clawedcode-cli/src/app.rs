@@ -115,17 +115,47 @@ pub async fn execute(boot: BootstrappedApp) -> Result<()> {
         unsafe { std::env::set_var("CLAWEDCODE_DATA_DIR", data_dir) };
     }
 
+    // `--worktree <name>`: create the worktree up front and run the session
+    // inside it, like the reference's startup flag. The original cwd becomes
+    // the session's worktree_origin so ExitWorktree restores it.
+    let mut cli = cli;
+    let mut worktree_origin: Option<PathBuf> = None;
+    if let Some(name) = cli.worktree.clone() {
+        let origin = cli.cwd.canonicalize().unwrap_or_else(|_| cli.cwd.clone());
+        let (path, _branch) =
+            clawedcode_core::runtime::create_session_worktree(&origin, &name, "startup")
+                .map_err(|e| anyhow::anyhow!(e))?;
+        worktree_origin = Some(origin);
+        cli.cwd = path;
+    }
+
+    // `--agent <name>`: resolve an agent definition (`.claude/agents` or
+    // built-ins) and apply its prompt/model/mode/tools to the main runtime.
+    let agent_def = match cli.agent.as_deref() {
+        Some(name) => Some(
+            compat::discover_agents(&cli.cwd)
+                .into_iter()
+                .find(|a| a.agent_type == name)
+                .ok_or_else(|| anyhow::anyhow!("Unknown agent type: {name}"))?,
+        ),
+        None => None,
+    };
+
     match mode {
         ExecutionMode::Tui => {
             let sessions_dir = session_store_dir(cli.data_dir.clone())
                 .context("no sessions directory available")?;
-            let ctx = TuiContext::new(
+            let mut ctx = TuiContext::new(
                 config,
                 resolve_prompt(None),
                 compatibility,
                 cli.cwd,
                 sessions_dir,
             );
+            ctx.session.worktree_origin = worktree_origin;
+            if let Some(agent) = &agent_def {
+                ctx.runtime.apply_agent(agent);
+            }
             tui::run_with_context(ctx)
         }
         ExecutionMode::Config => {
@@ -148,15 +178,49 @@ pub async fn execute(boot: BootstrappedApp) -> Result<()> {
             Ok(())
         }
         ExecutionMode::Update => execute_update(),
-        ExecutionMode::Run(run_mode) => execute_run(cli, config, compatibility, run_mode).await,
+        ExecutionMode::Run(run_mode) => {
+            execute_run(
+                cli,
+                config,
+                compatibility,
+                run_mode,
+                agent_def,
+                worktree_origin,
+            )
+            .await
+        }
         ExecutionMode::Resume(resume_mode) => {
-            execute_resume(cli, config, compatibility, resume_mode).await
+            execute_resume(
+                cli,
+                config,
+                compatibility,
+                resume_mode,
+                agent_def,
+                worktree_origin,
+            )
+            .await
         }
         ExecutionMode::Continue(continue_mode) => {
-            execute_continue(cli, config, compatibility, continue_mode).await
+            execute_continue(
+                cli,
+                config,
+                compatibility,
+                continue_mode,
+                agent_def,
+                worktree_origin,
+            )
+            .await
         }
         ExecutionMode::Headless(headless_mode) => {
-            execute_headless(cli, config, compatibility, headless_mode).await
+            execute_headless(
+                cli,
+                config,
+                compatibility,
+                headless_mode,
+                agent_def,
+                worktree_origin,
+            )
+            .await
         }
         ExecutionMode::DirectConnect(direct_connect_mode) => {
             execute_direct_connect(cli, config, compatibility, direct_connect_mode).await
@@ -209,16 +273,22 @@ async fn execute_run(
     config: AppConfig,
     compatibility: compat::CompatibilitySnapshot,
     run_mode: crate::bootstrap::RunMode,
+    agent_def: Option<compat::AgentDefinition>,
+    worktree_origin: Option<PathBuf>,
 ) -> Result<()> {
     let data_dir = cli.data_dir.clone();
     let model = config.model.clone();
-    let runtime = Runtime::with_mode(
+    let mut runtime = Runtime::with_mode(
         config,
         resolve_prompt(run_mode.system_prompt.as_deref()),
         compatibility,
         PermissionMode::Default,
     );
+    if let Some(agent) = &agent_def {
+        runtime.apply_agent(agent);
+    }
     let mut session = runtime.start_session_with_mode(cli.cwd, SessionMode::Headless);
+    session.worktree_origin = worktree_origin.clone();
     let approval_fn = build_approval_fn(run_mode.yes);
     // SessionStart hooks: stdout becomes context prepended to the prompt.
     let start_context = clawedcode_core::hooks::run_session_start_hooks(
@@ -291,19 +361,30 @@ async fn execute_resume(
     config: AppConfig,
     compatibility: compat::CompatibilitySnapshot,
     resume_mode: crate::bootstrap::ResumeMode,
+    agent_def: Option<compat::AgentDefinition>,
+    worktree_origin: Option<PathBuf>,
 ) -> Result<()> {
     let data_dir = cli.data_dir.clone();
     let sessions_dir =
         session_store_dir(data_dir.clone()).context("no sessions directory available")?;
     let mut session = Session::load_by_id(&sessions_dir, &resume_mode.session_id)
         .with_context(|| format!("failed to load session {}", resume_mode.session_id))?;
+    if cli.fork_session {
+        session = Session::fork_from(&session);
+    }
+    if worktree_origin.is_some() {
+        session.worktree_origin = worktree_origin.clone();
+    }
 
-    let runtime = Runtime::with_mode(
+    let mut runtime = Runtime::with_mode(
         config,
         resolve_prompt(None),
         compatibility,
         PermissionMode::Default,
     );
+    if let Some(agent) = &agent_def {
+        runtime.apply_agent(agent);
+    }
     let approval_fn = build_approval_fn(resume_mode.yes);
 
     session.execution_mode = SessionMode::Resume;
@@ -358,6 +439,8 @@ async fn execute_continue(
     config: AppConfig,
     compatibility: compat::CompatibilitySnapshot,
     continue_mode: crate::bootstrap::ContinueMode,
+    agent_def: Option<compat::AgentDefinition>,
+    worktree_origin: Option<PathBuf>,
 ) -> Result<()> {
     let data_dir = cli.data_dir.clone();
     let sessions_dir =
@@ -368,12 +451,15 @@ async fn execute_continue(
 
     let mut session = latest_session;
 
-    let runtime = Runtime::with_mode(
+    let mut runtime = Runtime::with_mode(
         config,
         resolve_prompt(None),
         compatibility,
         PermissionMode::Default,
     );
+    if let Some(agent) = &agent_def {
+        runtime.apply_agent(agent);
+    }
     let approval_fn = build_approval_fn(continue_mode.yes);
 
     session.execution_mode = SessionMode::Continue;
@@ -666,6 +752,8 @@ async fn execute_headless(
     config: AppConfig,
     compatibility: compat::CompatibilitySnapshot,
     headless_mode: crate::bootstrap::HeadlessMode,
+    agent_def: Option<compat::AgentDefinition>,
+    worktree_origin: Option<PathBuf>,
 ) -> Result<()> {
     let crate::bootstrap::HeadlessMode {
         prompt,
@@ -687,13 +775,17 @@ async fn execute_headless(
 
     let data_dir = cli.data_dir.clone();
     let model = config.model.clone();
-    let runtime = Runtime::with_mode(
+    let mut runtime = Runtime::with_mode(
         config,
         resolve_prompt(system_prompt.as_deref()),
         compatibility,
         PermissionMode::Default,
     );
+    if let Some(agent) = &agent_def {
+        runtime.apply_agent(agent);
+    }
     let mut session = runtime.start_session_with_mode(cli.cwd, SessionMode::Headless);
+    session.worktree_origin = worktree_origin.clone();
     let approval_fn = build_approval_fn(yes);
     // SessionStart hooks: stdout becomes context prepended to the prompt.
     let start_context = clawedcode_core::hooks::run_session_start_hooks(

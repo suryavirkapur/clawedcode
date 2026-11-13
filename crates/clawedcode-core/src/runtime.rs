@@ -682,6 +682,20 @@ impl Runtime {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Apply an agent definition to this runtime — the `--agent <name>`
+    /// startup flag: system-prompt override, model/permission-mode overrides,
+    /// and the agent's tool allowlist.
+    pub fn apply_agent(&mut self, agent: &crate::compat::AgentDefinition) {
+        self.agent_prompt = Some(agent.system_prompt.clone());
+        if let Some(model) = &agent.model {
+            self.config.model = model.clone();
+        }
+        if let Some(mode) = crate::compat::agent_permission_mode(agent.permission_mode.as_deref()) {
+            self.set_permission_mode(mode);
+        }
+        crate::subagent::apply_allowed_tools(self, &agent.tools);
+    }
+
     pub fn set_permission_mode(&mut self, mode: PermissionMode) {
         self.permission_engine = PermissionEngine::new(mode);
     }
@@ -1882,22 +1896,10 @@ impl Runtime {
         session: &mut Session,
         enter: bool,
     ) -> ContentBlock {
-        let run_git = |args: &[&str], cwd: &Path| -> Result<String, String> {
-            let out = std::process::Command::new("git")
-                .args(args)
-                .current_dir(cwd)
-                .output()
-                .map_err(|e| format!("git unavailable: {e}"))?;
-            if out.status.success() {
-                Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-            } else {
-                Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-            }
-        };
         let in_worktree = session.cwd.to_string_lossy().contains(".claude/worktrees");
 
         if enter {
-            if in_worktree {
+            if in_worktree || session.worktree_origin.is_some() {
                 return ContentBlock::tool_error(
                     tool_use_id,
                     "Already in a worktree session".to_string(),
@@ -1908,78 +1910,23 @@ impl Runtime {
                 .and_then(|v| v.as_str())
                 .unwrap_or("worktree")
                 .to_string();
-            let valid = slug.len() <= 64
-                && slug.split('/').all(|seg| {
-                    !seg.is_empty()
-                        && seg
-                            .chars()
-                            .all(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-'))
-                });
-            if !valid {
-                return ContentBlock::tool_error(
-                    tool_use_id,
-                    format!("Invalid worktree name: {slug}"),
-                );
-            }
-            // Hook-configured worktrees replace git entirely — the hook's
-            // stdout is the worktree path (VCS-agnostic isolation).
-            let hooks = crate::hooks::load_hooks(&session.cwd);
-            if crate::hooks::has_hooks(&hooks, "WorktreeCreate") {
-                let Some(hook_path) = crate::hooks::run_output_hooks(
-                    &hooks,
-                    "WorktreeCreate",
-                    &session.id.to_string(),
-                    &session.cwd,
-                    serde_json::json!({ "name": slug }),
-                ) else {
-                    return ContentBlock::tool_error(
+            match create_session_worktree(&session.cwd, &slug, &session.id.to_string()) {
+                Err(e) => ContentBlock::tool_error(tool_use_id, e),
+                Ok((path, branch)) => {
+                    session.worktree_origin = Some(session.cwd.clone());
+                    session.cwd = path.clone();
+                    let mut result = serde_json::json!({
+                        "worktreePath": path.to_string_lossy(),
+                    });
+                    if let Some(branch) = branch {
+                        result["worktreeBranch"] = serde_json::Value::String(branch);
+                    }
+                    ContentBlock::tool_result(
                         tool_use_id,
-                        "WorktreeCreate hook produced no worktree path".to_string(),
-                    );
-                };
-                session.worktree_origin = Some(session.cwd.clone());
-                session.cwd = PathBuf::from(&hook_path);
-                return ContentBlock::tool_result(
-                    tool_use_id,
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "worktreePath": hook_path,
-                    }))
-                    .unwrap_or_default(),
-                );
-            }
-            let root = match run_git(&["rev-parse", "--show-toplevel"], &session.cwd) {
-                Ok(r) => PathBuf::from(r),
-                Err(e) => {
-                    return ContentBlock::tool_error(
-                        tool_use_id,
-                        format!(
-                            "Cannot create a worktree: {e} and no WorktreeCreate hooks are configured"
-                        ),
-                    );
+                        serde_json::to_string_pretty(&result).unwrap_or_default(),
+                    )
                 }
-            };
-            let flat = slug.replace('/', "-");
-            let path = root.join(".claude/worktrees").join(&flat);
-            let branch = format!("worktree-{flat}");
-            if let Err(e) = run_git(
-                &["worktree", "add", &path.to_string_lossy(), "-b", &branch],
-                &root,
-            ) {
-                return ContentBlock::tool_error(
-                    tool_use_id,
-                    format!("Failed to create worktree: {e}"),
-                );
             }
-            session.worktree_origin = Some(session.cwd.clone());
-            session.cwd = path.clone();
-            ContentBlock::tool_result(
-                tool_use_id,
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "worktreePath": path.to_string_lossy(),
-                    "worktreeBranch": branch,
-                }))
-                .unwrap_or_default(),
-            )
         } else {
             if !in_worktree && session.worktree_origin.is_none() {
                 return ContentBlock::tool_error(
@@ -2893,6 +2840,73 @@ fn is_task_store_tool(tool_name: &str) -> bool {
         tool_name,
         "TaskCreate" | "TaskList" | "TaskGet" | "TaskUpdate" | "TodoWrite"
     )
+}
+
+fn run_git(args: &[&str], cwd: &Path) -> Result<String, String> {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| format!("git unavailable: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// Create a worktree for a session — shared by `EnterWorktree` and the
+/// `--worktree` startup flag. A configured `WorktreeCreate` hook replaces git
+/// entirely (its stdout is the path); otherwise a `git worktree add` under
+/// `.claude/worktrees/<slug>` on branch `worktree-<slug>` is used. Returns
+/// `(worktree_path, branch)`.
+pub fn create_session_worktree(
+    cwd: &Path,
+    slug: &str,
+    session_id: &str,
+) -> Result<(PathBuf, Option<String>), String> {
+    let valid = slug.len() <= 64
+        && slug.split('/').all(|seg| {
+            !seg.is_empty()
+                && seg
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        });
+    if !valid {
+        return Err(format!("Invalid worktree name: {slug}"));
+    }
+
+    let hooks = crate::hooks::load_hooks(cwd);
+    if crate::hooks::has_hooks(&hooks, "WorktreeCreate") {
+        let Some(hook_path) = crate::hooks::run_output_hooks(
+            &hooks,
+            "WorktreeCreate",
+            session_id,
+            cwd,
+            serde_json::json!({ "name": slug }),
+        ) else {
+            return Err("WorktreeCreate hook produced no worktree path".to_string());
+        };
+        return Ok((PathBuf::from(hook_path), None));
+    }
+
+    let root = match run_git(&["rev-parse", "--show-toplevel"], cwd) {
+        Ok(r) => PathBuf::from(r),
+        Err(e) => {
+            return Err(format!(
+                "Cannot create a worktree: {e} and no WorktreeCreate hooks are configured"
+            ));
+        }
+    };
+    let flat = slug.replace('/', "-");
+    let path = root.join(".claude/worktrees").join(&flat);
+    let branch = format!("worktree-{flat}");
+    run_git(
+        &["worktree", "add", &path.to_string_lossy(), "-b", &branch],
+        &root,
+    )
+    .map_err(|e| format!("Failed to create worktree: {e}"))?;
+    Ok((path, Some(branch)))
 }
 
 fn is_agent_tool(tool_name: &str) -> bool {

@@ -369,7 +369,7 @@ fn agent_tool_aliases(name: &str) -> &'static [&'static str] {
 
 /// Apply an agent's `tools` allowlist — `None` or containing `*` keeps the
 /// full pool, matching the reference's `resolveAgentTools`.
-fn apply_allowed_tools(runtime: &mut Runtime, allowed: &Option<Vec<String>>) {
+pub(crate) fn apply_allowed_tools(runtime: &mut Runtime, allowed: &Option<Vec<String>>) {
     let Some(tools) = allowed else { return };
     if tools.iter().any(|t| t == "*") {
         return;

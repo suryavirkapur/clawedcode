@@ -7198,6 +7198,14 @@ PR number: {args}"#
                     if active_turn.is_some() {
                         handler.push_overlay("[warn] A turn is already running.".to_string());
                     } else {
+                        // The reference fires Setup hooks with trigger "init".
+                        clawedcode_core::hooks::run_simple_event_hooks(
+                            &clawedcode_core::hooks::load_hooks(&ctx.session().cwd),
+                            "Setup",
+                            &ctx.session().id.to_string(),
+                            &ctx.session().cwd,
+                            serde_json::json!({ "trigger": "init" }),
+                        );
                         let init_prompt = "Analyze this codebase and create a CLAUDE.md file in the project root. It should document the build and test commands, code layout, conventions, and anything an agent should know to work effectively here.";
                         handler.begin_live_turn("/init".to_string());
                         *active_turn = Some(spawn_turn_worker(

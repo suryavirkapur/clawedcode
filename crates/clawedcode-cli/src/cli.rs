@@ -25,6 +25,15 @@ pub struct Cli {
     pub direct_connect: Option<String>,
     #[arg(long, global = true, hide = true)]
     pub ssh: Option<String>,
+    /// Start the session inside a new worktree (git, or WorktreeCreate hooks).
+    #[arg(long, global = true)]
+    pub worktree: Option<String>,
+    /// Run the main session as a named agent (from .claude/agents or built-ins).
+    #[arg(long, global = true)]
+    pub agent: Option<String>,
+    /// With `resume`, fork the session instead of resuming it in place.
+    #[arg(long, global = true)]
+    pub fork_session: bool,
 }
 
 #[derive(Debug, Clone, Subcommand)]

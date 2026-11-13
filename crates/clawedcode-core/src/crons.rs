@@ -145,7 +145,7 @@ pub fn next_fire_ms(cron: &str, from_ms: u64) -> Option<u64> {
         let secs_of_day = secs.rem_euclid(86_400);
         let (hour, minute) = (secs_of_day / 3600, (secs_of_day % 3600) / 60);
         let z = days + 719_468;
-        let era = z.div_euclid(146_097);
+        let _era = z.div_euclid(146_097);
         let doe = z.rem_euclid(146_097);
         let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
         let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
