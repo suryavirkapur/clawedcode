@@ -851,6 +851,57 @@ pub fn builtin_tools() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: "CronCreate".to_string(),
+            description: "Schedule a prompt to run on a 5-field cron expression (M H DoM Mon DoW).".to_string(),
+            needs_approval: false,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "cron": {"type": "string", "description": "5-field cron expression"},
+                    "prompt": {"type": "string", "description": "Prompt to enqueue at each fire time"},
+                    "recurring": {"type": "boolean"},
+                    "durable": {"type": "boolean"}
+                },
+                "required": ["cron", "prompt"]
+            }),
+        },
+        ToolSpec {
+            name: "CronList".to_string(),
+            description: "List scheduled cron prompts.".to_string(),
+            needs_approval: false,
+            input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+        },
+        ToolSpec {
+            name: "CronDelete".to_string(),
+            description: "Delete a scheduled cron prompt by id.".to_string(),
+            needs_approval: false,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"}
+                },
+                "required": ["id"]
+            }),
+        },
+        ToolSpec {
+            name: "Config".to_string(),
+            description: "Get or set supported settings (theme, model, statusLine, outputStyle, permissionMode, vim, effort).".to_string(),
+            needs_approval: true,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "setting": {
+                        "type": "string",
+                        "description": "The setting key"
+                    },
+                    "value": {
+                        "description": "New value; omit to get the current value"
+                    }
+                },
+                "required": ["setting"]
+            }),
+        },
+        ToolSpec {
             name: "TodoWrite".to_string(),
             description: "Replace the session todo list. Mark work in_progress as you go and completed when done.".to_string(),
             needs_approval: false,

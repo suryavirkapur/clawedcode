@@ -1717,6 +1717,91 @@ impl Runtime {
         )
     }
 
+    /// `Config` — get/set whitelisted settings, like the reference's
+    /// ConfigTool. Reads the merged settings; writes go to the project's
+    /// `.claude/settings.json`.
+    fn execute_config_tool(
+        &self,
+        tool_use_id: &str,
+        input: serde_json::Value,
+        session: &Session,
+    ) -> ContentBlock {
+        const SUPPORTED: &[&str] = &[
+            "theme",
+            "model",
+            "statusLine",
+            "outputStyle",
+            "permissionMode",
+            "permissions.defaultMode",
+            "vim",
+            "effort",
+        ];
+        let Some(setting) = input.get("setting").and_then(|v| v.as_str()) else {
+            return ContentBlock::tool_error(tool_use_id, "Missing 'setting' parameter");
+        };
+        if !SUPPORTED.contains(&setting) {
+            return ContentBlock::tool_error(
+                tool_use_id,
+                format!("Unknown setting: \"{setting}\""),
+            );
+        }
+        let key = if setting == "permissions.defaultMode" {
+            "permissionMode"
+        } else {
+            setting
+        };
+
+        if input.get("value").is_none() {
+            let value = self
+                .compatibility
+                .settings
+                .get(key)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            return ContentBlock::tool_result(
+                tool_use_id,
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "success": true,
+                    "operation": "get",
+                    "setting": key,
+                    "value": value,
+                }))
+                .unwrap_or_default(),
+            );
+        }
+
+        let path = session.cwd.join(".claude").join("settings.json");
+        let mut doc: serde_json::Value = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        if !doc.is_object() {
+            doc = serde_json::json!({});
+        }
+        doc[key] = input["value"].clone();
+        let Some(parent) = path.parent() else {
+            return ContentBlock::tool_error(tool_use_id, "Invalid settings path");
+        };
+        if std::fs::create_dir_all(parent).is_err()
+            || std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).is_err()
+        {
+            return ContentBlock::tool_error(
+                tool_use_id,
+                format!("Failed to write {}", path.display()),
+            );
+        }
+        ContentBlock::tool_result(
+            tool_use_id,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "success": true,
+                "operation": "set",
+                "setting": key,
+                "value": input["value"],
+            }))
+            .unwrap_or_default(),
+        )
+    }
+
     /// `ToolSearch` — keyword search over the runtime's available tools,
     /// with `select:<name>` returning the full schema like the reference.
     fn execute_tool_search(&self, tool_use_id: &str, input: serde_json::Value) -> ContentBlock {
@@ -2024,8 +2109,8 @@ impl Runtime {
             TASK_OUTPUT_TOOL_NAME => Some((false, false)),
             TASK_STOP_TOOL_NAME => Some((true, true)),
             "Skill" | "SendMessage" | "Sleep" | "EnterPlanMode" | "ExitPlanMode" | "WebSearch"
-            | "ToolSearch" => Some((false, false)),
-            "WebFetch" | "EnterWorktree" | "ExitWorktree" => Some((true, false)),
+            | "ToolSearch" | "CronCreate" | "CronList" | "CronDelete" => Some((false, false)),
+            "WebFetch" | "EnterWorktree" | "ExitWorktree" | "Config" => Some((true, false)),
             _ if is_agent_tool(tool_name) => Some((false, false)),
             _ if is_task_store_tool(tool_name) => Some((false, false)),
             _ => None,
@@ -2138,6 +2223,20 @@ impl Runtime {
 
         if tool_name == "ExitWorktree" {
             return self.execute_worktree_tool(tool_use_id, input, session, false);
+        }
+
+        if matches!(tool_name, "CronCreate" | "CronList" | "CronDelete") {
+            return match crate::crons::execute_cron_tool(tool_name, input, session) {
+                Ok(Some(result)) => finish_tool_result(tool_use_id, result),
+                Ok(None) => {
+                    ContentBlock::tool_error(tool_use_id, format!("Unknown tool: {tool_name}"))
+                }
+                Err(err) => ContentBlock::tool_error(tool_use_id, err),
+            };
+        }
+
+        if tool_name == "Config" {
+            return self.execute_config_tool(tool_use_id, input, session);
         }
 
         if tool_name == "EnterPlanMode" {

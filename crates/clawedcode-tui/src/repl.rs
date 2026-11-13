@@ -1125,6 +1125,16 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
             &mut queued_prompts,
             &always_allowed,
         )?;
+        // Fire scheduled prompts (CronCreate) like the reference's scheduler.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        for cron in clawedcode_core::crons::due_crons(now_ms) {
+            handler.push_overlay(format!("[cron] Scheduled prompt fired: {}", cron.prompt));
+            queued_prompts.push(cron.prompt.clone());
+            clawedcode_core::crons::advance_cron(&cron);
+        }
         if let Some(spec) = &status_line {
             tick_status_line(
                 spec,
