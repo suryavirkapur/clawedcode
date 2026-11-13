@@ -58,6 +58,18 @@ pub struct Cli {
     /// Use a specific session id for the new session.
     #[arg(long, global = true)]
     pub session_id: Option<String>,
+    /// Print the fully rendered system prompt and exit.
+    #[arg(long, global = true)]
+    pub dump_system_prompt: bool,
+    /// Skip all permission prompts (equivalent to --permission-mode bypassPermissions).
+    #[arg(long, global = true)]
+    pub dangerously_skip_permissions: bool,
+    /// Output format for headless runs: text, json, or stream-json.
+    #[arg(long, global = true)]
+    pub output_format: Option<String>,
+    /// Input format for headless runs: text or stream-json.
+    #[arg(long, global = true)]
+    pub input_format: Option<String>,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -247,6 +259,10 @@ mod tests {
             allowed_tools: Vec::new(),
             disallowed_tools: Vec::new(),
             session_id: None,
+            dump_system_prompt: false,
+            dangerously_skip_permissions: false,
+            output_format: None,
+            input_format: None,
         }
     }
 
@@ -277,6 +293,10 @@ mod tests {
             allowed_tools: Vec::new(),
             disallowed_tools: Vec::new(),
             session_id: None,
+            dump_system_prompt: false,
+            dangerously_skip_permissions: false,
+            output_format: None,
+            input_format: None,
         }
     }
 

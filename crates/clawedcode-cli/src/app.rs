@@ -141,6 +141,23 @@ pub async fn execute(boot: BootstrappedApp) -> Result<()> {
         None => None,
     };
 
+    if cli.dump_system_prompt {
+        let mut config = config;
+        apply_cli_config_overrides(&mut config, &cli);
+        let mut runtime = Runtime::with_mode(
+            config,
+            resolve_prompt(None),
+            compatibility,
+            PermissionMode::Default,
+        );
+        if let Some(agent) = &agent_def {
+            runtime.apply_agent(agent);
+        }
+        let session = runtime.start_session_with_mode(cli.cwd.clone(), SessionMode::Headless);
+        println!("{}", runtime.effective_system_prompt_body(&session));
+        return Ok(());
+    }
+
     match mode {
         ExecutionMode::Tui => {
             let sessions_dir = session_store_dir(cli.data_dir.clone())
@@ -289,6 +306,9 @@ fn apply_cli_session_overrides(
     session: &mut Session,
     cli: &Cli,
 ) -> Result<()> {
+    if cli.dangerously_skip_permissions && cli.permission_mode.is_none() {
+        runtime.set_permission_mode(PermissionMode::Bypass);
+    }
     if let Some(mode) = cli.permission_mode.as_deref() {
         let parsed = match mode.to_ascii_lowercase().as_str() {
             "default" | "dontask" => PermissionMode::Default,
@@ -2753,6 +2773,10 @@ mod tests {
             allowed_tools: Vec::new(),
             disallowed_tools: Vec::new(),
             session_id: None,
+            dump_system_prompt: false,
+            dangerously_skip_permissions: false,
+            output_format: None,
+            input_format: None,
         }
     }
 

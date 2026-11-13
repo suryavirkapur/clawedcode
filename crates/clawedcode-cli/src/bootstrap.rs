@@ -123,6 +123,13 @@ pub fn bootstrap(cli: Cli) -> Result<BootstrappedApp> {
 }
 
 pub fn resolve_mode(cli: &Cli) -> Result<ExecutionMode> {
+    match cli.input_format.as_deref() {
+        None | Some("text") => {}
+        Some("stream-json") => {
+            anyhow::bail!("--input-format stream-json is not supported by this build")
+        }
+        Some(other) => anyhow::bail!("unknown --input-format: {other}"),
+    }
     let prompt_payload = prompt_payload_from_command(cli.command.as_ref());
 
     if cli.headless {
@@ -176,14 +183,22 @@ pub fn resolve_mode(cli: &Cli) -> Result<ExecutionMode> {
             stream_json,
             show_thinking,
             yes,
-        } => Ok(ExecutionMode::Run(RunMode {
-            prompt,
-            system_prompt,
-            json,
-            stream_json,
-            show_thinking,
-            yes,
-        })),
+        } => {
+            let (json, stream_json) = match cli.output_format.as_deref() {
+                Some("json") => (true, false),
+                Some("stream-json") => (true, true),
+                Some("text") | None => (json, stream_json),
+                Some(other) => anyhow::bail!("unknown --output-format: {other}"),
+            };
+            Ok(ExecutionMode::Run(RunMode {
+                prompt,
+                system_prompt,
+                json,
+                stream_json,
+                show_thinking,
+                yes,
+            }))
+        }
         Command::Resume {
             session_id,
             prompt,
@@ -430,6 +445,10 @@ mod tests {
             allowed_tools: Vec::new(),
             disallowed_tools: Vec::new(),
             session_id: None,
+            dump_system_prompt: false,
+            dangerously_skip_permissions: false,
+            output_format: None,
+            input_format: None,
         }
     }
 
@@ -668,6 +687,10 @@ mod tests {
             allowed_tools: Vec::new(),
             disallowed_tools: Vec::new(),
             session_id: None,
+            dump_system_prompt: false,
+            dangerously_skip_permissions: false,
+            output_format: None,
+            input_format: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Tui));
@@ -695,6 +718,10 @@ mod tests {
             allowed_tools: Vec::new(),
             disallowed_tools: Vec::new(),
             session_id: None,
+            dump_system_prompt: false,
+            dangerously_skip_permissions: false,
+            output_format: None,
+            input_format: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -722,6 +749,10 @@ mod tests {
             allowed_tools: Vec::new(),
             disallowed_tools: Vec::new(),
             session_id: None,
+            dump_system_prompt: false,
+            dangerously_skip_permissions: false,
+            output_format: None,
+            input_format: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));
@@ -752,6 +783,10 @@ mod tests {
             allowed_tools: Vec::new(),
             disallowed_tools: Vec::new(),
             session_id: None,
+            dump_system_prompt: false,
+            dangerously_skip_permissions: false,
+            output_format: None,
+            input_format: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::DirectConnect(_)));
@@ -782,6 +817,10 @@ mod tests {
             allowed_tools: Vec::new(),
             disallowed_tools: Vec::new(),
             session_id: None,
+            dump_system_prompt: false,
+            dangerously_skip_permissions: false,
+            output_format: None,
+            input_format: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Ssh(_)));
@@ -819,6 +858,10 @@ mod tests {
             allowed_tools: Vec::new(),
             disallowed_tools: Vec::new(),
             session_id: None,
+            dump_system_prompt: false,
+            dangerously_skip_permissions: false,
+            output_format: None,
+            input_format: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -860,6 +903,10 @@ mod tests {
             allowed_tools: Vec::new(),
             disallowed_tools: Vec::new(),
             session_id: None,
+            dump_system_prompt: false,
+            dangerously_skip_permissions: false,
+            output_format: None,
+            input_format: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));

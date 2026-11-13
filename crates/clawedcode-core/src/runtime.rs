@@ -581,7 +581,7 @@ impl Runtime {
         result
     }
 
-    pub(crate) fn effective_system_prompt_body(&self, session: &Session) -> String {
+    pub fn effective_system_prompt_body(&self, session: &Session) -> String {
         let tool_names: Vec<String> = self.tools.iter().map(|tool| tool.name.clone()).collect();
         let mut body = render_system_prompt(
             &self.system_prompt,
