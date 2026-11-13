@@ -399,7 +399,11 @@ pub enum McpAction {
 #[derive(Debug, Clone, Subcommand)]
 pub enum PluginAction {
     /// List discovered plugins from plugin dirs.
-    List,
+    List {
+        /// Also show plugins available in registered marketplaces.
+        #[arg(long)]
+        available: bool,
+    },
     /// Validate a plugin manifest (.claude-plugin/plugin.json or dir).
     Validate { path: PathBuf },
     /// Enable a disabled plugin.

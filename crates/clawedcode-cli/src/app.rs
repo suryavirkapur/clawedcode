@@ -613,14 +613,14 @@ fn set_plugin_enabled(cwd: &Path, name: &str, enabled: bool) -> Result<()> {
 fn execute_plugin(cli: &Cli, action: crate::cli::PluginAction) -> Result<()> {
     use crate::cli::PluginAction;
     match action {
-        PluginAction::List => {
+        PluginAction::List { available } => {
             let plugins = compat::discover_plugins_all(&cli.cwd);
             if plugins.is_empty() {
                 println!("No plugins discovered.");
             } else {
-                for p in plugins {
-                    let version = p.version.unwrap_or_default();
-                    let desc = p.description.unwrap_or_default();
+                for p in &plugins {
+                    let version = p.version.clone().unwrap_or_default();
+                    let desc = p.description.clone().unwrap_or_default();
                     let state = if p.enabled { "enabled" } else { "disabled" };
                     println!(
                         "{}{} — {} [{}] ({state})",
@@ -629,6 +629,37 @@ fn execute_plugin(cli: &Cli, action: crate::cli::PluginAction) -> Result<()> {
                         desc,
                         p.path.display()
                     );
+                }
+            }
+            if available {
+                // Show plugins offered by registered marketplaces that are not
+                // installed yet, like the reference's `--available` listing.
+                if let Ok(doc) = load_known_marketplaces() {
+                    if let Some(map) = doc.as_object() {
+                        for (market, entry) in map {
+                            let Ok(manifest) = entry["source"]["path"]
+                                .as_str()
+                                .map(PathBuf::from)
+                                .ok_or_else(|| anyhow::anyhow!("skip"))
+                                .and_then(|p| read_marketplace_manifest(&p).map(|(_, m, _)| m))
+                            else {
+                                continue;
+                            };
+                            for pe in manifest["plugins"].as_array().into_iter().flatten() {
+                                let pname = pe
+                                    .get("name")
+                                    .or_else(|| pe.get("id"))
+                                    .and_then(|n| n.as_str())
+                                    .unwrap_or("?");
+                                if plugins.iter().any(|p| p.name == pname) {
+                                    continue;
+                                }
+                                let desc =
+                                    pe.get("description").and_then(|d| d.as_str()).unwrap_or("");
+                                println!("{pname}@{market} — {desc} (available)");
+                            }
+                        }
+                    }
                 }
             }
         }
