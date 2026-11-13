@@ -1544,11 +1544,19 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                                 }
                             }
                         }
-                        KeyCode::Char('x') => {
-                            if let Some(TaskEntry::Shell { id, .. }) = entries.get(sel) {
+                        KeyCode::Char('x') => match entries.get(sel) {
+                            Some(TaskEntry::Shell { id, .. }) => {
                                 let _ = stop_background_task(id);
                             }
-                        }
+                            Some(TaskEntry::Turn { index, .. }) => {
+                                if let Some(bg) = background_turns.get(*index) {
+                                    bg.turn
+                                        .interrupt_flag
+                                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                            Some(TaskEntry::Agent { .. }) | None => {}
+                        },
                         KeyCode::Esc => {
                             handler.tasks_picker = None;
                         }
@@ -2322,12 +2330,13 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                     KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         pending_ctrl_x = true;
                     }
-                    // `ctrl+x ctrl+k` — kill running background tasks.
+                    // `ctrl+x ctrl+k` — kill running background tasks, including
+                    // turns parked with ctrl+b (the reference's killAgents).
                     KeyCode::Char('k')
                         if key.modifiers.contains(KeyModifiers::CONTROL) && pending_ctrl_x =>
                     {
                         pending_ctrl_x = false;
-                        let stopped = list_background_tasks()
+                        let mut stopped = list_background_tasks()
                             .into_iter()
                             .filter(|task| {
                                 matches!(
@@ -2336,6 +2345,15 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                                 )
                             })
                             .filter(|task| stop_background_task(&task.id).is_some())
+                            .count();
+                        stopped += background_turns
+                            .iter()
+                            .filter(|turn| {
+                                !turn
+                                    .turn
+                                    .interrupt_flag
+                                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                            })
                             .count();
                         handler
                             .push_overlay(format!("[info] Stopped {stopped} background task(s)"));
@@ -7506,7 +7524,7 @@ fn render_tasks_picker(
         ]));
     }
     lines.push(Line::from(Span::styled(
-        " Enter foreground turn · x kill shell · Esc close",
+        " Enter foreground turn · x kill · Esc close",
         Style::default().fg(pal().dim),
     )));
     frame.render_widget(
