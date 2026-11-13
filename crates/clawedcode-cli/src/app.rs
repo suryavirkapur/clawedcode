@@ -1487,9 +1487,10 @@ fn build_approval_fn(yes: bool) -> ApprovalFn {
 fn apply_cli_config_overrides(config: &mut AppConfig, cli: &Cli) {
     if let Some(model) = &cli.model {
         config.model = model.clone();
-    } else {
-        // settings.json `model` applies when --model isn't given —
-        // later files win like settings precedence.
+    }
+    // settings.json `model`/`effortLevel` apply when the flags aren't
+    // given — later files win like settings precedence.
+    if cli.model.is_none() || cli.effort.is_none() {
         for path in clawedcode_core::hooks::settings_file_paths(&cli.cwd) {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
@@ -1497,8 +1498,15 @@ fn apply_cli_config_overrides(config: &mut AppConfig, cli: &Cli) {
             let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
                 continue;
             };
-            if let Some(model) = json.get("model").and_then(|v| v.as_str()) {
-                config.model = model.to_string();
+            if cli.model.is_none() {
+                if let Some(model) = json.get("model").and_then(|v| v.as_str()) {
+                    config.model = model.to_string();
+                }
+            }
+            if cli.effort.is_none() {
+                if let Some(effort) = json.get("effortLevel").and_then(|v| v.as_str()) {
+                    config.runtime.effort = Some(effort.to_string());
+                }
             }
         }
     }
@@ -4563,6 +4571,45 @@ mod tests {
                 mode
             );
         }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn settings_effort_level_applies_when_flag_absent() {
+        let _guard = env_lock();
+        let dir = temp_sessions_dir("effort_settings");
+        let fake_home = dir.join("home");
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".claude")).unwrap();
+        std::fs::create_dir_all(&fake_home).unwrap();
+        unsafe {
+            std::env::set_var("HOME", &fake_home);
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+            std::env::remove_var("CLAWEDCODE_SETTING_SOURCES");
+            std::env::remove_var("CLAWEDCODE_SETTINGS");
+        }
+        std::fs::write(
+            project.join(".claude/settings.json"),
+            r#"{"effortLevel": "low", "model": "settings-model"}"#,
+        )
+        .unwrap();
+
+        let mut cli = make_cli(&dir.join("data"));
+        cli.cwd = project.clone();
+        let mut config = AppConfig::default();
+        config.model = "flag-default".to_string();
+        apply_cli_config_overrides(&mut config, &cli);
+        assert_eq!(config.model, "settings-model");
+        assert_eq!(config.runtime.effort.as_deref(), Some("low"));
+
+        // Flags win over settings.
+        cli.model = Some("flag-model".to_string());
+        cli.effort = Some("max".to_string());
+        let mut config = AppConfig::default();
+        apply_cli_config_overrides(&mut config, &cli);
+        assert_eq!(config.model, "flag-model");
+        assert_eq!(config.runtime.effort.as_deref(), Some("max"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
