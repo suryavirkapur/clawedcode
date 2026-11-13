@@ -340,57 +340,70 @@ impl McpStdioClient {
     /// Poll the child's stdout before each blocking read so a silent or
     /// half-crashed server can't hang the CLI at discovery time.
     fn read_json_with_timeout(&mut self, timeout: std::time::Duration) -> Result<Value, String> {
+        use std::io::Read;
         use std::os::unix::io::AsRawFd;
         let stdout = self.io.stdout();
         let fd = stdout.get_ref().as_raw_fd();
-        if !poll_fd_readable(fd, timeout) {
-            return Err("MCP server response timed out".into());
-        }
-        let mut content_length = None;
-        let mut line = String::new();
+        let deadline = std::time::Instant::now() + timeout;
 
+        // Byte-wise reads gated on poll(): a server that emits a partial line
+        // or partial body then stalls cannot wedge the blocking read.
+        let mut read_byte = |stdout: &mut BufReader<ChildStdout>| -> Result<u8, String> {
+            loop {
+                if let Some(buf) = stdout.buffer().first() {
+                    let b = *buf;
+                    stdout.consume(1);
+                    return Ok(b);
+                }
+                let remaining = deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .ok_or_else(|| "MCP server response timed out".to_string())?;
+                if !poll_fd_readable(fd, remaining) {
+                    return Err("MCP server response timed out".into());
+                }
+                let mut byte = [0u8; 1];
+                match stdout.read(&mut byte) {
+                    Ok(0) => return Err("unexpected EOF from MCP server".into()),
+                    Ok(_) => return Ok(byte[0]),
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(format!("read error: {e}")),
+                }
+            }
+        };
+
+        let mut content_length = None;
+        let mut line = Vec::new();
         loop {
             line.clear();
-            stdout
-                .read_line(&mut line)
-                .map_err(|e| format!("read header error: {e}"))?;
-
-            if line.is_empty() {
-                return Err("unexpected EOF while reading MCP headers".into());
+            loop {
+                let b = read_byte(stdout)?;
+                if b == b'\n' {
+                    break;
+                }
+                line.push(b);
             }
-
-            if line == "\r\n" || line == "\n" {
+            if line.ends_with(b"\r") {
+                line.pop();
+            }
+            if line.is_empty() {
                 break;
             }
-
-            let trimmed = line.trim();
-            if let Some(value) = trimmed.strip_prefix("Content-Length:") {
+            let text = String::from_utf8_lossy(&line);
+            if let Some(value) = text.trim().strip_prefix("Content-Length:") {
                 content_length = Some(
                     value
                         .trim()
-                        .parse()
+                        .parse::<usize>()
                         .map_err(|e| format!("parse Content-Length error: {e}"))?,
                 );
             }
         }
 
         let content_length = content_length.ok_or("missing Content-Length header")?;
-
-        let mut body = vec![0u8; content_length];
-        let mut filled = 0usize;
-        while filled < content_length {
-            let buffered = stdout
-                .fill_buf()
-                .map_err(|e| format!("read body error: {e}"))?;
-            let take = buffered.len().min(content_length - filled);
-            body[filled..filled + take].copy_from_slice(&buffered[..take]);
-            stdout.consume(take);
-            filled += take;
-            if filled < content_length && !poll_fd_readable(fd, MCP_IO_TIMEOUT) {
-                return Err("MCP server response timed out".into());
-            }
+        let mut body = Vec::with_capacity(content_length);
+        for _ in 0..content_length {
+            body.push(read_byte(stdout)?);
         }
-
         serde_json::from_slice(&body).map_err(|e| format!("parse error: {e}"))
     }
 

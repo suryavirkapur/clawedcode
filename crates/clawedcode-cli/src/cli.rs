@@ -355,23 +355,40 @@ pub enum McpAction {
     List,
     /// Show one server's configuration.
     Get { name: String },
-    /// Add a stdio MCP server to .mcp.json.
+    /// Add an MCP server (stdio command or sse/http URL).
     Add {
         name: String,
-        command: String,
+        command_or_url: String,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
-        /// Write to the user-level ~/.claude.json-style scope instead.
-        #[arg(long)]
-        user: bool,
+        /// Configuration scope (local, user, or project).
+        #[arg(short = 's', long, default_value = "local")]
+        scope: String,
+        /// Transport type (stdio, sse, or http). Defaults to stdio.
+        #[arg(short = 't', long)]
+        transport: Option<String>,
+        /// Environment variables, e.g. -e KEY=value.
+        #[arg(short = 'e', long = "env")]
+        env: Vec<String>,
+        /// HTTP/SSE headers, e.g. -H "X-Api-Key: abc123".
+        #[arg(short = 'H', long = "header")]
+        headers: Vec<String>,
     },
-    /// Remove a server from .mcp.json.
-    Remove { name: String },
+    /// Remove a server from a config scope.
+    Remove {
+        name: String,
+        /// Configuration scope (local, user, or project). Auto-detected if omitted.
+        #[arg(short = 's', long)]
+        scope: Option<String>,
+    },
     /// Add a server (stdio or SSE) with a JSON string, like `mcp add-json`.
     AddJson {
         name: String,
         /// JSON object, e.g. '{"type":"stdio","command":"x","args":[]}'.
         json: String,
+        /// Configuration scope (local, user, or project).
+        #[arg(short = 's', long, default_value = "local")]
+        scope: String,
     },
     /// Clear approved/rejected project-scoped (.mcp.json) servers for this cwd.
     ResetProjectChoices,

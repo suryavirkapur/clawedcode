@@ -58,6 +58,15 @@ pub fn claude_home() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude")))
 }
 
+/// Path to ~/.claude.json — the reference's global config file holding
+/// user-scope `mcpServers` and per-project `projects.<cwd>` (local scope).
+pub fn claude_json_path() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        return Some(home.join(".claude.json"));
+    }
+    claude_home().and_then(|d| d.parent().map(|p| p.join(".claude.json")))
+}
+
 fn discover_settings(cwd: &Path) -> Result<(Vec<PathBuf>, Value)> {
     let mut files = Vec::new();
     let mut merged = Value::Object(Map::new());
@@ -1110,7 +1119,36 @@ fn discover_mcp_servers(cwd: &Path, settings: &Value) -> Result<BTreeMap<String,
     let mut servers = if strict {
         BTreeMap::new()
     } else {
-        parse_settings_mcp_servers(settings)
+        let mut found = BTreeMap::new();
+        // ~/.claude.json: user-scope mcpServers + local-scope projects.<cwd>
+        if let Some(json_path) = claude_json_path() {
+            if json_path.exists() {
+                if let Ok(value) = read_json_file(&json_path) {
+                    if let Some(user) = value.get("mcpServers").and_then(parse_mcp_map) {
+                        found.extend(user);
+                    }
+                    let cwd_key = std::fs::canonicalize(cwd)
+                        .unwrap_or_else(|_| cwd.to_path_buf())
+                        .to_string_lossy()
+                        .to_string();
+                    if let Some(local) = value
+                        .get("projects")
+                        .and_then(|p| p.get(&cwd_key))
+                        .or_else(|| {
+                            value
+                                .get("projects")
+                                .and_then(|p| p.get(cwd.to_string_lossy().as_ref()))
+                        })
+                        .and_then(|p| p.get("mcpServers"))
+                        .and_then(parse_mcp_map)
+                    {
+                        found.extend(local);
+                    }
+                }
+            }
+        }
+        found.extend(parse_settings_mcp_servers(settings));
+        found
     };
 
     for file in &extra_files {

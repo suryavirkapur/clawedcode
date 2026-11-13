@@ -662,6 +662,77 @@ fn execute_plugin(cli: &Cli, action: crate::cli::PluginAction) -> Result<()> {
     Ok(())
 }
 
+/// Resolve an MCP config scope to its backing file + scope tag:
+/// `project` → ./.mcp.json, `local`/`user` → ~/.claude.json.
+fn mcp_scope_path(cli: &Cli, scope: &str) -> Result<(std::path::PathBuf, &'static str)> {
+    match scope {
+        "project" => Ok((cli.cwd.join(".mcp.json"), "project")),
+        "local" | "user" => {
+            let path = compat::claude_json_path()
+                .ok_or_else(|| anyhow::anyhow!("cannot determine ~/.claude.json path"))?;
+            Ok((path, if scope == "local" { "local" } else { "user" }))
+        }
+        other => anyhow::bail!("invalid scope '{other}' (expected local, user, or project)"),
+    }
+}
+
+fn read_json_or_default(path: &std::path::Path) -> serde_json::Value {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
+/// Canonical cwd key matching the reference's projects.<abs-cwd> index.
+fn mcp_local_key(cli: &Cli) -> String {
+    std::fs::canonicalize(&cli.cwd)
+        .unwrap_or_else(|_| cli.cwd.clone())
+        .to_string_lossy()
+        .to_string()
+}
+
+fn ensure_mcp_doc(doc: &mut serde_json::Value, scope: &str, cli: &Cli) {
+    if scope == "local" {
+        let key = mcp_local_key(cli);
+        if doc.get("projects").is_none() {
+            doc["projects"] = serde_json::json!({});
+        }
+        if doc["projects"].get(&key).is_none() {
+            doc["projects"][&key] = serde_json::json!({});
+        }
+        if doc["projects"][&key].get("mcpServers").is_none() {
+            doc["projects"][&key]["mcpServers"] = serde_json::json!({});
+        }
+    } else if doc.get("mcpServers").is_none() {
+        doc["mcpServers"] = serde_json::json!({});
+    }
+}
+
+/// JSON pointer to the object holding `mcpServers` for a scope.
+fn doc_pointer<'a>(doc: &'a serde_json::Value, scope: &str, cli: &Cli) -> &'a serde_json::Value {
+    if scope == "local" {
+        let key = mcp_local_key(cli);
+        doc.get("projects").and_then(|p| p.get(&key)).unwrap_or(&serde_json::Value::Null)
+    } else {
+        doc
+    }
+}
+
+fn doc_pointer_mut<'a>(
+    doc: &'a mut serde_json::Value,
+    scope: &str,
+    cli: &Cli,
+) -> &'a mut serde_json::Value {
+    if scope == "local" {
+        let key = mcp_local_key(cli);
+        doc.get_mut("projects")
+            .and_then(|p| p.get_mut(&key))
+            .expect("ensure_mcp_doc called first")
+    } else {
+        doc
+    }
+}
+
 /// `clawedcode mcp` — manage `.mcp.json` server entries like the
 /// reference's `claude mcp` subcommand.
 fn execute_mcp(
@@ -671,14 +742,6 @@ fn execute_mcp(
     action: crate::cli::McpAction,
 ) -> Result<()> {
     use crate::cli::McpAction;
-    let path = cli.cwd.join(".mcp.json");
-    let mut doc: serde_json::Value = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    if doc.get("mcpServers").is_none() {
-        doc["mcpServers"] = serde_json::json!({});
-    }
 
     match action {
         McpAction::List => {
@@ -699,40 +762,127 @@ fn execute_mcp(
         }
         McpAction::Add {
             name,
-            command,
+            command_or_url,
             args,
-            user: _,
+            scope,
+            transport,
+            env,
+            headers,
         } => {
-            doc["mcpServers"][&name] = serde_json::json!({
-                "command": command,
-                "args": args,
-            });
+            let transport = match transport.as_deref() {
+                None => {
+                    if command_or_url.starts_with("http://")
+                        || command_or_url.starts_with("https://")
+                        || command_or_url.starts_with("ws://")
+                        || command_or_url.starts_with("wss://")
+                    {
+                        "sse".to_string()
+                    } else {
+                        "stdio".to_string()
+                    }
+                }
+                Some(t) => t.to_string(),
+            };
+            let env_map: serde_json::Map<String, serde_json::Value> = env
+                .iter()
+                .filter_map(|kv| {
+                    kv.split_once('=').map(|(k, v)| {
+                        (k.to_string(), serde_json::Value::String(v.to_string()))
+                    })
+                })
+                .collect();
+            let header_map: serde_json::Map<String, serde_json::Value> = headers
+                .iter()
+                .filter_map(|h| {
+                    h.split_once(':').map(|(k, v)| {
+                        (k.trim().to_string(), serde_json::Value::String(v.trim().to_string()))
+                    })
+                })
+                .collect();
+            let entry = match transport.as_str() {
+                "stdio" => serde_json::json!({
+                    "type": "stdio",
+                    "command": command_or_url,
+                    "args": args,
+                    "env": env_map,
+                }),
+                "sse" | "http" | "ws" => serde_json::json!({
+                    "type": transport,
+                    "url": command_or_url,
+                    "headers": header_map,
+                }),
+                other => anyhow::bail!("unknown transport '{other}' (expected stdio, sse, http, ws)"),
+            };
+            let (path, scope) = mcp_scope_path(cli, &scope)?;
+            let mut doc = read_json_or_default(&path);
+            ensure_mcp_doc(&mut doc, scope, cli);
+            doc_pointer_mut(&mut doc, scope, cli)["mcpServers"][&name] = entry;
             std::fs::write(&path, serde_json::to_string_pretty(&doc)?)
                 .with_context(|| format!("failed to write {}", path.display()))?;
-            println!("Added MCP server '{name}' to {}", path.display());
+            println!("Added MCP server '{name}' to {scope} config ({})", path.display());
         }
-        McpAction::Remove { name } => {
-            let removed = doc["mcpServers"]
+        McpAction::Remove { name, scope } => {
+            let scope = match scope {
+                Some(s) => s,
+                None => {
+                    // Auto-detect which scope(s) contain the server, like the
+                    // reference: error and list scopes when ambiguous.
+                    let mut found = Vec::new();
+                    for s in ["local", "project", "user"] {
+                        if let Ok((path, sc)) = mcp_scope_path(cli, s) {
+                            let doc = read_json_or_default(&path);
+                            if doc_pointer(&doc, sc, cli)
+                                .get("mcpServers")
+                                .and_then(|m| m.get(&name))
+                                .is_some()
+                            {
+                                found.push(sc);
+                            }
+                        }
+                    }
+                    match found.len() {
+                        0 => anyhow::bail!("No MCP server found with name: \"{name}\""),
+                        1 => found[0].to_string(),
+                        _ => {
+                            eprintln!("MCP server \"{name}\" exists in multiple scopes:");
+                            for s in &found {
+                                eprintln!("  - {s}");
+                            }
+                            eprintln!("\nTo remove from a specific scope, use:");
+                            for s in &found {
+                                eprintln!("  clawedcode mcp remove \"{name}\" -s {s}");
+                            }
+                            anyhow::bail!("ambiguous scope");
+                        }
+                    }
+                }
+            };
+            let (path, scope) = mcp_scope_path(cli, &scope)?;
+            let mut doc = read_json_or_default(&path);
+            let removed = doc_pointer_mut(&mut doc, scope, cli)["mcpServers"]
                 .as_object_mut()
                 .map(|m| m.remove(&name).is_some())
                 .unwrap_or(false);
             if !removed {
-                anyhow::bail!("No MCP server named '{name}' in {}", path.display());
+                anyhow::bail!("No MCP server named '{name}' in {scope} config ({})", path.display());
             }
             std::fs::write(&path, serde_json::to_string_pretty(&doc)?)
                 .with_context(|| format!("failed to write {}", path.display()))?;
-            println!("Removed MCP server '{name}' from {}", path.display());
+            println!("Removed MCP server '{name}' from {scope} config ({})", path.display());
         }
-        McpAction::AddJson { name, json } => {
+        McpAction::AddJson { name, json, scope } => {
             let value: serde_json::Value =
                 serde_json::from_str(&json).with_context(|| "invalid JSON for mcp add-json")?;
             if !value.is_object() {
                 anyhow::bail!("mcp add-json expects a JSON object");
             }
-            doc["mcpServers"][&name] = value;
+            let (path, scope) = mcp_scope_path(cli, &scope)?;
+            let mut doc = read_json_or_default(&path);
+            ensure_mcp_doc(&mut doc, scope, cli);
+            doc_pointer_mut(&mut doc, scope, cli)["mcpServers"][&name] = value;
             std::fs::write(&path, serde_json::to_string_pretty(&doc)?)
                 .with_context(|| format!("failed to write {}", path.display()))?;
-            println!("Added MCP server '{name}' to {}", path.display());
+            println!("Added MCP server '{name}' to {scope} config ({})", path.display());
         }
         McpAction::ResetProjectChoices => {
             // Clears approved/rejected project servers in settings files,
