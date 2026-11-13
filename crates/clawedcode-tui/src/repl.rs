@@ -436,6 +436,7 @@ const BUILTIN_COMMANDS: &[&str] = &[
     "/diff",
     "/files",
     "/doctor",
+    "/stickers",
     "/rewind",
     "/plan",
     "/skills",
@@ -515,7 +516,6 @@ const UNSUPPORTED_COMMANDS: &[&str] = &[
     "/oauth-refresh",
     "/reset-limits",
     "/terminal-setup",
-    "/stickers",
     "/ant-trace",
     "/install",
     "/issue-report",
@@ -7045,6 +7045,18 @@ PR number: {args}"#
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
+                "/stickers" => {
+                    // Opens the sticker store in the browser, like the reference.
+                    let url = "https://www.stickermule.com/claudecode";
+                    let msg = if open_in_browser(url) {
+                        "Opening sticker page in browser…".to_string()
+                    } else {
+                        format!("Failed to open browser. Visit: {url}")
+                    };
+                    handler.push_overlay(format!("[info] {msg}"));
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
                 "/doctor" => {
                     let mut lines = vec![
                         format!("ClawedCode v{}", env!("CARGO_PKG_VERSION")),
@@ -7877,6 +7889,11 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
         CommandEntry {
             name: "/doctor".to_string(),
             description: "Check the ClawedCode environment".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/stickers".to_string(),
+            description: "Order Claude Code stickers".to_string(),
             source: CommandSource::BuiltIn,
         },
         CommandEntry {
@@ -10085,6 +10102,25 @@ fn copy_to_clipboard(text: &str) -> Result<&'static str> {
     Err(anyhow::anyhow!(
         "no clipboard tool found (pbcopy, wl-copy, xclip, xsel)"
     ))
+}
+
+fn open_in_browser(url: &str) -> bool {
+    let tools: &[(&str, &[&str])] = &[("xdg-open", &[]), ("open", &[]), ("wslview", &[])];
+    for (tool, extra) in tools {
+        if let Ok(status) = std::process::Command::new(tool)
+            .args(*extra)
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+        {
+            if status.success() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn open_external_editor(initial: &str) -> Option<String> {
