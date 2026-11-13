@@ -66,6 +66,8 @@ pub struct CompletionRequest {
     pub effort: Option<EffortLevel>,
     /// `--max-thinking-tokens`: overrides the effort-derived budget when set.
     pub thinking_budget: Option<u64>,
+    /// Anthropic beta feature strings sent as `anthropic-beta` headers.
+    pub betas: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -956,10 +958,14 @@ pub mod anthropic_provider {
                 let mut last_err: Option<ProviderError> = None;
 
                 for attempt in 1..=retry.max_attempts {
-                    let send_fut = client
+                    let mut req_b = client
                         .post(&endpoint)
                         .header("x-api-key", &api_key)
-                        .header("anthropic-version", &anthropic_version)
+                        .header("anthropic-version", &anthropic_version);
+                    if !req.betas.is_empty() {
+                        req_b = req_b.header("anthropic-beta", req.betas.join(","));
+                    }
+                    let send_fut = req_b
                         .header("content-type", "application/json")
                         .json(&body)
                         .send();
@@ -1084,10 +1090,14 @@ pub mod anthropic_provider {
                     body["tools"] = tools;
                 }
 
-                let send_fut = client
+                let mut req_b = client
                     .post(&endpoint)
                     .header("x-api-key", &api_key)
-                    .header("anthropic-version", &anthropic_version)
+                    .header("anthropic-version", &anthropic_version);
+                if !req.betas.is_empty() {
+                    req_b = req_b.header("anthropic-beta", req.betas.join(","));
+                }
+                let send_fut = req_b
                     .header("content-type", "application/json")
                     .json(&body)
                     .send();
@@ -1934,6 +1944,7 @@ mod tests {
             mcp_servers: BTreeMap::new(),
             effort: None,
             thinking_budget: None,
+            betas: Vec::new(),
         };
 
         let events: Vec<_> = provider
@@ -1961,6 +1972,7 @@ mod tests {
             mcp_servers: BTreeMap::new(),
             effort: None,
             thinking_budget: None,
+            betas: Vec::new(),
         };
 
         let events: Vec<_> = provider
@@ -1998,6 +2010,7 @@ mod tests {
             mcp_servers: BTreeMap::new(),
             effort: None,
             thinking_budget: None,
+            betas: Vec::new(),
         };
 
         let direct = provider.complete(&request).await.unwrap();

@@ -25,6 +25,7 @@ clawedcode-tui = { path = "../clawedcode-tui", version = "0.1.1" }
 clawedcode-tools = { path = "../clawedcode-tools", version = "0.1.1" }
 clap_complete = "4.6.11"
 libc = "0.2.191"
+jsonschema = { version = "0.28.1", default-features = false }
 
 [[bin]]
 name = "clawedcode"

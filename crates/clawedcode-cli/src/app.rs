@@ -641,6 +641,10 @@ fn apply_cli_config_overrides(config: &mut AppConfig, cli: &Cli) {
     if let Some(fallback) = &cli.fallback_model {
         config.runtime.fallback_model = Some(fallback.clone());
     }
+    config.runtime.betas.extend(cli.betas.iter().cloned());
+    if let Some(cap) = cli.max_budget_usd {
+        config.runtime.max_budget_usd = Some(cap);
+    }
 }
 
 /// Apply the reference's print-mode flag overrides to a runtime+session:
@@ -683,6 +687,12 @@ fn apply_cli_session_overrides(
             )
         })?;
         runtime.append_system_prompt(text);
+    }
+    if let Some(schema) = &cli.json_schema {
+        runtime.append_system_prompt(format!(
+            "You must respond ONLY with a JSON object that validates against \
+             this JSON Schema, with no other text or markdown fences:\n{schema}"
+        ));
     }
     if !cli.allowed_tools.is_empty() {
         runtime.allow_only_tools(&cli.allowed_tools);
@@ -763,13 +773,25 @@ async fn execute_run(
                 &mut session,
                 &run_mode.prompt,
                 run_mode.show_thinking,
+                cli.enable_auth_status,
             )
             .await?;
         } else {
             let output =
                 runtime.submit_with_approval(&mut session, &run_mode.prompt, &*approval_fn);
             replay_user_message(&cli, &run_mode.prompt);
-            println!("{}", serde_json::to_string_pretty(&output)?);
+            let mut value = serde_json::to_value(&output)?;
+            if let Some(schema_src) = &cli.json_schema {
+                let schema: serde_json::Value =
+                    serde_json::from_str(schema_src).context("--json-schema must be valid JSON")?;
+                let instance = extract_json_value(&output.response)
+                    .context("model response is not valid JSON")?;
+                if !jsonschema::is_valid(&schema, &instance) {
+                    anyhow::bail!("model response failed --json-schema validation");
+                }
+                value["structured_output"] = instance;
+            }
+            println!("{}", serde_json::to_string_pretty(&value)?);
         }
 
         if let Some(path) = session_store_dir(data_dir) {
@@ -857,6 +879,7 @@ async fn execute_resume(
                 &mut session,
                 prompt,
                 resume_mode.show_thinking,
+                cli.enable_auth_status,
             )
             .await?;
         } else if let Some(prompt) = resume_mode.prompt.clone() {
@@ -1044,6 +1067,53 @@ struct ApprovalResponseLine {
     approved: bool,
 }
 
+/// Extract the first JSON value from free-form model text: the whole
+/// response, a ```json fenced block, or the widest balanced {...}/[...].
+fn extract_json_value(text: &str) -> Option<serde_json::Value> {
+    if let Ok(v) = serde_json::from_str(text.trim()) {
+        return Some(v);
+    }
+    let mut search = String::new();
+    let mut in_fence = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            if in_fence {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&search) {
+                    return Some(v);
+                }
+                search.clear();
+                in_fence = false;
+            } else {
+                in_fence = true;
+                search.clear();
+            }
+        } else if in_fence {
+            search.push_str(line);
+            search.push('\n');
+        }
+    }
+    for (i, c) in text.char_indices() {
+        if c == '{' || c == '[' {
+            let mut depth = 0i32;
+            for (j, c2) in text[i..].char_indices() {
+                match c2 {
+                    '{' | '[' => depth += 1,
+                    '}' | ']' => depth -= 1,
+                    _ => {}
+                }
+                if depth == 0 {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text[i..i + j + 1]) {
+                        return Some(v);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    None
+}
+
 fn protocol_stdout() -> Arc<std::sync::Mutex<std::io::Stdout>> {
     Arc::new(std::sync::Mutex::new(std::io::stdout()))
 }
@@ -1169,8 +1239,20 @@ async fn execute_streaming_submit_with_json_protocol(
     session: &mut Session,
     prompt: &str,
     show_thinking: bool,
+    enable_auth_status: bool,
 ) -> Result<clawedcode_core::runtime::StreamingRuntimeOutput> {
     let stdout = protocol_stdout();
+    if enable_auth_status {
+        let authenticated = std::env::var("ANTHROPIC_API_KEY").is_ok()
+            || std::env::var("CLAUDE_CODE_OAUTH_TOKEN").is_ok();
+        emit_json_protocol_record(
+            &stdout,
+            &serde_json::json!({
+                "type": "auth_status",
+                "authenticated": authenticated,
+            }),
+        );
+    }
     let approval_stdout = Arc::clone(&stdout);
     let approval_fn = {
         let approval_stdout = Arc::clone(&approval_stdout);
@@ -2259,6 +2341,30 @@ fn bootstrap(cli: Cli) -> Result<BootstrappedApp> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn extract_json_value_parses_raw_fenced_and_embedded() {
+        assert_eq!(
+            extract_json_value(r#"{"a":1}"#).unwrap()["a"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            extract_json_value("here you go:\n```json\n{\"b\":2}\n```\ndone").unwrap()["b"],
+            serde_json::json!(2)
+        );
+        assert_eq!(
+            extract_json_value("prefix {\"c\":[1,{\"d\":3}]} suffix").unwrap()["c"][1]["d"],
+            serde_json::json!(3)
+        );
+        assert!(extract_json_value("no json here").is_none());
+    }
+
+    #[test]
+    fn json_schema_validation_accepts_and_rejects() {
+        let schema: serde_json::Value =
+            serde_json::from_str(r#"{"type":"object","required":["a"]}"#).unwrap();
+        assert!(jsonschema::is_valid(&schema, &serde_json::json!({"a":1})));
+        assert!(!jsonschema::is_valid(&schema, &serde_json::json!({"b":1})));
+    }
     use super::*;
     use serde_json::json;
     use std::{
@@ -3215,6 +3321,14 @@ mod tests {
             fallback_model: None,
             workload: None,
             file: Vec::new(),
+            debug: None,
+            verbose: false,
+            debug_file: None,
+            mcp_debug: false,
+            betas: Vec::new(),
+            json_schema: None,
+            max_budget_usd: None,
+            enable_auth_status: false,
         }
     }
 

@@ -40,6 +40,10 @@ pub struct RuntimeConfig {
     /// `--fallback-model`: retry once with this model on overload errors.
     #[serde(default)]
     pub fallback_model: Option<String>,
+    #[serde(default)]
+    pub betas: Vec<String>,
+    #[serde(default)]
+    pub max_budget_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +68,8 @@ impl Default for AppConfig {
                 effort: None,
                 thinking_budget: None,
                 fallback_model: None,
+                betas: Vec::new(),
+                max_budget_usd: None,
                 max_turns: 64,
                 session_history_limit: 2_000,
             },

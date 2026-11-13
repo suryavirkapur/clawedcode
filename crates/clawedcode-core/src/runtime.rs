@@ -246,9 +246,34 @@ struct TurnResult {
     tool_use_records: Vec<ToolUseRecord>,
     /// Provider error seen mid-stream, if any — used by --fallback-model.
     stream_error: Option<clawedcode_api::ProviderError>,
+    /// Tokens consumed by this turn — used by --max-budget-usd.
+    usage: clawedcode_api::UsageAccount,
 }
 
 const REPEATED_TOOL_LOOP_LIMIT: usize = 4;
+
+/// USD-per-million-token prices by model family (Anthropic list prices).
+fn model_prices_mtok(model: &str) -> (f64, f64) {
+    let m = model.to_ascii_lowercase();
+    if m.contains("opus") {
+        (15.0, 75.0)
+    } else if m.contains("haiku") {
+        (0.80, 4.0)
+    } else if m.contains("sonnet") {
+        (3.0, 15.0)
+    } else {
+        (1.0, 5.0)
+    }
+}
+
+fn turn_cost_usd(usage: &clawedcode_api::UsageAccount, model: &str) -> f64 {
+    let (input, output) = model_prices_mtok(model);
+    (usage.total_input_tokens as f64 * input
+        + usage.total_output_tokens as f64 * output
+        + usage.total_cache_read_tokens as f64 * input * 0.1
+        + usage.total_cache_write_tokens as f64 * input * 1.25)
+        / 1_000_000.0
+}
 const TOOL_RESULT_MAX_CHARS: usize = 50_000;
 
 pub(crate) fn casual_reply_for_prompt(prompt: &str) -> Option<&'static str> {
@@ -698,6 +723,7 @@ impl Runtime {
                 .as_deref()
                 .and_then(clawedcode_api::EffortLevel::parse),
             thinking_budget: self.config.runtime.thinking_budget,
+            betas: self.config.runtime.betas.clone(),
         };
         if let Some(prompt_override) = prompt_override {
             apply_prompt_override(&mut request.messages, prompt_override);
@@ -1019,6 +1045,7 @@ impl Runtime {
         }
 
         let mut stop_hook_used = false;
+        let mut session_cost_usd = 0.0f64;
         let mut fallback_used = false;
         let mut active_fallback_model: Option<String> = None;
         for _turn in 0..self.max_turns() {
@@ -1074,6 +1101,20 @@ impl Runtime {
             total_thinking.push_str(&turn_result.thinking);
             total_tools_executed += turn_result.tools_executed;
             all_tool_use_records.extend(turn_result.tool_use_records);
+
+            // `--max-budget-usd`: stop when the session exceeds the cap.
+            if let Some(cap) = self.config.runtime.max_budget_usd {
+                session_cost_usd += turn_cost_usd(&turn_result.usage, &request.model);
+                if session_cost_usd > cap {
+                    let text = format!(
+                        "Stopped: session cost ${session_cost_usd:.4} exceeded --max-budget-usd ${cap:.4}"
+                    );
+                    on_event(&ApiEvent::MessageDelta { text: text.clone() });
+                    session.push(Role::Assistant, &text);
+                    total_text.push_str(&text);
+                    break;
+                }
+            }
 
             if repeated_tool_count >= REPEATED_TOOL_LOOP_LIMIT {
                 let warning = format!(
@@ -1140,6 +1181,7 @@ impl Runtime {
         let mut tool_uses: Vec<(String, String, serde_json::Value)> = Vec::new();
         let mut tool_use_records: Vec<ToolUseRecord> = Vec::new();
         let mut stream_error: Option<clawedcode_api::ProviderError> = None;
+        let mut turn_usage = clawedcode_api::UsageAccount::default();
         let mut s = stream;
 
         while let Some(event) = s.next().await {
@@ -1178,7 +1220,9 @@ impl Runtime {
                         record.is_error = tool_result.is_error;
                     }
                 }
-                ApiEvent::Usage { usage: _ } => {}
+                ApiEvent::Usage { usage } => {
+                    turn_usage.record(usage);
+                }
                 ApiEvent::Completed => {}
             }
 
@@ -1211,6 +1255,7 @@ impl Runtime {
                 tools_executed: 0,
                 tool_use_records,
                 stream_error,
+                usage: turn_usage,
             };
         }
 
@@ -1275,6 +1320,7 @@ impl Runtime {
             tools_executed,
             tool_use_records,
             stream_error,
+            usage: turn_usage,
         }
     }
 
@@ -1789,6 +1835,7 @@ impl Runtime {
             mcp_servers: Default::default(),
             effort: None,
             thinking_budget: None,
+            betas: Vec::new(),
         };
         let result = self
             .run_in_runtime(self.provider.complete(&request))

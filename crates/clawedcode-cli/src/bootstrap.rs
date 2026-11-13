@@ -114,7 +114,7 @@ struct PromptExecutionPayload {
 }
 
 pub fn bootstrap(cli: Cli) -> Result<BootstrappedApp> {
-    init_tracing();
+    init_tracing(&cli);
     let config = AppConfig::load(cli.config.as_deref())?;
     ensure_default_config_exists(cli.config.as_deref())?;
     let compatibility = compat::discover(&cli.cwd)?;
@@ -472,15 +472,39 @@ fn prompt_payload_from_command(command: Option<&Command>) -> PromptExecutionPayl
     }
 }
 
-pub fn init_tracing() {
-    let _ = fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env()
-                .add_directive("clawedcode=warn".parse().expect("valid directive")),
-        )
-        .with_target(false)
-        .compact()
-        .try_init();
+pub fn init_tracing(cli: &Cli) {
+    // Reference-style logging flags: --verbose (info), --debug (debug,
+    // optional filter list), --mcp-debug (deprecated alias), --debug-file.
+    let level = if cli.debug.is_some() || cli.mcp_debug {
+        "debug"
+    } else if cli.verbose {
+        "info"
+    } else {
+        "warn"
+    };
+    let mut filter = EnvFilter::from_default_env().add_directive(
+        format!("clawedcode={level}")
+            .parse()
+            .expect("valid directive"),
+    );
+    if let Some(targets) = cli.debug.as_deref().filter(|t| !t.is_empty()) {
+        for target in targets.split(',') {
+            if let Ok(directive) = format!("{}=debug", target.trim()).parse() {
+                filter = filter.add_directive(directive);
+            }
+        }
+    }
+    let builder = fmt().with_env_filter(filter).with_target(false).compact();
+    if let Some(path) = &cli.debug_file {
+        if let Ok(file) = std::fs::File::create(path) {
+            let _ = builder
+                .with_writer(std::sync::Mutex::new(file))
+                .with_ansi(false)
+                .try_init();
+            return;
+        }
+    }
+    let _ = builder.try_init();
 }
 
 pub fn ensure_default_config_exists(explicit_path: Option<&std::path::Path>) -> Result<()> {
@@ -579,6 +603,14 @@ mod tests {
             fallback_model: None,
             workload: None,
             file: Vec::new(),
+            debug: None,
+            verbose: false,
+            debug_file: None,
+            mcp_debug: false,
+            betas: Vec::new(),
+            json_schema: None,
+            max_budget_usd: None,
+            enable_auth_status: false,
         }
     }
 
@@ -852,6 +884,14 @@ mod tests {
             fallback_model: None,
             workload: None,
             file: Vec::new(),
+            debug: None,
+            verbose: false,
+            debug_file: None,
+            mcp_debug: false,
+            betas: Vec::new(),
+            json_schema: None,
+            max_budget_usd: None,
+            enable_auth_status: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Tui));
@@ -914,6 +954,14 @@ mod tests {
             fallback_model: None,
             workload: None,
             file: Vec::new(),
+            debug: None,
+            verbose: false,
+            debug_file: None,
+            mcp_debug: false,
+            betas: Vec::new(),
+            json_schema: None,
+            max_budget_usd: None,
+            enable_auth_status: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -976,6 +1024,14 @@ mod tests {
             fallback_model: None,
             workload: None,
             file: Vec::new(),
+            debug: None,
+            verbose: false,
+            debug_file: None,
+            mcp_debug: false,
+            betas: Vec::new(),
+            json_schema: None,
+            max_budget_usd: None,
+            enable_auth_status: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));
@@ -1041,6 +1097,14 @@ mod tests {
             fallback_model: None,
             workload: None,
             file: Vec::new(),
+            debug: None,
+            verbose: false,
+            debug_file: None,
+            mcp_debug: false,
+            betas: Vec::new(),
+            json_schema: None,
+            max_budget_usd: None,
+            enable_auth_status: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::DirectConnect(_)));
@@ -1106,6 +1170,14 @@ mod tests {
             fallback_model: None,
             workload: None,
             file: Vec::new(),
+            debug: None,
+            verbose: false,
+            debug_file: None,
+            mcp_debug: false,
+            betas: Vec::new(),
+            json_schema: None,
+            max_budget_usd: None,
+            enable_auth_status: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Ssh(_)));
@@ -1178,6 +1250,14 @@ mod tests {
             fallback_model: None,
             workload: None,
             file: Vec::new(),
+            debug: None,
+            verbose: false,
+            debug_file: None,
+            mcp_debug: false,
+            betas: Vec::new(),
+            json_schema: None,
+            max_budget_usd: None,
+            enable_auth_status: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -1254,6 +1334,14 @@ mod tests {
             fallback_model: None,
             workload: None,
             file: Vec::new(),
+            debug: None,
+            verbose: false,
+            debug_file: None,
+            mcp_debug: false,
+            betas: Vec::new(),
+            json_schema: None,
+            max_budget_usd: None,
+            enable_auth_status: false,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));

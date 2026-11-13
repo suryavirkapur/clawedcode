@@ -165,6 +165,30 @@ pub struct Cli {
     /// Files whose contents are prepended to the prompt as context.
     #[arg(long, global = true)]
     pub file: Vec<PathBuf>,
+    /// Enable debug logging; optional comma-separated target filter.
+    #[arg(long, global = true, num_args = 0..=1, default_missing_value = "")]
+    pub debug: Option<String>,
+    /// Enable verbose logging.
+    #[arg(long, global = true)]
+    pub verbose: bool,
+    /// Write debug logs to a file (implies --debug).
+    #[arg(long, global = true)]
+    pub debug_file: Option<PathBuf>,
+    /// Include auth status information in stream-json output.
+    #[arg(long, global = true)]
+    pub enable_auth_status: bool,
+    /// Maximum dollar spend allowed for the session (API keys only).
+    #[arg(long, global = true)]
+    pub max_budget_usd: Option<f64>,
+    /// JSON schema the model output must validate against (print mode).
+    #[arg(long, global = true)]
+    pub json_schema: Option<String>,
+    /// Anthropic beta feature strings to send with requests.
+    #[arg(long, value_delimiter = ',', global = true)]
+    pub betas: Vec<String>,
+    /// Deprecated alias for --debug (MCP server errors).
+    #[arg(long, global = true)]
+    pub mcp_debug: bool,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -445,6 +469,14 @@ mod tests {
             fallback_model: None,
             workload: None,
             file: Vec::new(),
+            debug: None,
+            verbose: false,
+            debug_file: None,
+            mcp_debug: false,
+            betas: Vec::new(),
+            json_schema: None,
+            max_budget_usd: None,
+            enable_auth_status: false,
         }
     }
 
@@ -510,6 +542,14 @@ mod tests {
             fallback_model: None,
             workload: None,
             file: Vec::new(),
+            debug: None,
+            verbose: false,
+            debug_file: None,
+            mcp_debug: false,
+            betas: Vec::new(),
+            json_schema: None,
+            max_budget_usd: None,
+            enable_auth_status: false,
         }
     }
 
