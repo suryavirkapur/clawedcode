@@ -52,6 +52,8 @@ pub struct TuiContext {
     startup_prompt: Option<String>,
     /// Open the session picker at launch (`clawedcode --resume` bare).
     open_session_picker_at_start: bool,
+    /// `--prefill`: seed the interactive input buffer at launch.
+    prefill_input: Option<String>,
     transport_label: Option<String>,
     /// Extra context prepended to the next submitted prompt once — used by
     /// `SessionStart` hooks to inject context like the reference.
@@ -165,6 +167,7 @@ impl TuiContext {
             external_turn_executor,
             startup_prompt: None,
             open_session_picker_at_start: false,
+            prefill_input: None,
             transport_label: None,
             pending_prompt_prefix: None,
             last_compatibility_refresh: Instant::now(),
@@ -185,6 +188,14 @@ impl TuiContext {
 
     pub fn take_open_session_picker_at_start(&mut self) -> bool {
         std::mem::take(&mut self.open_session_picker_at_start)
+    }
+
+    pub fn set_prefill_input(&mut self, text: Option<String>) {
+        self.prefill_input = text;
+    }
+
+    pub fn take_prefill_input(&mut self) -> Option<String> {
+        self.prefill_input.take()
     }
 
     pub fn set_pending_prompt_prefix(&mut self, prefix: Option<String>) {

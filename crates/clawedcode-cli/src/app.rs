@@ -164,7 +164,8 @@ pub async fn execute(boot: BootstrappedApp) -> Result<()> {
         if let Some(agent) = &agent_def {
             runtime.apply_agent(agent);
         }
-        let session = runtime.start_session_with_mode(cli.cwd.clone(), SessionMode::Headless);
+        let mut session = runtime.start_session_with_mode(cli.cwd.clone(), SessionMode::Headless);
+        apply_cli_session_overrides(&mut runtime, &mut session, &cli)?;
         println!("{}", runtime.effective_system_prompt_body(&session));
         return Ok(());
     }
@@ -226,6 +227,9 @@ pub async fn execute(boot: BootstrappedApp) -> Result<()> {
             }
             if let Some(prompt) = cli.prompt.clone() {
                 ctx.set_startup_prompt(Some(prompt));
+            }
+            if let Some(prefill) = cli.prefill.clone() {
+                ctx.set_prefill_input(Some(prefill));
             }
             if let Some(agent) = &agent_def {
                 ctx.runtime.apply_agent(agent);
@@ -305,7 +309,72 @@ pub async fn execute(boot: BootstrappedApp) -> Result<()> {
             execute_remote(cli, config, compatibility, remote_mode).await
         }
         ExecutionMode::Mcp(action) => execute_mcp(&cli, &compatibility, action),
+        ExecutionMode::Doctor => execute_doctor(&cli, &config, &compatibility),
+        ExecutionMode::Plugin(action) => execute_plugin(&cli, action),
     }
+}
+
+/// `clawedcode doctor` — environment health check like the reference.
+fn execute_doctor(
+    cli: &Cli,
+    config: &AppConfig,
+    compatibility: &compat::CompatibilitySnapshot,
+) -> Result<()> {
+    let git_repo = cli.cwd.join(".git").exists();
+    let skills = compatibility.skills.len();
+    let agents = compat::discover_agents(&cli.cwd).len();
+    let plugins = compat::discover_plugins(&cli.cwd).len();
+    println!("ClawedCode v{}", env!("CARGO_PKG_VERSION"));
+    println!("Model: {}", config.model);
+    println!("Working dir: {}", cli.cwd.display());
+    println!("Git repo: {}", if git_repo { "yes" } else { "no" });
+    println!("Skills: {skills} · Agents: {agents} · Plugins: {plugins}");
+    println!("MCP servers: {}", compatibility.mcp_servers.len());
+    println!(
+        "Config: {}",
+        clawedcode_core::config::default_config_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(none)".to_string())
+    );
+    Ok(())
+}
+
+/// `clawedcode plugin` — list/validate plugins like the reference.
+fn execute_plugin(cli: &Cli, action: crate::cli::PluginAction) -> Result<()> {
+    use crate::cli::PluginAction;
+    match action {
+        PluginAction::List => {
+            let plugins = compat::discover_plugins(&cli.cwd);
+            if plugins.is_empty() {
+                println!("No plugins discovered.");
+            } else {
+                for p in plugins {
+                    let version = p.version.unwrap_or_default();
+                    let desc = p.description.unwrap_or_default();
+                    println!("{}{} — {} [{}]", p.name, version, desc, p.path.display());
+                }
+            }
+        }
+        PluginAction::Validate { path } => {
+            let manifest_path = if path.is_dir() {
+                path.join(".claude-plugin").join("plugin.json")
+            } else {
+                path.clone()
+            };
+            let raw = std::fs::read_to_string(&manifest_path)
+                .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+            let manifest: serde_json::Value = serde_json::from_str(&raw)
+                .with_context(|| format!("invalid JSON in {}", manifest_path.display()))?;
+            match manifest.get("name").and_then(|n| n.as_str()) {
+                Some(name) => println!(
+                    "Valid plugin manifest '{name}' ({})",
+                    manifest_path.display()
+                ),
+                None => anyhow::bail!("{} is missing a 'name' field", manifest_path.display()),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `clawedcode mcp` — manage `.mcp.json` server entries like the
@@ -367,6 +436,50 @@ fn execute_mcp(
             std::fs::write(&path, serde_json::to_string_pretty(&doc)?)
                 .with_context(|| format!("failed to write {}", path.display()))?;
             println!("Removed MCP server '{name}' from {}", path.display());
+        }
+        McpAction::AddJson { name, json } => {
+            let value: serde_json::Value =
+                serde_json::from_str(&json).with_context(|| "invalid JSON for mcp add-json")?;
+            if !value.is_object() {
+                anyhow::bail!("mcp add-json expects a JSON object");
+            }
+            doc["mcpServers"][&name] = value;
+            std::fs::write(&path, serde_json::to_string_pretty(&doc)?)
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            println!("Added MCP server '{name}' to {}", path.display());
+        }
+        McpAction::ResetProjectChoices => {
+            // Clears approved/rejected project servers in settings files,
+            // like the reference's reset-project-choices.
+            let settings_path = cli.cwd.join(".claude").join("settings.json");
+            let mut cleared = false;
+            if let Ok(raw) = std::fs::read_to_string(&settings_path) {
+                if let Ok(mut settings) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    if let Some(obj) = settings.as_object_mut() {
+                        for key in [
+                            "enabledMcpjsonServers",
+                            "disabledMcpjsonServers",
+                            "enableAllProjectMcpServers",
+                        ] {
+                            cleared |= obj.remove(key).is_some();
+                        }
+                    }
+                    if cleared {
+                        std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)
+                            .with_context(|| {
+                                format!("failed to write {}", settings_path.display())
+                            })?;
+                    }
+                }
+            }
+            if cleared {
+                println!(
+                    "Reset .mcp.json approvals/rejections in {}",
+                    settings_path.display()
+                );
+            } else {
+                println!("No project MCP server choices to reset.");
+            }
         }
     }
     Ok(())
@@ -442,8 +555,28 @@ fn apply_cli_session_overrides(
     if let Some(text) = &cli.append_system_prompt {
         runtime.append_system_prompt(text.clone());
     }
+    if let Some(text) = &cli.system_prompt {
+        runtime.set_system_prompt_body(text.clone());
+    }
+    if let Some(path) = &cli.system_prompt_file {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read --system-prompt-file {}", path.display()))?;
+        runtime.set_system_prompt_body(text);
+    }
+    if let Some(path) = &cli.append_system_prompt_file {
+        let text = std::fs::read_to_string(path).with_context(|| {
+            format!(
+                "failed to read --append-system-prompt-file {}",
+                path.display()
+            )
+        })?;
+        runtime.append_system_prompt(text);
+    }
     if !cli.allowed_tools.is_empty() {
         runtime.allow_only_tools(&cli.allowed_tools);
+    }
+    if let Some(tools) = &cli.tools {
+        runtime.allow_only_tools(tools);
     }
     if !cli.disallowed_tools.is_empty() {
         runtime.deny_tools(&cli.disallowed_tools);
@@ -457,6 +590,9 @@ fn apply_cli_session_overrides(
     if let Some(id) = &cli.session_id {
         session.id =
             uuid::Uuid::parse_str(id).with_context(|| format!("invalid --session-id: {id}"))?;
+    }
+    if cli.no_session_persistence {
+        session.persist = false;
     }
     Ok(())
 }
@@ -2926,6 +3062,12 @@ mod tests {
             resume: None,
             resume_session_at: None,
             rewind_files: None,
+            system_prompt: None,
+            system_prompt_file: None,
+            append_system_prompt_file: None,
+            tools: None,
+            no_session_persistence: false,
+            prefill: None,
         }
     }
 

@@ -29,6 +29,8 @@ pub enum ExecutionMode {
     Ssh(SshMode),
     Remote(RemoteMode),
     Mcp(crate::cli::McpAction),
+    Doctor,
+    Plugin(crate::cli::PluginAction),
 }
 
 #[derive(Debug, Clone)]
@@ -361,6 +363,8 @@ pub fn resolve_mode(cli: &Cli) -> Result<ExecutionMode> {
             yes,
         })),
         Command::Mcp { action } => Ok(ExecutionMode::Mcp(action)),
+        Command::Doctor => Ok(ExecutionMode::Doctor),
+        Command::Plugin { action } => Ok(ExecutionMode::Plugin(action)),
     }
 }
 
@@ -531,6 +535,12 @@ mod tests {
             resume: None,
             resume_session_at: None,
             rewind_files: None,
+            system_prompt: None,
+            system_prompt_file: None,
+            append_system_prompt_file: None,
+            tools: None,
+            no_session_persistence: false,
+            prefill: None,
         }
     }
 
@@ -782,6 +792,12 @@ mod tests {
             resume: None,
             resume_session_at: None,
             rewind_files: None,
+            system_prompt: None,
+            system_prompt_file: None,
+            append_system_prompt_file: None,
+            tools: None,
+            no_session_persistence: false,
+            prefill: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Tui));
@@ -822,6 +838,12 @@ mod tests {
             resume: None,
             resume_session_at: None,
             rewind_files: None,
+            system_prompt: None,
+            system_prompt_file: None,
+            append_system_prompt_file: None,
+            tools: None,
+            no_session_persistence: false,
+            prefill: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -862,6 +884,12 @@ mod tests {
             resume: None,
             resume_session_at: None,
             rewind_files: None,
+            system_prompt: None,
+            system_prompt_file: None,
+            append_system_prompt_file: None,
+            tools: None,
+            no_session_persistence: false,
+            prefill: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));
@@ -905,6 +933,12 @@ mod tests {
             resume: None,
             resume_session_at: None,
             rewind_files: None,
+            system_prompt: None,
+            system_prompt_file: None,
+            append_system_prompt_file: None,
+            tools: None,
+            no_session_persistence: false,
+            prefill: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::DirectConnect(_)));
@@ -948,6 +982,12 @@ mod tests {
             resume: None,
             resume_session_at: None,
             rewind_files: None,
+            system_prompt: None,
+            system_prompt_file: None,
+            append_system_prompt_file: None,
+            tools: None,
+            no_session_persistence: false,
+            prefill: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Ssh(_)));
@@ -998,6 +1038,12 @@ mod tests {
             resume: None,
             resume_session_at: None,
             rewind_files: None,
+            system_prompt: None,
+            system_prompt_file: None,
+            append_system_prompt_file: None,
+            tools: None,
+            no_session_persistence: false,
+            prefill: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -1052,6 +1098,12 @@ mod tests {
             resume: None,
             resume_session_at: None,
             rewind_files: None,
+            system_prompt: None,
+            system_prompt_file: None,
+            append_system_prompt_file: None,
+            tools: None,
+            no_session_persistence: false,
+            prefill: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));

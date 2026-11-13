@@ -99,6 +99,24 @@ pub struct Cli {
     /// index, then exit. Standalone — cannot be combined with a prompt.
     #[arg(long)]
     pub rewind_files: Option<usize>,
+    /// Replace the system prompt entirely (reference --system-prompt).
+    #[arg(long, global = true)]
+    pub system_prompt: Option<String>,
+    /// Replace the system prompt with a file's contents.
+    #[arg(long, global = true)]
+    pub system_prompt_file: Option<PathBuf>,
+    /// Append a file's contents to the system prompt.
+    #[arg(long, global = true)]
+    pub append_system_prompt_file: Option<PathBuf>,
+    /// Restrict the session to these tools (comma-separated; "" disables all).
+    #[arg(long, global = true, value_delimiter = ',', num_args = 0..=1, default_missing_value = "")]
+    pub tools: Option<Vec<String>>,
+    /// Do not persist the session transcript to disk.
+    #[arg(long, global = true)]
+    pub no_session_persistence: bool,
+    /// Pre-fill the interactive input with this text.
+    #[arg(long, global = true)]
+    pub prefill: Option<String>,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -202,6 +220,13 @@ pub enum Command {
         #[command(subcommand)]
         action: McpAction,
     },
+    /// Check the environment (reference `claude doctor`).
+    Doctor,
+    /// Manage plugins (reference `claude plugin`).
+    Plugin {
+        #[command(subcommand)]
+        action: PluginAction,
+    },
     /// Connect to a remote orchestrator.
     Remote {
         #[arg(long)]
@@ -237,6 +262,22 @@ pub enum McpAction {
     },
     /// Remove a server from .mcp.json.
     Remove { name: String },
+    /// Add a server (stdio or SSE) with a JSON string, like `mcp add-json`.
+    AddJson {
+        name: String,
+        /// JSON object, e.g. '{"type":"stdio","command":"x","args":[]}'.
+        json: String,
+    },
+    /// Clear approved/rejected project-scoped (.mcp.json) servers for this cwd.
+    ResetProjectChoices,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum PluginAction {
+    /// List discovered plugins from plugin dirs.
+    List,
+    /// Validate a plugin manifest (.claude-plugin/plugin.json or dir).
+    Validate { path: PathBuf },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,6 +325,7 @@ impl Cli {
             Some(Command::Ssh { .. }) => Intent::Ssh,
             Some(Command::Remote { .. }) => Intent::Remote,
             Some(Command::Mcp { .. }) => Intent::Mcp,
+            Some(Command::Doctor) | Some(Command::Plugin { .. }) => Intent::Interactive,
             None => Intent::Interactive,
         }
     }
@@ -328,6 +370,12 @@ mod tests {
             resume: None,
             resume_session_at: None,
             rewind_files: None,
+            system_prompt: None,
+            system_prompt_file: None,
+            append_system_prompt_file: None,
+            tools: None,
+            no_session_persistence: false,
+            prefill: None,
         }
     }
 
@@ -371,6 +419,12 @@ mod tests {
             resume: None,
             resume_session_at: None,
             rewind_files: None,
+            system_prompt: None,
+            system_prompt_file: None,
+            append_system_prompt_file: None,
+            tools: None,
+            no_session_persistence: false,
+            prefill: None,
         }
     }
 

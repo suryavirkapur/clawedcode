@@ -522,6 +522,16 @@ impl Runtime {
         self.appended_system_prompt = Some(text);
     }
 
+    /// `--system-prompt`: replace the whole system prompt with custom text,
+    /// like the reference flag.
+    pub fn set_system_prompt_body(&mut self, text: String) {
+        self.system_prompt = crate::prompt::PromptSpec {
+            name: "custom",
+            summary: "Custom --system-prompt body",
+            body: text.leak(),
+        };
+    }
+
     /// `--allowedTools`: restrict the pool to these names (Claude-format
     /// names like `Bash`/`Read` resolve via the agent-tool alias map).
     pub fn allow_only_tools(&mut self, names: &[String]) {

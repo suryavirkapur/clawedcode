@@ -60,6 +60,14 @@ pub struct Session {
     /// restore code + conversation like the reference's checkpointing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checkpoints: Vec<Checkpoint>,
+    /// `--no-session-persistence`: when false, `save` is a no-op. Skipped
+    /// during serialization and always loaded back as `true`.
+    #[serde(skip, default = "default_persist")]
+    pub persist: bool,
+}
+
+fn default_persist() -> bool {
+    true
 }
 
 /// Snapshot of files touched by a single mutating tool call, taken BEFORE
@@ -173,6 +181,7 @@ impl Session {
             additional_allowed_dirs: Vec::new(),
             worktree_origin: None,
             checkpoints: Vec::new(),
+            persist: true,
         }
         .with_default_task_list_id()
     }
@@ -209,6 +218,7 @@ impl Session {
             additional_allowed_dirs: Vec::new(),
             worktree_origin: None,
             checkpoints: Vec::new(),
+            persist: true,
         }
     }
 
@@ -257,6 +267,7 @@ impl Session {
             additional_allowed_dirs: Vec::new(),
             worktree_origin: None,
             checkpoints: Vec::new(),
+            persist: true,
         }
         .with_default_task_list_id()
     }
@@ -279,9 +290,12 @@ impl Session {
     }
 
     pub fn save(&self, base_dir: &Path) -> Result<PathBuf> {
+        let path = base_dir.join(format!("{}.json", self.id));
+        if !self.persist {
+            return Ok(path);
+        }
         fs::create_dir_all(base_dir)
             .with_context(|| format!("failed to create {}", base_dir.display()))?;
-        let path = base_dir.join(format!("{}.json", self.id));
         let mut session = self.clone();
         session.refresh_transport_session_id_from_messages();
         let raw = serde_json::to_string_pretty(&session)?;
@@ -343,6 +357,7 @@ impl Session {
             additional_allowed_dirs: Vec::new(),
             worktree_origin: None,
             checkpoints: Vec::new(),
+            persist: true,
         }
     }
 }

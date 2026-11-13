@@ -1041,8 +1041,8 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
         )));
     }
 
-    let mut input_buffer = String::new();
-    let mut cursor_pos: usize = 0;
+    let mut input_buffer = ctx.take_prefill_input().unwrap_or_default();
+    let mut cursor_pos: usize = input_buffer.len();
     let mut screen = ReplScreen::Main;
     let mut viewport = TranscriptViewport {
         pinned_to_bottom: true,
