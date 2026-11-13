@@ -31,6 +31,13 @@ pub struct HookCommand {
     /// Per-hook timeout override in milliseconds (settings `timeout` is
     /// seconds, like the reference).
     pub timeout_ms: Option<u64>,
+    /// `"http"` hooks POST the payload JSON instead of running a command.
+    pub url: Option<String>,
+    /// Extra headers for `"http"` hooks; values may reference env vars
+    /// from `allowed_env_vars` via `$VAR`/`${VAR}`.
+    pub headers: std::collections::BTreeMap<String, String>,
+    /// Env vars that may be interpolated into `headers`.
+    pub allowed_env_vars: Vec<String>,
     /// Settings file the hook came from (for display in `/hooks`).
     pub source: std::path::PathBuf,
 }
@@ -54,6 +61,12 @@ struct HookSpec {
     #[serde(rename = "type", default)]
     kind: Option<String>,
     command: Option<String>,
+    /// `"http"` hook fields.
+    url: Option<String>,
+    #[serde(default)]
+    headers: std::collections::BTreeMap<String, String>,
+    #[serde(default, rename = "allowedEnvVars")]
+    allowed_env_vars: Vec<String>,
     /// Timeout in seconds, like the reference's hook timeout field.
     timeout: Option<u64>,
 }
@@ -125,19 +138,29 @@ pub fn load_hooks(cwd: &Path) -> HooksConfig {
             };
             for group in groups {
                 for spec in group.hooks {
-                    // Only `command` hooks exist today; the reference also
-                    // defines llm/prompt hooks which we do not emulate.
-                    if spec.kind.as_deref().unwrap_or("command") != "command" {
+                    let kind = spec.kind.as_deref().unwrap_or("command");
+                    // The reference also defines prompt/agent hooks which we
+                    // do not emulate.
+                    if kind != "command" && kind != "http" {
                         continue;
                     }
-                    let Some(command) = spec.command.filter(|c| !c.trim().is_empty()) else {
-                        continue;
+                    let is_http = kind == "http";
+                    let command = if is_http {
+                        spec.url.clone().unwrap_or_default()
+                    } else {
+                        spec.command.clone().unwrap_or_default()
                     };
+                    if command.trim().is_empty() {
+                        continue;
+                    }
                     config.hooks.push(HookCommand {
                         event: event.clone(),
                         matcher: group.matcher.clone(),
                         command,
                         timeout_ms: spec.timeout.map(|secs| secs * 1000),
+                        url: if is_http { spec.url.clone() } else { None },
+                        headers: spec.headers.clone(),
+                        allowed_env_vars: spec.allowed_env_vars.clone(),
                         source: path.clone(),
                     });
                 }
@@ -301,11 +324,24 @@ fn default_hook_timeout_ms(event: &str) -> u64 {
     }
 }
 
+/// Normalized hook execution output — command hooks use exit codes and
+/// pipes; `"http"` hooks map HTTP status/body onto the same shape (2xx →
+/// code 0 semantics via `success`, body → stdout).
+pub struct HookOutput {
+    pub code: Option<i32>,
+    pub success: bool,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
 fn run_hook_command(
     hook: &HookCommand,
     cwd: &Path,
     stdin_json: &str,
-) -> std::io::Result<std::process::Output> {
+) -> std::io::Result<HookOutput> {
+    if hook.url.is_some() {
+        return run_http_hook(hook, cwd, stdin_json);
+    }
     let command = hook.command.as_str();
     let timeout_ms = hook
         .timeout_ms
@@ -414,8 +450,9 @@ fn run_hook_command(
                         "session_id": session_id,
                         "async": true,
                     }));
-                    return Ok(std::process::Output {
-                        status: std::process::ExitStatus::default(),
+                    return Ok(HookOutput {
+                        code: Some(0),
+                        success: true,
                         stdout: first,
                         stderr: Vec::new(),
                     });
@@ -447,8 +484,9 @@ fn run_hook_command(
             None => std::thread::sleep(std::time::Duration::from_millis(10)),
         }
     };
-    let out = std::process::Output {
-        status,
+    let out = HookOutput {
+        code: status.code(),
+        success: status.success(),
         stdout: out_thread.join().unwrap_or_default(),
         stderr: err_thread.join().unwrap_or_default(),
     };
@@ -461,10 +499,189 @@ fn run_hook_command(
         "session_id": session_id,
         "stdout": String::from_utf8_lossy(&out.stdout),
         "stderr": String::from_utf8_lossy(&out.stderr),
-        "exit_code": out.status.code(),
-        "outcome": if out.status.success() { "success" } else { "non_blocking_error" },
+        "exit_code": out.code,
+        "outcome": if out.success { "success" } else { "non_blocking_error" },
     }));
     Ok(out)
+}
+
+/// `"http"` hook: POST the payload JSON to `hook.url` and treat the
+/// response body as the hook's stdout (parsed for the same JSON
+/// contract). `allowedHttpHookUrls` policy gates the URL (undefined →
+/// unrestricted, `[]` → block all, patterns → wildcard match); header
+/// values interpolate only env vars named by the hook's
+/// `allowedEnvVars`, intersected with settings `httpHookAllowedEnvVars`
+/// when that policy is set.
+fn run_http_hook(
+    hook: &HookCommand,
+    cwd: &Path,
+    stdin_json: &str,
+) -> std::io::Result<HookOutput> {
+    let url = hook.url.clone().unwrap_or_default();
+    let timeout_ms = hook
+        .timeout_ms
+        .unwrap_or_else(|| default_hook_timeout_ms(&hook.event));
+
+    let mut allowed_urls: Option<Vec<String>> = None;
+    let mut policy_env_vars: Option<Vec<String>> = None;
+    for path in settings_file_paths(cwd) {
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        if let Some(arr) = value.get("allowedHttpHookUrls").and_then(|v| v.as_array()) {
+            allowed_urls
+                .get_or_insert_with(Vec::new)
+                .extend(arr.iter().filter_map(|s| s.as_str()).map(str::to_string));
+        }
+        if let Some(arr) = value.get("httpHookAllowedEnvVars").and_then(|v| v.as_array()) {
+            policy_env_vars
+                .get_or_insert_with(Vec::new)
+                .extend(arr.iter().filter_map(|s| s.as_str()).map(str::to_string));
+        }
+    }
+
+    if let Some(patterns) = &allowed_urls {
+        let matched = patterns
+            .iter()
+            .any(|p| crate::compat::url_pattern_matches(&url, p));
+        if !matched {
+            return Ok(HookOutput {
+                code: Some(1),
+                success: false,
+                stdout: Vec::new(),
+                stderr: format!(
+                    "HTTP hook blocked: {url} does not match any pattern in allowedHttpHookUrls"
+                )
+                .into_bytes(),
+            });
+        }
+    }
+
+    let effective_vars: std::collections::BTreeSet<String> = match &policy_env_vars {
+        Some(policy) => hook
+            .allowed_env_vars
+            .iter()
+            .filter(|v| policy.iter().any(|p| p == *v))
+            .cloned()
+            .collect(),
+        None => hook.allowed_env_vars.iter().cloned().collect(),
+    };
+    let headers: Vec<(String, String)> = hook
+        .headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.clone(),
+                interpolate_header_env(value, &effective_vars),
+            )
+        })
+        .collect();
+    let body = stdin_json.to_string();
+    // reqwest::blocking owns a tokio runtime — creating, driving, and
+    // dropping it all happen on a dedicated thread because any of those
+    // inside our async runtime panics. Only plain data crosses back.
+    let handle = std::thread::spawn(move || -> Result<(u16, Vec<u8>), String> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_millis(timeout_ms))
+            .build()
+            .map_err(|e| e.to_string())?;
+        let mut request = client
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body);
+        for (name, value) in headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        let response = request.send().map_err(|e| e.to_string())?;
+        let status = response.status().as_u16();
+        let body = response.bytes().map_err(|e| e.to_string())?;
+        Ok((status, body.to_vec()))
+    });
+    match handle.join() {
+        Ok(Ok((status, body))) if (200..300).contains(&status) => Ok(HookOutput {
+            code: Some(0),
+            success: true,
+            stdout: body,
+            stderr: Vec::new(),
+        }),
+        Ok(Ok((status, body))) => Ok(HookOutput {
+            code: Some(status as i32),
+            success: false,
+            stdout: body,
+            stderr: format!("HTTP hook returned {status}").into_bytes(),
+        }),
+        Ok(Err(e)) => Ok(HookOutput {
+            code: Some(1),
+            success: false,
+            stdout: Vec::new(),
+            stderr: format!("HTTP hook request failed: {e}").into_bytes(),
+        }),
+        Err(_) => Ok(HookOutput {
+            code: Some(1),
+            success: false,
+            stdout: Vec::new(),
+            stderr: "HTTP hook thread panicked".to_string().into_bytes(),
+        }),
+    }
+}
+
+/// `$VAR`/`${VAR}` interpolation limited to allowlisted names; other
+/// references become empty strings, and CR/LF/NUL are stripped to
+/// prevent header injection — the reference's interpolateEnvVars.
+fn interpolate_header_env(
+    value: &str,
+    allowed: &std::collections::BTreeSet<String>,
+) -> String {
+    let mut out = String::with_capacity(value.len());
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            let (name, next) = if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                let end = bytes[i + 2..]
+                    .iter()
+                    .position(|b| *b == b'}')
+                    .map(|p| i + 2 + p);
+                match end {
+                    Some(e) => (&value[i + 2..e], e + 1),
+                    None => {
+                        out.push('$');
+                        i += 1;
+                        continue;
+                    }
+                }
+            } else {
+                let mut j = i + 1;
+                while j < bytes.len()
+                    && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')
+                {
+                    j += 1;
+                }
+                (&value[i + 1..j], j)
+            };
+            if !name.is_empty() {
+                let resolved = if allowed.iter().any(|v| v == name) {
+                    std::env::var(name).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                out.push_str(&resolved);
+                i = next;
+                continue;
+            }
+        }
+        // Copy one UTF-8 char (or raw byte) without corrupting multi-byte
+        // sequences.
+        let len = value[i..].chars().next().map(char::len_utf8).unwrap_or(1);
+        out.push_str(&value[i..i + len]);
+        i += len;
+    }
+    out.chars()
+        .filter(|c| *c != '\r' && *c != '\n' && *c != '\0')
+        .collect()
 }
 
 /// `--include-hook-events`: a process-global sink that receives
@@ -580,7 +797,7 @@ pub fn run_pre_tool_hooks(
             }
         }
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        match out.status.code() {
+        match out.code {
             Some(0) => {}
             Some(2) => {
                 let reason = if stderr.is_empty() {
@@ -596,7 +813,7 @@ pub fn run_pre_tool_hooks(
                     warning = Some(format!(
                         "PreToolUse hook `{}` exited {}: {}",
                         hook.command,
-                        out.status.code().unwrap_or(-1),
+                        out.code.unwrap_or(-1),
                         stderr
                     ));
                 }
@@ -676,7 +893,7 @@ pub fn run_post_tool_hooks(
                 result.updated_mcp_output = Some(updated.clone());
             }
         }
-        if out.status.code() == Some(2) && !stderr.is_empty() {
+        if out.code == Some(2) && !stderr.is_empty() {
             feedback.push(stderr);
         }
     }
@@ -855,7 +1072,7 @@ pub fn run_stop_hooks(
                 return StopHookOutcome::Block(reason());
             }
         }
-        if out.status.code() == Some(2) {
+        if out.code == Some(2) {
             let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
             return StopHookOutcome::Block(if stderr.is_empty() {
                 format!("blocked by Stop hook `{}`", hook.command)
@@ -1092,7 +1309,7 @@ pub fn run_output_hooks(
     let stdin = session_hook_input(event, session_id, cwd, extra);
     for hook in hooks_for_event(config, event) {
         if let Ok(out) = run_hook_command(hook, cwd, &stdin) {
-            if out.status.success() {
+            if out.success {
                 let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if stdout.is_empty() {
                     continue;
@@ -1210,7 +1427,7 @@ pub fn run_prompt_submit_hooks(
         };
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        match out.status.code() {
+        match out.code {
             Some(2) => {
                 return PromptHookOutcome::Block(if stderr.is_empty() {
                     format!("blocked by UserPromptSubmit hook `{}`", hook.command)

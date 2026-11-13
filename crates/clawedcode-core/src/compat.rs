@@ -1521,7 +1521,7 @@ fn mcp_server_url(config: &McpServerConfig) -> Option<&str> {
 
 /// Wildcard URL match: `*` matches any characters, rest is literal —
 /// the reference's urlPatternToRegex.
-fn url_pattern_matches(url: &str, pattern: &str) -> bool {
+pub(crate) fn url_pattern_matches(url: &str, pattern: &str) -> bool {
     let mut parts = pattern.split('*');
     let first = parts.next().unwrap_or("");
     if !url.starts_with(first) {

@@ -21,6 +21,7 @@ toml.workspace = true
 uuid.workspace = true
 futures-util.workspace = true
 tracing.workspace = true
+reqwest.workspace = true
 clawedcode-api = { path = "../clawedcode-api", version = "0.1.1" }
 clawedcode-mcp = { path = "../clawedcode-mcp", version = "0.1.1" }
 clawedcode-tools = { path = "../clawedcode-tools", version = "0.1.1" }
