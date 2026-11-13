@@ -1742,12 +1742,48 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                         KeyCode::Enter => {
                             if let Some((msg_index, _)) = candidates.get(sel) {
                                 let msg_index = *msg_index;
+                                // Restore file state: checkpoints taken at or
+                                // after the rewind point are applied newest-
+                                // first then dropped, like the reference's
+                                // code+conversation rewind.
+                                let checkpoints =
+                                    std::mem::take(&mut ctx.session_mut().checkpoints);
+                                let mut restored = 0usize;
+                                for cp in checkpoints
+                                    .iter()
+                                    .rev()
+                                    .filter(|c| c.message_index >= msg_index)
+                                {
+                                    for snap in &cp.files {
+                                        match &snap.contents {
+                                            Some(bytes) => {
+                                                if std::fs::write(&snap.path, bytes).is_ok() {
+                                                    restored += 1;
+                                                }
+                                            }
+                                            None => {
+                                                if std::fs::remove_file(&snap.path).is_ok() {
+                                                    restored += 1;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                ctx.session_mut().checkpoints = checkpoints
+                                    .into_iter()
+                                    .filter(|c| c.message_index < msg_index)
+                                    .collect();
                                 ctx.session_mut().messages.truncate(msg_index);
                                 handler.overlay_rows.clear();
                                 handler.clear_live_turn();
                                 handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
+                                let suffix = if restored > 0 {
+                                    format!(" and restored {restored} file(s)")
+                                } else {
+                                    String::new()
+                                };
                                 handler.push_overlay(format!(
-                                    "[info] Rewound conversation to message {msg_index}"
+                                    "[info] Rewound to message {msg_index}{suffix}"
                                 ));
                                 let _ = ctx.save_session();
                             }
@@ -9683,7 +9719,7 @@ fn render_rewind_picker(frame: &mut Frame, area: Rect, selected: usize, ctx: &Tu
         ]));
     }
     lines.push(Line::from(Span::styled(
-        " Enter to rewind · Esc to cancel",
+        " Enter to rewind code + conversation · Esc to cancel",
         Style::default().fg(pal().dim),
     )));
     frame.render_widget(

@@ -56,6 +56,26 @@ pub struct Session {
     /// on `ExitWorktree` even for hook-based worktrees outside `.claude/worktrees`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_origin: Option<std::path::PathBuf>,
+    /// File-state checkpoints taken before mutating tool calls — rewind can
+    /// restore code + conversation like the reference's checkpointing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checkpoints: Vec<Checkpoint>,
+}
+
+/// Snapshot of files touched by a single mutating tool call, taken BEFORE
+/// the tool ran. `contents: None` means the file did not exist then.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Checkpoint {
+    /// `messages.len()` at the time the tool call executed — used to find
+    /// which checkpoints a rewind target should restore.
+    pub message_index: usize,
+    pub files: Vec<FileSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FileSnapshot {
+    pub path: PathBuf,
+    pub contents: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -152,6 +172,7 @@ impl Session {
             prompt_color: None,
             additional_allowed_dirs: Vec::new(),
             worktree_origin: None,
+            checkpoints: Vec::new(),
         }
         .with_default_task_list_id()
     }
@@ -187,6 +208,7 @@ impl Session {
             prompt_color: None,
             additional_allowed_dirs: Vec::new(),
             worktree_origin: None,
+            checkpoints: Vec::new(),
         }
     }
 
@@ -208,6 +230,7 @@ impl Session {
             prompt_color: None,
             additional_allowed_dirs: Vec::new(),
             worktree_origin: None,
+            checkpoints: Vec::new(),
         }
         .with_default_task_list_id()
     }
@@ -293,6 +316,7 @@ impl Session {
             prompt_color: None,
             additional_allowed_dirs: Vec::new(),
             worktree_origin: None,
+            checkpoints: Vec::new(),
         }
     }
 }

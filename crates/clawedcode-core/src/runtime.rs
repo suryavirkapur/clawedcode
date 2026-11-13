@@ -2376,6 +2376,43 @@ impl Runtime {
         };
 
         clawedcode_tools::set_extra_allowed_roots(session.additional_allowed_dirs.clone());
+        // Snapshot affected files before mutating tools run — rewind uses
+        // these checkpoints to restore code alongside conversation.
+        if matches!(tool_name, "apply_patch" | "NotebookEdit") {
+            let mut files = Vec::new();
+            if tool_name == "apply_patch" {
+                if let Some(patch) = input.get("patch").and_then(|v| v.as_str()) {
+                    for line in patch.lines() {
+                        if let Some(path) = line
+                            .strip_prefix("*** Add File:")
+                            .or_else(|| line.strip_prefix("*** Update File:"))
+                            .or_else(|| line.strip_prefix("*** Delete File:"))
+                        {
+                            files.push(session.cwd.join(path.trim()));
+                        }
+                    }
+                }
+            } else if let Some(nb) = input.get("notebook_path").and_then(|v| v.as_str()) {
+                files.push(session.cwd.join(nb));
+            }
+            let files: Vec<PathBuf> = files
+                .into_iter()
+                .map(|p| std::path::absolute(&p).unwrap_or(p))
+                .collect();
+            if !files.is_empty() {
+                let snapshots = files
+                    .iter()
+                    .map(|path| crate::session::FileSnapshot {
+                        path: path.clone(),
+                        contents: std::fs::read(path).ok(),
+                    })
+                    .collect();
+                session.checkpoints.push(crate::session::Checkpoint {
+                    message_index: session.messages.len(),
+                    files: snapshots,
+                });
+            }
+        }
         let result = tool.execute(input.clone(), &session.cwd);
         // FileChanged hooks fire on successful file edits like the reference.
         if tool_name == "apply_patch" && !result.is_error {
