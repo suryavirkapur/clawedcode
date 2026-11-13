@@ -200,6 +200,10 @@ static CUSTOM_SPINNER_TIPS: std::sync::RwLock<Option<(bool, Vec<String>)>> =
 static SPINNER_TIPS_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
+/// `settings.prefersReducedMotion` freezes the spinner animation frame.
+static REDUCED_MOTION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 const DEFAULT_SPINNER_TIPS: &[&str] = &[
     "Use /help to see all available commands",
     "Press shift+tab to cycle permission modes",
@@ -4264,7 +4268,11 @@ fn spinner_line(turn_started_at: Option<std::time::Instant>, tokens: u64) -> Lin
     let elapsed = turn_started_at
         .map(|start| start.elapsed().as_millis())
         .unwrap_or(0);
-    let frame_index = (elapsed / SPINNER_FRAME_MS) as usize % SPINNER_FRAMES.len();
+    let frame_index = if REDUCED_MOTION.load(std::sync::atomic::Ordering::Relaxed) {
+        0
+    } else {
+        (elapsed / SPINNER_FRAME_MS) as usize % SPINNER_FRAMES.len()
+    };
     let verbs = spinner_verbs();
     let verb_index = (elapsed / SPINNER_VERB_MS) as usize % verbs.len();
     let seconds = elapsed / 1000;
@@ -8256,6 +8264,12 @@ fn apply_respect_gitignore(settings: &serde_json::Value) {
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
     RESPECT_GITIGNORE.store(respect, std::sync::atomic::Ordering::Relaxed);
+    if let Some(reduced) = settings
+        .get("prefersReducedMotion")
+        .and_then(|v| v.as_bool())
+    {
+        REDUCED_MOTION.store(reduced, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// `git ls-files --cached --others` — respects .gitignore via

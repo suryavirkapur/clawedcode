@@ -826,6 +826,46 @@ fn execute_marketplace(cli: &Cli, action: crate::cli::MarketplaceAction) -> Resu
     use crate::cli::MarketplaceAction;
     match action {
         MarketplaceAction::Add { source } => {
+            // blockedMarketplaces — enterprise blocklist checked before the
+            // source is touched, like the reference's BEFORE-download check.
+            for path in clawedcode_core::hooks::settings_file_paths(&cli.cwd) {
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    continue;
+                };
+                let Some(blocked) = json.get("blockedMarketplaces").and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                for entry in blocked {
+                    let matches = entry
+                        .get("path")
+                        .or_else(|| entry.get("url"))
+                        .or_else(|| entry.get("repo"))
+                        .and_then(|v| v.as_str())
+                        .map(|candidate| {
+                            candidate == source
+                                || std::fs::canonicalize(cli.cwd.join(&source))
+                                    .map(|abs| {
+                                        abs.to_string_lossy() == candidate
+                                            || candidate.ends_with(&format!(
+                                                "/{}",
+                                                abs.file_name()
+                                                    .map(|n| n.to_string_lossy())
+                                                    .unwrap_or_default()
+                                            ))
+                                    })
+                                    .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if matches {
+                        anyhow::bail!(
+                            "Marketplace source '{source}' is blocked by managed settings"
+                        );
+                    }
+                }
+            }
             let abs = std::fs::canonicalize(cli.cwd.join(&source))
                 .with_context(|| format!("marketplace source '{source}' not found"))?;
             let (manifest_path, manifest, base) = read_marketplace_manifest(&abs)?;
@@ -1521,14 +1561,66 @@ fn build_approval_fn(yes: bool) -> ApprovalFn {
     }
 }
 
+/// The reference's availableModels semantics: family aliases ("opus",
+/// "sonnet", "haiku") allow the whole family unless a more specific entry
+/// for that family exists; other entries match exactly or as a
+/// segment-boundary version prefix ("opus-4-5" allows "claude-opus-4-5-*").
+fn model_allowed_by_settings(model: &str, allowlist: Option<&[String]>) -> bool {
+    const FAMILIES: &[&str] = &["sonnet", "opus", "haiku"];
+    let Some(list) = allowlist else {
+        return true;
+    };
+    if list.is_empty() {
+        return false;
+    }
+    let model = model.trim().to_lowercase();
+    let list: Vec<String> = list.iter().map(|e| e.trim().to_lowercase()).collect();
+    let family_narrowed = |family: &str| {
+        list.iter()
+            .any(|e| e != family && e.starts_with(&format!("{family}-")))
+    };
+    for entry in &list {
+        if *entry == model && !(FAMILIES.contains(&entry.as_str()) && family_narrowed(entry)) {
+            return true;
+        }
+        if FAMILIES.contains(&entry.as_str())
+            && !family_narrowed(entry)
+            && model.contains(entry.as_str())
+        {
+            return true;
+        }
+        // Version-prefix entry: matches when it appears in the model at a
+        // non-alphanumeric boundary ("opus-4-5" in "arn:aws:bedrock:opus-4-5"
+        // or "claude-opus-4-5-20251101").
+        if !FAMILIES.contains(&entry.as_str()) {
+            let mut start = 0usize;
+            while let Some(pos) = model[start..].find(entry.as_str()).map(|i| i + start) {
+                let left_ok = pos == 0
+                    || !model.as_bytes()[pos - 1].is_ascii_alphanumeric();
+                let right = pos + entry.len();
+                let right_ok = right == model.len()
+                    || !model.as_bytes()[right].is_ascii_alphanumeric();
+                if left_ok && right_ok {
+                    return true;
+                }
+                start = pos + 1;
+            }
+        }
+    }
+    false
+}
+
 /// Apply `--model`/`--max-turns` before the runtime is built.
 fn apply_cli_config_overrides(config: &mut AppConfig, cli: &Cli) {
-    if let Some(model) = &cli.model {
-        config.model = model.clone();
-    }
-    // settings.json `model`/`effortLevel` apply when the flags aren't
-    // given — later files win like settings precedence.
-    if cli.model.is_none() || cli.effort.is_none() || cli.thinking.is_none() {
+    // The user-specified model (flag > settings) is checked against the
+    // availableModels allowlist and mapped through modelOverrides before it
+    // lands on config.model — the reference ignores unallowed selections.
+    let default_model = config.model.clone();
+    let mut specified_model: Option<String> = cli.model.clone();
+    let mut model_overrides: serde_json::Map<String, serde_json::Value> =
+        serde_json::Map::new();
+    let mut available_models: Option<Vec<String>> = None;
+    {
         let mut thinking_enabled: Option<bool> = None;
         for path in clawedcode_core::hooks::settings_file_paths(&cli.cwd) {
             let Ok(text) = std::fs::read_to_string(&path) else {
@@ -1537,9 +1629,21 @@ fn apply_cli_config_overrides(config: &mut AppConfig, cli: &Cli) {
             let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
                 continue;
             };
+            if let Some(map) = json.get("modelOverrides").and_then(|v| v.as_object()) {
+                for (k, v) in map {
+                    model_overrides.insert(k.clone(), v.clone());
+                }
+            }
+            if let Some(list) = json.get("availableModels").and_then(|v| v.as_array()) {
+                available_models = Some(
+                    list.iter()
+                        .filter_map(|m| m.as_str().map(str::to_string))
+                        .collect(),
+                );
+            }
             if cli.model.is_none() {
                 if let Some(model) = json.get("model").and_then(|v| v.as_str()) {
-                    config.model = model.to_string();
+                    specified_model = Some(model.to_string());
                 }
             }
             if cli.effort.is_none() {
@@ -1567,6 +1671,22 @@ fn apply_cli_config_overrides(config: &mut AppConfig, cli: &Cli) {
         if cli.thinking.is_none() && thinking_enabled == Some(false) {
             config.runtime.effort = None;
             config.runtime.thinking_budget = None;
+        }
+    }
+    // modelOverrides → provider-specific IDs, then the allowlist gate.
+    if let Some(specified) = specified_model {
+        let resolved = model_overrides
+            .get(&specified)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or(specified);
+        if model_allowed_by_settings(&resolved, available_models.as_deref()) {
+            config.model = resolved;
+        } else {
+            eprintln!(
+                "warning: model '{}' is not in the availableModels allowlist; using '{}'",
+                resolved, default_model
+            );
         }
     }
     if let Some(turns) = cli.max_turns {
@@ -4648,6 +4768,62 @@ mod tests {
                 mode
             );
         }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn model_allowlist_and_overrides_gate_selection() {
+        let _guard = env_lock();
+        let dir = temp_sessions_dir("model_gate");
+        let fake_home = dir.join("home");
+        let project = dir.join("project");
+        std::fs::create_dir_all(project.join(".claude")).unwrap();
+        std::fs::create_dir_all(&fake_home).unwrap();
+        unsafe {
+            std::env::set_var("HOME", &fake_home);
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+            std::env::remove_var("CLAWEDCODE_SETTING_SOURCES");
+            std::env::remove_var("CLAWEDCODE_SETTINGS");
+        }
+        std::fs::write(
+            project.join(".claude/settings.json"),
+            r#"{"model": "claude-opus-4-5-20251101",
+                "availableModels": ["opus-4-5"],
+                "modelOverrides": {"claude-opus-4-5-20251101": "arn:aws:bedrock:opus-4-5"}}"#,
+        )
+        .unwrap();
+
+        let mut cli = make_cli(&dir.join("data"));
+        cli.cwd = project.clone();
+        let mut config = AppConfig::default();
+        config.model = "flag-default".to_string();
+        apply_cli_config_overrides(&mut config, &cli);
+        // The override is checked against the allowlist, then applied.
+        assert_eq!(config.model, "arn:aws:bedrock:opus-4-5");
+
+        // A model outside the allowlist is ignored.
+        std::fs::write(
+            project.join(".claude/settings.json"),
+            r#"{"model": "claude-sonnet-9",
+                "availableModels": ["opus-4-5"]}"#,
+        )
+        .unwrap();
+        let mut config = AppConfig::default();
+        config.model = "flag-default".to_string();
+        apply_cli_config_overrides(&mut config, &cli);
+        assert_eq!(config.model, "flag-default");
+
+        // Family alias covers the whole family unless narrowed.
+        std::fs::write(
+            project.join(".claude/settings.json"),
+            r#"{"model": "claude-sonnet-9", "availableModels": ["sonnet", "opus-4-5"]}"#,
+        )
+        .unwrap();
+        let mut config = AppConfig::default();
+        config.model = "flag-default".to_string();
+        apply_cli_config_overrides(&mut config, &cli);
+        assert_eq!(config.model, "claude-sonnet-9");
 
         std::fs::remove_dir_all(&dir).ok();
     }
