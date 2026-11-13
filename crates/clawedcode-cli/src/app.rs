@@ -1567,6 +1567,11 @@ fn apply_cli_config_overrides(config: &mut AppConfig, cli: &Cli) {
     }
     if let Some(budget) = cli.max_thinking_tokens {
         config.runtime.thinking_budget = Some(budget);
+    } else if let Ok(raw) = std::env::var("MAX_THINKING_TOKENS") {
+        // MAX_THINKING_TOKENS env like the reference's thinking default.
+        if let Ok(budget) = raw.parse::<u64>() {
+            config.runtime.thinking_budget = Some(budget);
+        }
     }
     if let Some(mode) = cli.thinking.as_deref() {
         match mode {

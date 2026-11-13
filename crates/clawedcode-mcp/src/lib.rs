@@ -334,7 +334,7 @@ impl McpStdioClient {
     }
 
     fn read_json(&mut self) -> Result<Value, String> {
-        self.read_json_with_timeout(MCP_IO_TIMEOUT)
+        self.read_json_with_timeout(mcp_io_timeout())
     }
 
     /// Poll the child's stdout before each blocking read so a silent or
@@ -589,7 +589,17 @@ impl Drop for McpStdioClient {
     }
 }
 
-const MCP_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Read deadline for MCP stdio I/O — `MCP_TIMEOUT` env (ms) overrides,
+/// like the reference's client timeout (its default is 30s; ours is a
+/// tighter 15s after silent-server hangs).
+fn mcp_io_timeout() -> std::time::Duration {
+    std::env::var("MCP_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(std::time::Duration::from_millis)
+        .unwrap_or_else(|| std::time::Duration::from_secs(15))
+}
 
 /// Write a JSON-RPC message with Content-Length framing (server side).
 pub fn write_framed(out: &mut impl std::io::Write, value: &Value) -> std::io::Result<()> {

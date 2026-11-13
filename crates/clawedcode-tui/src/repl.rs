@@ -191,6 +191,76 @@ const SPINNER_FRAMES: &[char] = &['·', '✢', '✳', '✶', '✻', '✽', '✻'
 static CUSTOM_SPINNER_VERBS: std::sync::RwLock<Option<Vec<String>>> =
     std::sync::RwLock::new(None);
 
+/// `settings.fileSuggestion` — `{type: "command", command}` runs for
+/// @-palette suggestions instead of index filtering (the reference's
+/// executeFileSuggestionCommand).
+static FILE_SUGGESTION: std::sync::RwLock<Option<(String, std::path::PathBuf)>> =
+    std::sync::RwLock::new(None);
+
+fn apply_file_suggestion(settings: &serde_json::Value, cwd: &std::path::Path) {
+    let cmd = settings
+        .get("fileSuggestion")
+        .filter(|f| f.get("type").and_then(|t| t.as_str()) == Some("command"))
+        .and_then(|f| f.get("command"))
+        .and_then(|c| c.as_str())
+        .map(str::to_string);
+    if let Ok(mut slot) = FILE_SUGGESTION.write() {
+        *slot = cmd.map(|c| (c, cwd.to_path_buf()));
+    }
+}
+
+/// Run the configured fileSuggestion command: the hook input JSON goes to
+/// stdin, stdout is a JSON array or newline-separated paths.
+fn file_suggestion_entries(query: &str) -> Option<Vec<String>> {
+    let (cmd, cwd) = FILE_SUGGESTION.read().ok()?.clone()?;
+    let input = serde_json::json!({
+        "hook_event_name": "FileSuggestion",
+        "query": query,
+        "cwd": cwd.display().to_string(),
+    })
+    .to_string();
+    let mut child = std::process::Command::new("sh")
+        .arg("-lc")
+        .arg(&cmd)
+        .current_dir(&cwd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        let _ = stdin.write_all(input.as_bytes());
+    }
+    // 5s budget like the reference's typeahead timeout.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                return Some(Vec::new());
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(_) => return None,
+        }
+    }
+    let out = child.wait_with_output().ok()?;
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if let Ok(arr) = serde_json::from_str::<Vec<String>>(&stdout) {
+        return Some(arr.into_iter().take(8).collect());
+    }
+    Some(
+        stdout
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .take(8)
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
 fn apply_spinner_verbs(settings: &serde_json::Value) {
     let Some(cfg) = settings.get("spinnerVerbs") else {
         return;
@@ -602,6 +672,10 @@ fn skill_is_registerable(skill: &SkillDescriptor) -> bool {
 pub fn run_with_context(mut ctx: TuiContext) -> Result<()> {
     set_theme(ctx.theme_name());
     apply_spinner_verbs(&ctx.runtime.compatibility().settings);
+    apply_file_suggestion(
+        &ctx.runtime.compatibility().settings,
+        &ctx.session().cwd,
+    );
     enable_raw_mode()?;
     execute!(
         stdout(),
@@ -8099,6 +8173,9 @@ fn build_file_index(cwd: &std::path::Path) -> Vec<String> {
 /// Substring-matches the file index against the `@` query (directories and
 /// shallower paths rank first), capped for the palette.
 fn filtered_file_entries(index: &[String], query: &str) -> Vec<String> {
+    if let Some(entries) = file_suggestion_entries(query) {
+        return entries;
+    }
     let query = query.to_lowercase();
     let mut matches: Vec<&String> = index
         .iter()
