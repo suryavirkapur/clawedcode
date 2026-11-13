@@ -343,7 +343,12 @@ impl Session {
 
     pub fn with_default_task_list_id(mut self) -> Self {
         if self.task_list_id.is_empty() {
-            self.task_list_id = self.id.to_string();
+            // CLAUDE_CODE_TASK_LIST_ID scopes the default list like the
+            // reference's task-store env.
+            self.task_list_id = std::env::var("CLAUDE_CODE_TASK_LIST_ID")
+                .ok()
+                .filter(|id| !id.is_empty())
+                .unwrap_or_else(|| self.id.to_string());
         }
         self
     }

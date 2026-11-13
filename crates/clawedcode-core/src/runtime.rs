@@ -697,9 +697,28 @@ impl Runtime {
         prompt_override: Option<&str>,
     ) -> CompletionRequest {
         let limit = self.config.runtime.session_history_limit;
-        let messages = Self::compact_session_messages(&session.messages, limit);
+        // DISABLE_AUTO_COMPACT skips automatic history compaction like the
+        // reference's env gate.
+        let auto_compact_disabled = std::env::var("DISABLE_AUTO_COMPACT")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        let messages = if auto_compact_disabled {
+            session.messages.clone()
+        } else {
+            Self::compact_session_messages(&session.messages, limit)
+        };
+        let model = if session.parent_session_id.is_some() {
+            // CLAUDE_CODE_SUBAGENT_MODEL overrides the model for spawned
+            // subagents like the reference.
+            std::env::var("CLAUDE_CODE_SUBAGENT_MODEL")
+                .ok()
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| self.config.model.clone())
+        } else {
+            self.config.model.clone()
+        };
         let mut request = CompletionRequest {
-            model: self.config.model.clone(),
+            model,
             prompt_pack: self.config.prompts.default_prompt_pack.clone(),
             system_prompt_name: self.system_prompt.name.to_string(),
             system_prompt_body: self.effective_system_prompt_body(session),

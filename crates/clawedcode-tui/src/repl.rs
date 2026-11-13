@@ -6423,6 +6423,13 @@ fn to_tui_event(event: &ApiEvent) -> Option<TuiEvent> {
 /// plus the model's summary of the conversation — mirrors Claude Code's
 /// `/compact`, where the summary becomes the new starting context.
 fn compact_session(session: &mut Session) -> Vec<String> {
+    // DISABLE_COMPACT — the reference's manual-compact kill switch.
+    if std::env::var("DISABLE_COMPACT")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+    {
+        return vec!["[info] /compact is disabled (DISABLE_COMPACT)".to_string()];
+    }
     clawedcode_core::hooks::run_pre_compact_hooks(
         &clawedcode_core::hooks::load_hooks(&session.cwd),
         &session.id.to_string(),

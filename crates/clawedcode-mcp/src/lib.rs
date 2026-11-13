@@ -300,6 +300,15 @@ impl McpStdioClient {
     }
 
     fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        self.request_with_timeout(method, params, mcp_io_timeout())
+    }
+
+    fn request_with_timeout(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: std::time::Duration,
+    ) -> Result<Value, String> {
         let request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": self.next_request_id(),
@@ -308,7 +317,7 @@ impl McpStdioClient {
         });
 
         self.send_json(&request)?;
-        let response = self.read_json()?;
+        let response = self.read_json_with_timeout(timeout)?;
 
         if let Some(error) = response.get("error") {
             let message = error
@@ -419,14 +428,17 @@ impl McpStdioClient {
         if !self.initialized {
             return Err("not initialized".into());
         }
-        let result = self.request(
+        // tools/call gets the longer MCP_TOOL_TIMEOUT deadline like the
+        // reference (other RPCs stay on MCP_TIMEOUT).
+        let result = self.request_with_timeout(
             "tools/call",
             serde_json::json!({
                 "name": tool_name,
                 "arguments": arguments
             }),
+            mcp_tool_timeout(),
         )?;
-        parse_tool_call_text(&result)
+        parse_tool_call_text(&result).map(truncate_mcp_output)
     }
 
     pub fn list_resources(&mut self) -> Result<Vec<McpResource>, String> {
@@ -599,6 +611,38 @@ fn mcp_io_timeout() -> std::time::Duration {
         .filter(|ms| *ms > 0)
         .map(std::time::Duration::from_millis)
         .unwrap_or_else(|| std::time::Duration::from_secs(15))
+}
+
+/// `MCP_TOOL_TIMEOUT` (ms) — the reference gives tool calls a much longer
+/// deadline than ordinary RPCs (its default is ~10min).
+fn mcp_tool_timeout() -> std::time::Duration {
+    std::env::var("MCP_TOOL_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(std::time::Duration::from_millis)
+        .unwrap_or_else(|| std::time::Duration::from_secs(600))
+}
+
+/// `MAX_MCP_OUTPUT_TOKENS` — the reference truncates MCP tool results past
+/// this token budget (chars/4 estimate), appending a notice.
+fn truncate_mcp_output(text: String) -> String {
+    let max_tokens: usize = std::env::var("MAX_MCP_OUTPUT_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(25_000);
+    let max_chars = max_tokens.saturating_mul(4);
+    if text.len() <= max_chars {
+        return text;
+    }
+    let mut end = max_chars;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n\n[MCP tool output exceeded {max_tokens} tokens and was truncated]",
+        &text[..end]
+    )
 }
 
 /// Write a JSON-RPC message with Content-Length framing (server side).

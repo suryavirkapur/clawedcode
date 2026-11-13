@@ -1483,6 +1483,13 @@ fn execute_mcp_serve(
 }
 
 fn execute_update() -> Result<()> {
+    // DISABLE_AUTOUPDATER — the reference's managed update kill switch.
+    if std::env::var("DISABLE_AUTOUPDATER")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+    {
+        anyhow::bail!("self-update is disabled (DISABLE_AUTOUPDATER)");
+    }
     let outcome = clawedcode_core::update::run_self_update()?;
     println!(
         "Updated clawedcode via {:?} using `{}`",
