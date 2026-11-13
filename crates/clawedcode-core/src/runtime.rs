@@ -2268,17 +2268,32 @@ impl Runtime {
         let input = pre.updated_input.unwrap_or(input);
         let pre_context = pre.additional_context;
 
-        let decision = match decision_override {
-            Some(d) => d,
-            None => self.permission_engine.decide(needs_approval, write_like),
+        // Settings permission rules (permissions.deny/ask/allow) sit between
+        // the hook decision and the mode decision: deny rules are hard
+        // blocks (even under bypass), then hook ask, ask rules, allow rules,
+        // then the permission mode.
+        let rules = crate::permissions::load_permission_rules(&session.cwd);
+        let rule_decision = rules.check(tool_name, &input, &session.cwd);
+        let decision = if rule_decision == Some(PermissionDecision::Deny) {
+            PermissionDecision::Deny
+        } else if let Some(d) = decision_override {
+            d
+        } else if let Some(d) = rule_decision.clone() {
+            d
+        } else {
+            self.permission_engine.decide(needs_approval, write_like)
         };
 
         match decision {
             PermissionDecision::Deny => {
-                let reason = format!(
-                    "Tool '{tool_name}' denied in {:?} mode",
-                    self.permission_engine.mode()
-                );
+                let reason = if rule_decision == Some(PermissionDecision::Deny) {
+                    format!("Tool '{tool_name}' denied by permissions.deny rule")
+                } else {
+                    format!(
+                        "Tool '{tool_name}' denied in {:?} mode",
+                        self.permission_engine.mode()
+                    )
+                };
                 crate::hooks::run_permission_denied_hooks(
                     &crate::hooks::load_hooks(&session.cwd),
                     &session.id.to_string(),

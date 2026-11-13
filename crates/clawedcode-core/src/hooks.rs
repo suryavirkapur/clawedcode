@@ -61,13 +61,9 @@ struct HookSpec {
 /// Load hooks from `.claude/settings.json` and `.claude/settings.local.json`
 /// in `cwd` (the local file wins `disableAllHooks` like the reference's
 /// settings precedence).
-pub fn load_hooks(cwd: &Path) -> HooksConfig {
-    let mut config = HooksConfig::default();
-    // `--bare`: minimal mode skips hooks like the reference.
-    if std::env::var_os("CLAWEDCODE_SIMPLE").is_some() {
-        config.disabled = true;
-        return config;
-    }
+/// Settings files in precedence order, honoring `CLAWEDCODE_SETTING_SOURCES`
+/// and `CLAWEDCODE_SETTINGS` — shared by hook and permission-rule loading.
+pub(crate) fn settings_file_paths(cwd: &Path) -> Vec<PathBuf> {
     // `--settings <file>` / CLAWEDCODE_SETTINGS: extra settings file merged
     // last like the reference flag.
     let extra = std::env::var_os("CLAWEDCODE_SETTINGS").map(PathBuf::from);
@@ -96,7 +92,17 @@ pub fn load_hooks(cwd: &Path) -> HooksConfig {
         paths.push(cwd.join(".claude").join("settings.local.json"));
     }
     paths.extend(extra);
-    for path in paths {
+    paths
+}
+
+pub fn load_hooks(cwd: &Path) -> HooksConfig {
+    let mut config = HooksConfig::default();
+    // `--bare`: minimal mode skips hooks like the reference.
+    if std::env::var_os("CLAWEDCODE_SIMPLE").is_some() {
+        config.disabled = true;
+        return config;
+    }
+    for path in settings_file_paths(cwd) {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
