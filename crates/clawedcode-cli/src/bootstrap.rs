@@ -449,6 +449,9 @@ mod tests {
             dangerously_skip_permissions: false,
             output_format: None,
             input_format: None,
+            mcp_config: None,
+            strict_mcp_config: false,
+            settings: None,
         }
     }
 
@@ -691,6 +694,9 @@ mod tests {
             dangerously_skip_permissions: false,
             output_format: None,
             input_format: None,
+            mcp_config: None,
+            strict_mcp_config: false,
+            settings: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Tui));
@@ -722,6 +728,9 @@ mod tests {
             dangerously_skip_permissions: false,
             output_format: None,
             input_format: None,
+            mcp_config: None,
+            strict_mcp_config: false,
+            settings: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -753,6 +762,9 @@ mod tests {
             dangerously_skip_permissions: false,
             output_format: None,
             input_format: None,
+            mcp_config: None,
+            strict_mcp_config: false,
+            settings: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));
@@ -787,6 +799,9 @@ mod tests {
             dangerously_skip_permissions: false,
             output_format: None,
             input_format: None,
+            mcp_config: None,
+            strict_mcp_config: false,
+            settings: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::DirectConnect(_)));
@@ -821,6 +836,9 @@ mod tests {
             dangerously_skip_permissions: false,
             output_format: None,
             input_format: None,
+            mcp_config: None,
+            strict_mcp_config: false,
+            settings: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Ssh(_)));
@@ -862,6 +880,9 @@ mod tests {
             dangerously_skip_permissions: false,
             output_format: None,
             input_format: None,
+            mcp_config: None,
+            strict_mcp_config: false,
+            settings: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Headless(_)));
@@ -907,6 +928,9 @@ mod tests {
             dangerously_skip_permissions: false,
             output_format: None,
             input_format: None,
+            mcp_config: None,
+            strict_mcp_config: false,
+            settings: None,
         };
         let mode = resolve_mode(&cli).unwrap();
         assert!(matches!(mode, ExecutionMode::Remote(_)));

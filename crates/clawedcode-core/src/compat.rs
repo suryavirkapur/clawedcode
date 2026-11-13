@@ -1004,7 +1004,37 @@ fn slash_command_from_name(name: &str) -> String {
 }
 
 fn discover_mcp_servers(cwd: &Path, settings: &Value) -> Result<BTreeMap<String, McpServerConfig>> {
-    let mut servers = parse_settings_mcp_servers(settings);
+    // `--mcp-config` / CLAWEDCODE_MCP_CONFIG: extra config file(s) merged
+    // like the reference flag. `--strict-mcp-config` /
+    // CLAWEDCODE_MCP_CONFIG_STRICT ignores every other source.
+    let extra_files: Vec<PathBuf> = std::env::var("CLAWEDCODE_MCP_CONFIG")
+        .map(|v| {
+            v.split(':')
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    let strict = std::env::var_os("CLAWEDCODE_MCP_CONFIG_STRICT").is_some();
+
+    let mut servers = if strict {
+        BTreeMap::new()
+    } else {
+        parse_settings_mcp_servers(settings)
+    };
+
+    for file in &extra_files {
+        let raw = fs::read_to_string(file)
+            .with_context(|| format!("failed to read {}", file.display()))?;
+        let value: Value = serde_json::from_str(&raw)
+            .with_context(|| format!("failed to parse {}", file.display()))?;
+        if let Some(extra_servers) = value.get("mcpServers").and_then(parse_mcp_map) {
+            servers.extend(extra_servers);
+        }
+    }
+    if strict {
+        return Ok(servers);
+    }
 
     let mut ancestor_paths: Vec<PathBuf> = cwd.ancestors().map(PathBuf::from).collect();
     ancestor_paths.reverse();

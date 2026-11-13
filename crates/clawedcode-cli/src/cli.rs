@@ -70,6 +70,15 @@ pub struct Cli {
     /// Input format for headless runs: text or stream-json.
     #[arg(long, global = true)]
     pub input_format: Option<String>,
+    /// Extra MCP server config file(s) to merge (colon-separated).
+    #[arg(long, global = true)]
+    pub mcp_config: Option<String>,
+    /// Use only --mcp-config servers, ignoring project/user sources.
+    #[arg(long, global = true)]
+    pub strict_mcp_config: bool,
+    /// Extra settings file merged after .claude/settings*.json.
+    #[arg(long, global = true)]
+    pub settings: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -263,6 +272,9 @@ mod tests {
             dangerously_skip_permissions: false,
             output_format: None,
             input_format: None,
+            mcp_config: None,
+            strict_mcp_config: false,
+            settings: None,
         }
     }
 
@@ -297,6 +309,9 @@ mod tests {
             dangerously_skip_permissions: false,
             output_format: None,
             input_format: None,
+            mcp_config: None,
+            strict_mcp_config: false,
+            settings: None,
         }
     }
 

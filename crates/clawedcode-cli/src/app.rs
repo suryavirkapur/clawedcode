@@ -101,6 +101,17 @@ struct InteractiveTransportFinalOutput {
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
+    // Plumb config-path flags into discovery env vars before bootstrap —
+    // compat discovery runs inside bootstrap() and reads them there.
+    if let Some(paths) = &cli.mcp_config {
+        unsafe { std::env::set_var("CLAWEDCODE_MCP_CONFIG", paths) };
+    }
+    if cli.strict_mcp_config {
+        unsafe { std::env::set_var("CLAWEDCODE_MCP_CONFIG_STRICT", "1") };
+    }
+    if let Some(path) = &cli.settings {
+        unsafe { std::env::set_var("CLAWEDCODE_SETTINGS", path) };
+    }
     let boot = bootstrap(cli)?;
     execute(boot).await
 }
@@ -2777,6 +2788,9 @@ mod tests {
             dangerously_skip_permissions: false,
             output_format: None,
             input_format: None,
+            mcp_config: None,
+            strict_mcp_config: false,
+            settings: None,
         }
     }
 

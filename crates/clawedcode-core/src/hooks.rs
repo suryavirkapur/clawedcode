@@ -19,7 +19,7 @@
 
 use serde::Deserialize;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct HookCommand {
@@ -58,8 +58,14 @@ struct HookSpec {
 /// settings precedence).
 pub fn load_hooks(cwd: &Path) -> HooksConfig {
     let mut config = HooksConfig::default();
-    for name in ["settings.json", "settings.local.json"] {
-        let path = cwd.join(".claude").join(name);
+    // `--settings <file>` / CLAWEDCODE_SETTINGS: extra settings file merged
+    // last like the reference flag.
+    let extra = std::env::var_os("CLAWEDCODE_SETTINGS").map(PathBuf::from);
+    for path in ["settings.json", "settings.local.json"]
+        .iter()
+        .map(|n| cwd.join(".claude").join(n))
+        .chain(extra)
+    {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
