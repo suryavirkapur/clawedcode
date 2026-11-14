@@ -592,6 +592,7 @@ const BUILTIN_COMMANDS: &[&str] = &[
     "/bashes",
     "/sessions",
     "/fork",
+    "/branch",
     "/tools",
     "/status",
     "/model",
@@ -8043,6 +8044,57 @@ PR number: {args}"#
                     }
                     return Ok(true);
                 }
+                "/branch" => {
+                    // Reference commands/branch: fork the current
+                    // conversation under a new session id, optionally
+                    // titled; the title defaults to the first prompt.
+                    let title_arg = prompt
+                        .strip_prefix("/branch")
+                        .map(str::trim)
+                        .unwrap_or_default();
+                    if ctx.session().messages.is_empty() {
+                        handler.push_overlay(
+                            "[info] No conversation to branch.".to_string(),
+                        );
+                        let _ = ctx.save_session();
+                        return Ok(true);
+                    }
+                    let _ = ctx.save_session();
+                    let title = if !title_arg.is_empty() {
+                        Some(title_arg.to_string())
+                    } else {
+                        // deriveFirstPrompt: first user message collapsed to
+                        // one line, capped at 100 chars.
+                        ctx.session()
+                            .messages
+                            .iter()
+                            .find(|m| matches!(m.role, clawedcode_core::session::Role::User))
+                            .and_then(|m| {
+                                m.content_blocks.iter().find_map(|b| match b {
+                                    clawedcode_core::content::ContentBlock::Text { text } => {
+                                        Some(text.split_whitespace().collect::<Vec<_>>().join(" "))
+                                    }
+                                    _ => None,
+                                })
+                            })
+                            .map(|t| t.chars().take(100).collect::<String>())
+                            .filter(|t| !t.is_empty())
+                            .or_else(|| Some("Branched conversation".to_string()))
+                    };
+                    let mut forked = Session::fork_from(ctx.session());
+                    forked.title = title.clone();
+                    let forked_id = forked.id.to_string();
+                    ctx.replace_session(forked);
+                    let _ = ctx.save_session();
+                    handler.overlay_rows.clear();
+                    handler.clear_panel();
+                    handler.push_overlay(format!(
+                        "[info] Branched to {} — {}",
+                        short_session_id(&forked_id),
+                        title.unwrap_or_default()
+                    ));
+                    return Ok(true);
+                }
                 "/resume" => {
                     let prefix = prompt
                         .strip_prefix("/resume")
@@ -8347,6 +8399,11 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
         CommandEntry {
             name: "/sessions".to_string(),
             description: "List recent saved sessions".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/branch".to_string(),
+            description: "Branch the current conversation into a new session".to_string(),
             source: CommandSource::BuiltIn,
         },
         CommandEntry {
@@ -9146,6 +9203,7 @@ fn curated_command_entries(entries: Vec<CommandEntry>) -> Vec<CommandEntry> {
         "/sessions",
         "/tools",
         "/fork",
+        "/branch",
         "/clear",
         "/update",
     ];
