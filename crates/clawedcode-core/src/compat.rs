@@ -69,6 +69,90 @@ pub fn bypass_dialog_accepted(cwd: &Path) -> bool {
     })
 }
 
+/// Normalize a path into a ~/.claude.json `projects` key — forward slashes
+/// on all platforms like the reference's normalizePathForConfigKey.
+fn normalize_config_key(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// The key the reference persists trust under: the git root when inside a
+/// repo, else the cwd itself (getProjectPathForConfig).
+fn project_config_key(cwd: &Path) -> String {
+    let git_root = cwd
+        .ancestors()
+        .find(|ancestor| ancestor.join(".git").exists());
+    normalize_config_key(git_root.unwrap_or(cwd))
+}
+
+/// Session-scoped trust latch for the home-directory case — the reference
+/// keeps it in memory only and never persists it.
+static SESSION_TRUST_ACCEPTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Reference checkHasTrustDialogAccepted: session trust, then the primary
+/// project key, then every ancestor of cwd.
+pub fn project_trust_accepted(cwd: &Path) -> bool {
+    if SESSION_TRUST_ACCEPTED.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    let Some(json_path) = claude_json_path() else {
+        return false;
+    };
+    let Ok(raw) = std::fs::read_to_string(json_path) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    let Some(projects) = json.get("projects").and_then(|p| p.as_object()) else {
+        return false;
+    };
+    let accepted_at = |key: &str| {
+        projects
+            .get(key)
+            .and_then(|p| p.get("hasTrustDialogAccepted"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    };
+    if accepted_at(&project_config_key(cwd)) {
+        return true;
+    }
+    cwd.ancestors()
+        .map(normalize_config_key)
+        .any(|key| accepted_at(&key))
+}
+
+/// Record the trust acceptance. Launched from the home directory the
+/// acceptance stays in memory only; elsewhere it persists under the
+/// git-root-or-cwd project key like saveCurrentProjectConfig.
+pub fn accept_project_trust(cwd: &Path) -> Result<()> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if home.as_deref() == Some(cwd) {
+        SESSION_TRUST_ACCEPTED.store(true, std::sync::atomic::Ordering::Relaxed);
+        return Ok(());
+    }
+    let Some(path) = claude_json_path() else {
+        bail!("could not resolve ~/.claude.json path");
+    };
+    let key = project_config_key(cwd);
+    let mut json: Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    if !json.is_object() {
+        json = Value::Object(Map::new());
+    }
+    if !json["projects"].is_object() {
+        json["projects"] = Value::Object(Map::new());
+    }
+    if !json["projects"][&key].is_object() {
+        json["projects"][&key] = Value::Object(Map::new());
+    }
+    json["projects"][&key]["hasTrustDialogAccepted"] = Value::Bool(true);
+    std::fs::write(&path, serde_json::to_string_pretty(&json)? + "\n")?;
+    Ok(())
+}
+
 /// Persist the bypass-dialog acceptance into user settings like the
 /// reference's saveSettings on dialog accept.
 pub fn persist_bypass_acceptance() -> Result<()> {
@@ -2806,5 +2890,30 @@ Some more content here.
             assert_eq!(skill.slash_command, "/my-skill");
             assert!(!skill.legacy_command);
         }
+
+    #[test]
+    fn project_trust_accepted_checks_project_key_and_ancestors() {
+        let _guard = env_lock();
+        let root = temp_dir("trust");
+        let home = root.join("home");
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        unsafe { std::env::set_var("HOME", &home) };
+        let key = normalize_config_key(&root);
+        fs::write(
+            home.join(".claude.json"),
+            format!(
+                r#"{{"projects":{{"{key}":{{"hasTrustDialogAccepted":true}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let nested = root.join("sub").join("dir");
+        fs::create_dir_all(&nested).unwrap();
+        // Ancestor trust covers nested paths.
+        assert!(project_trust_accepted(&nested));
+        // Untrusted sibling outside the trusted root.
+        let other = temp_dir("trust_other");
+        assert!(!project_trust_accepted(&other));
+        unsafe { std::env::remove_var("HOME") };
+    }
     }
 }

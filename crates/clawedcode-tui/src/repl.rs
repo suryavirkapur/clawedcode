@@ -883,6 +883,8 @@ struct ReplHandler {
     /// Bypass-mode acceptance dialog — shown once when bypass is entered
     /// without `skipDangerousModePermissionPrompt` accepted.
     bypass_confirm: bool,
+    /// Reference TrustDialog: shown until the workspace is marked trusted.
+    trust_confirm: bool,
     /// "Yes, clear context" plan accept — the implement prompt to run on a
     /// fresh session after the turn finishes.
     plan_implement_pending: Option<String>,
@@ -925,6 +927,7 @@ impl ReplHandler {
             copy_picker_text: String::new(),
             copy_picker_blocks: Vec::new(),
             bypass_confirm: false,
+            trust_confirm: false,
             plan_implement_pending: None,
             plan_exit_ids: std::collections::HashSet::new(),
             turn_tokens: 0,
@@ -1241,6 +1244,11 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
     {
         handler.bypass_confirm = true;
     }
+    // Reference: the "Do you trust the files in this folder?" dialog gates
+    // interactive startup until the workspace is accepted.
+    if !clawedcode_core::compat::project_trust_accepted(&ctx.session().cwd) {
+        handler.trust_confirm = true;
+    }
     handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
     maybe_mark_project_onboarding_complete(&ctx.session().cwd);
 
@@ -1512,7 +1520,11 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 &handler.resume_picker_query,
             ))
             .max(rewind_picker_height(handler.rewind_picker, ctx));
-            let bypass_height = if handler.bypass_confirm { 6 } else { 0 };
+            let bypass_height = if handler.bypass_confirm || handler.trust_confirm {
+                8
+            } else {
+                0
+            };
             let spinner_height = if active_turn.is_some() && awaiting_approval.is_none() {
                 2
             } else {
@@ -1632,7 +1644,43 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                 );
             }
 
-            if bypass_height > 0 {
+            if bypass_height > 0 && handler.trust_confirm {
+                // Reference TrustDialog — "Accessing workspace:" safety check.
+                frame.render_widget(
+                    Paragraph::new(vec![
+                        Line::from(Span::styled(
+                            "Accessing workspace:",
+                            Style::default()
+                                .fg(pal().warn_fg)
+                                .add_modifier(Modifier::BOLD),
+                        )),
+                        Line::from(Span::styled(
+                            display_path(&ctx.session().cwd),
+                            Style::default().add_modifier(Modifier::BOLD),
+                        )),
+                        Line::from(Span::styled(
+                            "Quick safety check: Is this a project you created or one you trust?",
+                            Style::default().fg(pal().muted),
+                        )),
+                        Line::from(Span::styled(
+                            "ClawedCode'll be able to read, edit, and execute files here.",
+                            Style::default().fg(pal().muted),
+                        )),
+                        Line::from(""),
+                        Line::from(vec![
+                            Span::styled("  enter ", Style::default().add_modifier(Modifier::BOLD)),
+                            Span::styled("Yes, I trust this folder", Style::default().fg(pal().muted)),
+                            Span::styled("   esc ", Style::default().add_modifier(Modifier::BOLD)),
+                            Span::styled("No, exit", Style::default().fg(pal().muted)),
+                        ]),
+                        Line::from(Span::styled(
+                            "Enter to confirm · Esc to cancel",
+                            Style::default().fg(pal().dim),
+                        )),
+                    ]),
+                    chunks[5],
+                );
+            } else if bypass_height > 0 {
                 frame.render_widget(
                     Paragraph::new(vec![
                         Line::from(Span::styled(
@@ -2033,6 +2081,24 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                     continue;
                 }
 
+                if handler.trust_confirm {
+                    match key.code {
+                        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                            let _ = clawedcode_core::compat::accept_project_trust(
+                                &ctx.session().cwd,
+                            );
+                            handler.trust_confirm = false;
+                            handler.push_overlay(
+                                "[info] Workspace trusted".to_string(),
+                            );
+                        }
+                        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                            handler.quit_requested = true;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
                 if handler.bypass_confirm {
                     match key.code {
                         KeyCode::Char('y') | KeyCode::Char('Y') => {
