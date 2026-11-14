@@ -328,7 +328,9 @@ impl Session {
     }
 
     pub fn load_by_id(base_dir: &Path, session_id: &str) -> Result<Self> {
+        // Accept a full UUID or a unique prefix like the reference's resume.
         let session_uuid = Uuid::parse_str(session_id)
+            .or_else(|_| resolve_session_by_prefix(base_dir, session_id))
             .with_context(|| format!("invalid session ID format: {}", session_id))?;
         Self::load(base_dir, session_uuid)
     }
