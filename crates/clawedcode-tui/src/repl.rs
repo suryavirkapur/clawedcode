@@ -739,6 +739,14 @@ fn skill_is_registerable(skill: &SkillDescriptor) -> bool {
 }
 
 pub fn run_with_context(mut ctx: TuiContext) -> Result<()> {
+    // Reference: ~/.claude.json `theme` is the globalConfig store and wins
+    // over our config file default.
+    if let Some(theme) = clawedcode_core::compat::global_config_value("theme")
+        .and_then(|v| v.as_str().map(str::to_string))
+        .filter(|t| THEME_NAMES.contains(&t.as_str()))
+    {
+        ctx.set_theme_name(&theme);
+    }
     set_theme(ctx.theme_name());
     apply_spinner_verbs(&ctx.runtime.compatibility().settings);
     apply_file_suggestion(
@@ -907,7 +915,10 @@ impl ReplHandler {
             tasks_picker: None,
             resume_picker: None,
             resume_picker_query: String::new(),
-            vim_enabled: false,
+            vim_enabled: clawedcode_core::compat::global_config_value("editorMode")
+                .and_then(|v| v.as_str().map(str::to_string))
+                .map(|mode| mode == "vim")
+                .unwrap_or(false),
             vim_insert: true,
             rewind_picker: None,
             msg_actions_cursor: None,
@@ -3782,7 +3793,50 @@ fn welcome_left_lines(ctx: &TuiContext, width: usize) -> Vec<Line<'static>> {
         display_path(&ctx.session().cwd),
         Style::default().fg(pal().muted),
     ));
+    if let Some(announcement) =
+        company_announcement(&ctx.runtime.compatibility().settings)
+    {
+        lines.push(Line::from(""));
+        for wrapped in wrap_styled_line(
+            Line::from(Span::raw(announcement)),
+            width.saturating_sub(2).max(8),
+        ) {
+            let mut spans = vec![Span::raw("  ")];
+            spans.extend(wrapped.spans);
+            lines.push(Line::from(spans));
+        }
+    }
     lines
+}
+
+/// Reference LogoV2: on the first recorded startup the first
+/// `companyAnnouncements` entry shows; afterwards a random entry is picked.
+fn company_announcement(settings: &serde_json::Value) -> Option<String> {
+    let announcements = settings
+        .get("companyAnnouncements")?
+        .as_array()?
+        .iter()
+        .filter_map(|entry| entry.as_str())
+        .collect::<Vec<_>>();
+    if announcements.is_empty() {
+        return None;
+    }
+    let first_startup = clawedcode_core::compat::claude_json_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|json| json.get("numStartups").and_then(|n| n.as_u64()))
+        .map(|n| n <= 1)
+        .unwrap_or(false);
+    let index = if first_startup {
+        0
+    } else {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as usize)
+            .unwrap_or(0);
+        nanos % announcements.len()
+    };
+    Some(announcements[index].to_string())
 }
 
 /// Claude Code-style welcome box: mascot/metadata column on the left and the
@@ -7636,11 +7690,20 @@ PR number: {args}"#
                 "/vim" => {
                     handler.vim_enabled = !handler.vim_enabled;
                     handler.vim_insert = true;
-                    handler.push_overlay(if handler.vim_enabled {
-                        "[info] Vim mode enabled (Esc for NORMAL, i to insert)".to_string()
-                    } else {
-                        "[info] Vim mode disabled".to_string()
-                    });
+                    let mode = if handler.vim_enabled { "vim" } else { "normal" };
+                    // Reference: /vim persists editorMode to ~/.claude.json.
+                    let _ = clawedcode_core::compat::set_global_config_value(
+                        "editorMode",
+                        serde_json::Value::String(mode.to_string()),
+                    );
+                    handler.push_overlay(format!(
+                        "[info] Editor mode set to {mode}. {}",
+                        if handler.vim_enabled {
+                            "Use Escape key to toggle between INSERT and NORMAL modes."
+                        } else {
+                            "Using standard (readline) keyboard bindings."
+                        }
+                    ));
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
@@ -10234,6 +10297,11 @@ fn apply_theme_choice(ctx: &mut TuiContext, handler: &mut ReplHandler, theme: &s
             let _ = fs::write(&path, updated);
         }
     }
+    // Reference: theme persists to ~/.claude.json globalConfig.
+    let _ = clawedcode_core::compat::set_global_config_value(
+        "theme",
+        serde_json::Value::String(theme.to_string()),
+    );
     handler.push_overlay(format!("[info] Theme set to {theme}"));
 }
 
@@ -13068,6 +13136,40 @@ mod command_policy_tests {
             let verbs = spinner_verbs();
             assert_eq!(verbs.len(), SPINNER_VERBS.len() + 1);
             assert_eq!(verbs.last().unwrap(), "Vibing");
+        }
+
+        #[test]
+        fn company_announcement_picks_entry() {
+            let dir = std::env::temp_dir().join(format!(
+                "clawed-announce-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let prev_home = std::env::var_os("HOME");
+            unsafe { std::env::set_var("HOME", &dir) };
+
+            // First recorded startup → first entry.
+            std::fs::write(dir.join(".claude.json"), r#"{"numStartups": 1}"#).unwrap();
+            let settings = serde_json::json!({
+                "companyAnnouncements": ["first", "second"]
+            });
+            assert_eq!(company_announcement(&settings).as_deref(), Some("first"));
+
+            // Later startups → one of the entries.
+            std::fs::write(dir.join(".claude.json"), r#"{"numStartups": 9}"#).unwrap();
+            let picked = company_announcement(&settings).unwrap();
+            assert!(picked == "first" || picked == "second");
+
+            // No setting → no announcement.
+            assert_eq!(company_announcement(&serde_json::json!({})), None);
+
+            if let Some(home) = prev_home {
+                unsafe { std::env::set_var("HOME", home) };
+            } else {
+                unsafe { std::env::remove_var("HOME") };
+            }
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }

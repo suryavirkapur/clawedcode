@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clawedcode_mcp::{McpServerConfig, discover_mcp_servers as parse_settings_mcp_servers};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -117,6 +117,36 @@ pub fn claude_json_path() -> Option<PathBuf> {
         return Some(home.join(".claude.json"));
     }
     claude_home().and_then(|d| d.parent().map(|p| p.join(".claude.json")))
+}
+
+/// Read a top-level key from ~/.claude.json — the reference's globalConfig,
+/// which stores `theme`, `editorMode`, `numStartups`, `mcpServers`, etc.
+pub fn global_config_value(key: &str) -> Option<Value> {
+    let path = claude_json_path()?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    let json: Value = serde_json::from_str(&raw).ok()?;
+    json.get(key).cloned()
+}
+
+/// Merge-set a top-level key in ~/.claude.json, creating the file when
+/// missing. Mirrors the reference's saveGlobalConfig patch semantics.
+pub fn set_global_config_value(key: &str, value: Value) -> Result<()> {
+    let Some(path) = claude_json_path() else {
+        bail!("could not resolve ~/.claude.json path");
+    };
+    let mut json: Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    if !json.is_object() {
+        json = Value::Object(Map::new());
+    }
+    json[key] = value;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&json)? + "\n")?;
+    Ok(())
 }
 
 fn discover_settings(cwd: &Path) -> Result<(Vec<PathBuf>, Value)> {
