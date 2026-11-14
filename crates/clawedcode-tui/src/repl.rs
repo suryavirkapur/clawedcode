@@ -693,7 +693,6 @@ const UNSUPPORTED_COMMANDS: &[&str] = &[
     "/mock-limits",
     "/oauth-refresh",
     "/reset-limits",
-    "/terminal-setup",
     "/ant-trace",
     "/install",
     "/issue-report",
@@ -7848,6 +7847,13 @@ PR number: {args}"#
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
+                "/terminal-setup" => {
+                    for line in terminal_setup().lines() {
+                        handler.push_overlay(format!("[info] {line}"));
+                    }
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
                 "/rewind" => {
                     let candidates = rewind_candidates(ctx);
                     if candidates.is_empty() {
@@ -7989,7 +7995,7 @@ PR number: {args}"#
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
-                "/doctor" => {
+                "/doctor" if std::env::var_os("DISABLE_DOCTOR_COMMAND").is_none() => {
                     let install = clawedcode_core::update::detect_install_method();
                     let install_label = match install {
                         clawedcode_core::update::InstallMethod::Cargo => "cargo",
@@ -8780,6 +8786,11 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
             source: CommandSource::BuiltIn,
         },
         CommandEntry {
+            name: "/terminal-setup".to_string(),
+            description: "Install Shift+Enter key binding for newlines".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
             name: "/vim".to_string(),
             description: "Toggle vim modal editing".to_string(),
             source: CommandSource::BuiltIn,
@@ -9077,7 +9088,13 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
 }
 
 fn visible_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
-    all_command_entries(ctx)
+    let mut entries = all_command_entries(ctx);
+    // DISABLE_DOCTOR_COMMAND hides /doctor entirely — the reference's
+    // isEnabled gate applies to palette and dispatch alike.
+    if std::env::var_os("DISABLE_DOCTOR_COMMAND").is_some() {
+        entries.retain(|entry| entry.name != "/doctor");
+    }
+    entries
 }
 
 fn find_visible_command_entry(ctx: &TuiContext, command: &str) -> Option<CommandEntry> {
@@ -10497,6 +10514,180 @@ fn apply_theme_choice(ctx: &mut TuiContext, handler: &mut ReplHandler, theme: &s
         serde_json::Value::String(theme.to_string()),
     );
     handler.push_overlay(format!("[info] Theme set to {theme}"));
+}
+
+/// `/terminal-setup` — installs a Shift+Enter newline binding into the
+/// terminal/editor config like the reference's terminalSetup command.
+fn terminal_setup() -> String {
+    let term = std::env::var("TERM_PROGRAM").unwrap_or_default();
+    match term.as_str() {
+        // These terminals natively speak CSI u / kitty keyboard protocol.
+        "ghostty" | "kitty" | "iTerm.app" | "WezTerm" | "WarpTerminal" => format!(
+            "Shift+Enter is natively supported in {term}.\n\nNo configuration needed. Just use Shift+Enter to add newlines."
+        ),
+        "vscode" => install_vscode_shift_enter("VSCode", "Code"),
+        "cursor" => install_vscode_shift_enter("Cursor", "Cursor"),
+        "windsurf" => install_vscode_shift_enter("Windsurf", "Windsurf"),
+        "alacritty" => install_alacritty_shift_enter(),
+        other => format!(
+            "terminal-setup isn't supported for {}. Supported: VSCode, Cursor, Windsurf, Alacritty. In other terminals use ctrl+j or \\<Enter> for newlines.",
+            if other.is_empty() { "your terminal" } else { other }
+        ),
+    }
+}
+
+/// VSCode-family keybindings.json path: `~/.config/<Dir>/User/keybindings.json`
+/// on Linux, `~/Library/Application Support/<Dir>/User/` on macOS,
+/// `%APPDATA%/<Dir>/User/` on Windows.
+fn vscode_keybindings_path(editor_dir: &str) -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+    let user_dir = if cfg!(windows) {
+        std::env::var_os("APPDATA")
+            .map(std::path::PathBuf::from)
+            .map(|p| p.join(editor_dir).join("User"))
+    } else if cfg!(target_os = "macos") {
+        Some(home.join("Library/Application Support").join(editor_dir).join("User"))
+    } else {
+        Some(home.join(".config").join(editor_dir).join("User"))
+    }?;
+    Some(user_dir.join("keybindings.json"))
+}
+
+fn install_vscode_shift_enter(editor: &str, editor_dir: &str) -> String {
+    let Some(path) = vscode_keybindings_path(editor_dir) else {
+        return format!("Could not resolve the {editor} keybindings.json path.");
+    };
+    let binding = serde_json::json!({
+        "key": "shift+enter",
+        "command": "workbench.action.terminal.sendSequence",
+        "args": { "text": "\u{1b}\r" },
+        "when": "terminalFocus"
+    });
+    let existed = path.exists();
+    let mut bindings: Vec<serde_json::Value> = if existed {
+        match std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|v| v.as_array().cloned())
+        {
+            Some(arr) => arr,
+            None => {
+                return format!(
+                    "Could not parse existing {editor} keybindings.json. Bailing out.\nSee {}",
+                    display_path(&path)
+                );
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    if bindings.iter().any(|b| {
+        b.get("key").and_then(|v| v.as_str()) == Some("shift+enter")
+            && b.get("command").and_then(|v| v.as_str())
+                == Some("workbench.action.terminal.sendSequence")
+            && b.get("when").and_then(|v| v.as_str()) == Some("terminalFocus")
+    }) {
+        return format!(
+            "Found existing {editor} terminal Shift+Enter key binding. Remove it to continue.\nSee {}",
+            display_path(&path)
+        );
+    }
+    if existed {
+        let backup = path.with_extension(format!(
+            "json.{:08x}.bak",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        if std::fs::copy(&path, &backup).is_err() {
+            return format!(
+                "Error backing up existing {editor} terminal keybindings. Bailing out.\nSee {}\nBackup path: {}",
+                display_path(&path),
+                display_path(&backup)
+            );
+        }
+    }
+    bindings.push(binding);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match serde_json::to_string_pretty(&serde_json::Value::Array(bindings)) {
+        Ok(out) if std::fs::write(&path, format!("{out}\n")).is_ok() => {
+            let _ = clawedcode_core::compat::set_global_config_value(
+                "shiftEnterKeyBindingInstalled",
+                serde_json::Value::Bool(true),
+            );
+            format!(
+                "Installed {editor} terminal Shift+Enter key binding\nSee {}",
+                display_path(&path)
+            )
+        }
+        _ => format!("Failed to install {editor} terminal Shift+Enter key binding"),
+    }
+}
+
+fn install_alacritty_shift_enter() -> String {
+    const BINDING: &str = "[[keyboard.bindings]]\nkey = \"Return\"\nmods = \"Shift\"\nchars = \"\\u001B\\r\"\n";
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+        return "Could not resolve the Alacritty config path.".to_string();
+    };
+    let mut candidates = Vec::new();
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        candidates.push(
+            std::path::PathBuf::from(xdg)
+                .join("alacritty")
+                .join("alacritty.toml"),
+        );
+    } else {
+        candidates.push(home.join(".config/alacritty/alacritty.toml"));
+    }
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        candidates.push(
+            std::path::PathBuf::from(appdata)
+                .join("alacritty")
+                .join("alacritty.toml"),
+        );
+    }
+    let (path, existing) = candidates
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok().map(|c| (p.clone(), Some(c))))
+        .unwrap_or_else(|| (candidates[0].clone(), None));
+    if let Some(content) = &existing {
+        if content.contains("mods = \"Shift\"") && content.contains("key = \"Return\"") {
+            return format!(
+                "Found existing Alacritty Shift+Enter key binding. Remove it to continue.\nSee {}",
+                display_path(&path)
+            );
+        }
+        let backup = path.with_extension("toml.bak");
+        if std::fs::copy(&path, &backup).is_err() {
+            return format!(
+                "Error backing up existing Alacritty config. Bailing out.\nSee {}",
+                display_path(&path)
+            );
+        }
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut content = existing.unwrap_or_default();
+    if !content.ends_with('\n') && !content.is_empty() {
+        content.push('\n');
+    }
+    content.push_str(BINDING);
+    if std::fs::write(&path, content).is_ok() {
+        let _ = clawedcode_core::compat::set_global_config_value(
+            "shiftEnterKeyBindingInstalled",
+            serde_json::Value::Bool(true),
+        );
+        format!(
+            "Installed Alacritty Shift+Enter key binding\nSee {}",
+            display_path(&path)
+        )
+    } else {
+        "Failed to install Alacritty Shift+Enter key binding".to_string()
+    }
 }
 
 /// Template for ~/.claude/keybindings.json — mirrors the reference's
@@ -13401,6 +13592,36 @@ mod command_policy_tests {
 
             // No setting → no announcement.
             assert_eq!(company_announcement(&serde_json::json!({})), None);
+
+            if let Some(home) = prev_home {
+                unsafe { std::env::set_var("HOME", home) };
+            } else {
+                unsafe { std::env::remove_var("HOME") };
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn vscode_shift_enter_installs_and_detects_existing() {
+            let dir = std::env::temp_dir().join(format!(
+                "clawed-termsetup-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let prev_home = std::env::var_os("HOME");
+            unsafe { std::env::set_var("HOME", &dir) };
+
+            let msg = install_vscode_shift_enter("VSCode", "Code");
+            assert!(msg.contains("Installed"), "{msg}");
+            let kb = dir.join(".config/Code/User/keybindings.json");
+            let text = std::fs::read_to_string(&kb).unwrap();
+            assert!(text.contains("shift+enter"));
+            assert!(text.contains("terminalFocus"));
+
+            // Second run detects the existing binding.
+            let msg = install_vscode_shift_enter("VSCode", "Code");
+            assert!(msg.contains("Found existing"), "{msg}");
 
             if let Some(home) = prev_home {
                 unsafe { std::env::set_var("HOME", home) };

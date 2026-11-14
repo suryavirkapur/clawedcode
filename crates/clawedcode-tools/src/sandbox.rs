@@ -368,8 +368,15 @@ pub fn wrap_spec(
 mod tests {
     use super::*;
 
+    /// Both tests mutate the global CONFIG — serialize them.
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn configure_parses_settings_shape() {
+        let _guard = test_lock();
         configure(&serde_json::json!({
             "sandbox": {
                 "enabled": true,
@@ -400,6 +407,7 @@ mod tests {
 
     #[test]
     fn wrap_spec_passthrough_when_inactive() {
+        let _guard = test_lock();
         configure(&serde_json::json!({}));
         let (program, args) = wrap_spec(
             "bash",
