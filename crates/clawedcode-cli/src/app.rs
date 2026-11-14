@@ -262,6 +262,15 @@ pub async fn execute(boot: BootstrappedApp) -> Result<()> {
 
     match mode {
         ExecutionMode::Tui => {
+            // Reference: numStartups bumps synchronously before first render
+            // so first-startup readers (announcements, tips) see the new value.
+            let startups = clawedcode_core::compat::global_config_value("numStartups")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let _ = clawedcode_core::compat::set_global_config_value(
+                "numStartups",
+                serde_json::Value::from(startups + 1),
+            );
             let sessions_dir = session_store_dir(cli.data_dir.clone())
                 .context("no sessions directory available")?;
             let mut config = config;

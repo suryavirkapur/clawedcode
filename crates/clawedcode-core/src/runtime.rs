@@ -720,9 +720,14 @@ impl Runtime {
         let limit = self.config.runtime.session_history_limit;
         // DISABLE_AUTO_COMPACT skips automatic history compaction like the
         // reference's env gate.
+        // globalConfig.autoCompactEnabled === false also disables it.
         let auto_compact_disabled = std::env::var("DISABLE_AUTO_COMPACT")
             .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || crate::compat::global_config_value("autoCompactEnabled")
+                .and_then(|v| v.as_bool())
+                .map(|enabled| !enabled)
+                .unwrap_or(false);
         let messages = if auto_compact_disabled {
             session.messages.clone()
         } else {

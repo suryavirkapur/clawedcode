@@ -1202,6 +1202,8 @@ struct ActiveTurn {
     /// `/btw` side questions stream like a normal turn but never persist —
     /// the finished rows fold into the overlay instead of the session.
     ephemeral: bool,
+    /// Wall-clock start for the post-turn "Worked for Ns" duration line.
+    started_at: std::time::Instant,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -4717,6 +4719,71 @@ fn render_question_dialog(
     );
 }
 
+/// Reference `TURN_COMPLETION_VERBS` — past-tense verbs for the post-turn
+/// "Cooked for 5s" transcript line.
+const TURN_COMPLETION_VERBS: &[&str] = &[
+    "Baked", "Brewed", "Churned", "Cogitated", "Cooked", "Crunched", "Sautéed", "Worked",
+];
+
+/// globalConfig.showTurnDuration defaults to true in the reference.
+fn show_turn_duration() -> bool {
+    clawedcode_core::compat::global_config_value("showTurnDuration")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+}
+
+/// Reference `formatDuration`: <60s → "Ns", else "Xd Yh Zm Ws" (trailing
+/// units shown, carry rounding included).
+fn format_turn_duration(ms: u128) -> String {
+    let ms = ms.min(u64::MAX as u128) as u64;
+    if ms < 60_000 {
+        return format!("{}s", ms / 1000);
+    }
+    let mut days = ms / 86_400_000;
+    let mut hours = (ms % 86_400_000) / 3_600_000;
+    let mut minutes = (ms % 3_600_000) / 60_000;
+    let mut seconds = (ms % 60_000 + 500) / 1000;
+    if seconds == 60 {
+        seconds = 0;
+        minutes += 1;
+    }
+    if minutes == 60 {
+        minutes = 0;
+        hours += 1;
+    }
+    if hours == 24 {
+        hours = 0;
+        days += 1;
+    }
+    if days > 0 {
+        format!("{days}d {hours}h {minutes}m")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// The reference's post-turn `✻ Worked for 5s` line — a random past-tense
+/// verb per message, gated by showTurnDuration.
+fn turn_completion_line(started_at: std::time::Instant) -> Option<String> {
+    if !show_turn_duration() {
+        return None;
+    }
+    let index = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as usize)
+        .unwrap_or(0)
+        % TURN_COMPLETION_VERBS.len();
+    Some(format!(
+        "✻ {} for {}",
+        TURN_COMPLETION_VERBS[index],
+        format_turn_duration(started_at.elapsed().as_millis())
+    ))
+}
+
 /// Animated "working" line above the input box: `✻ Verb… (esc to interrupt · Ns)`.
 fn spinner_lines(
     turn_started_at: Option<std::time::Instant>,
@@ -6505,6 +6572,7 @@ fn spawn_bash_worker(session: Session, command: String) -> ActiveTurn {
         interrupt_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         compacting: false,
         ephemeral: false,
+        started_at: std::time::Instant::now(),
     }
 }
 
@@ -6722,6 +6790,7 @@ fn spawn_turn_worker(
         interrupt_flag,
         compacting: false,
         ephemeral: false,
+        started_at: std::time::Instant::now(),
     }
 }
 
@@ -6804,6 +6873,9 @@ fn drain_turn_events(
                     maybe_mark_project_onboarding_complete(&ctx.session().cwd);
                     handler.clear_live_turn();
                     handler.rebuild_from_session(ctx.session(), ctx.show_thinking);
+                    if let Some(line) = turn_completion_line(turn.started_at) {
+                        handler.push_overlay(line);
+                    }
                     let _ = ctx.save_session();
                     *awaiting_approval = None;
                     finished = true;
@@ -6864,6 +6936,9 @@ fn drain_background_turns(
                         "[done] Background turn finished: {}",
                         bg.turn.label
                     ));
+                    if let Some(line) = turn_completion_line(bg.turn.started_at) {
+                        handler.push_overlay(line);
+                    }
                     finished.push(index);
                     break;
                 }
@@ -13170,6 +13245,19 @@ mod command_policy_tests {
                 unsafe { std::env::remove_var("HOME") };
             }
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn turn_duration_formats_like_reference() {
+            assert_eq!(format_turn_duration(0), "0s");
+            assert_eq!(format_turn_duration(500), "0s");
+            assert_eq!(format_turn_duration(5_000), "5s");
+            assert_eq!(format_turn_duration(59_999), "59s");
+            assert_eq!(format_turn_duration(60_000), "1m 0s");
+            assert_eq!(format_turn_duration(3_661_000), "1h 1m 1s");
+            assert_eq!(format_turn_duration(86_400_000), "1d 0h 0m");
+            // Carry-over rounding: 59.6s in the minute tail rounds to 60s.
+            assert_eq!(format_turn_duration(119_600), "2m 0s");
         }
     }
 }
