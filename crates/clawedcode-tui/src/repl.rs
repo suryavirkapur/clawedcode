@@ -7674,21 +7674,8 @@ PR number: {args}"#
                     return Ok(true);
                 }
                 "/diff" => {
-                    let cwd = ctx.session().cwd.clone();
-                    let lines = std::process::Command::new("git")
-                        .args(["diff", "--stat", "HEAD"])
-                        .current_dir(&cwd)
-                        .output()
-                        .ok()
-                        .map(|out| {
-                            String::from_utf8_lossy(&out.stdout)
-                                .lines()
-                                .map(str::to_string)
-                                .collect::<Vec<_>>()
-                        })
-                        .filter(|lines| !lines.is_empty())
-                        .unwrap_or_else(|| vec!["No uncommitted changes".to_string()]);
-                    handler.show_panel("Diff".to_string(), lines);
+                    let lines = session_diff_lines(ctx.session());
+                    handler.show_panel("Session changes".to_string(), lines);
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
@@ -8682,6 +8669,207 @@ fn find_visible_command_entry(ctx: &TuiContext, command: &str) -> Option<Command
     visible_command_entries(ctx)
         .into_iter()
         .find(|entry| entry.name == command)
+}
+
+/// Cumulative session diff like the reference's DiffDialog: earliest
+/// checkpoint snapshot per file vs the file on disk now, rendered as
+/// `---/+++`/`@@` unified hunks. Falls back to `git diff` when the session
+/// checkpointed nothing (e.g. changes made outside tool calls).
+fn session_diff_lines(session: &clawedcode_core::session::Session) -> Vec<String> {
+    // Earliest snapshot per path = the file's state before the session
+    // touched it.
+    let mut seen: std::collections::HashMap<std::path::PathBuf, Option<Vec<u8>>> =
+        std::collections::HashMap::new();
+    for checkpoint in &session.checkpoints {
+        for file in &checkpoint.files {
+            seen.entry(file.path.clone()).or_insert(file.contents.clone());
+        }
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut paths: Vec<_> = seen.keys().cloned().collect();
+    paths.sort();
+    for path in paths {
+        let before = seen.get(&path).cloned().flatten();
+        let after = std::fs::read(&path).ok();
+        if before == after {
+            continue;
+        }
+        let to_text = |bytes: &Option<Vec<u8>>| -> Option<Vec<String>> {
+            let bytes = bytes.as_ref()?;
+            if bytes.contains(&0) {
+                return None;
+            }
+            Some(
+                String::from_utf8_lossy(bytes)
+                    .lines()
+                    .map(str::to_string)
+                    .collect(),
+            )
+        };
+        let rel = path
+            .strip_prefix(&session.cwd)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| path.display().to_string());
+        match (to_text(&before), to_text(&after)) {
+            (Some(b), Some(a)) => {
+                lines.push(format!("--- a/{rel}"));
+                lines.push(format!("+++ b/{rel}"));
+                lines.extend(unified_diff(&b, &a, 3));
+            }
+            (None, Some(a)) => {
+                lines.push(format!("--- /dev/null"));
+                lines.push(format!("+++ b/{rel}"));
+                for (i, line) in a.iter().enumerate() {
+                    let _ = i;
+                    lines.push(format!("+{line}"));
+                }
+            }
+            (Some(b), None) => {
+                lines.push(format!("--- a/{rel}"));
+                lines.push(format!("+++ /dev/null"));
+                for line in &b {
+                    lines.push(format!("-{line}"));
+                }
+            }
+            _ => lines.push(format!("{rel}: binary or unreadable file changed")),
+        }
+    }
+    if lines.is_empty() {
+        // No checkpointed deltas — fall back to `git diff` so /diff still
+        // shows useful output when edits bypassed checkpointing.
+        let git = std::process::Command::new("git")
+            .args(["diff", "HEAD"])
+            .current_dir(&session.cwd)
+            .output()
+            .ok()
+            .map(|out| {
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|l| !l.is_empty());
+        match git {
+            Some(git) => lines = git,
+            None => lines.push("No changes".to_string()),
+        }
+    }
+    lines
+}
+
+/// Minimal LCS-based unified diff — `@@ -a,b +c,d @@` hunks with `context`
+/// lines of surrounding context, like `git diff` output.
+fn unified_diff(before: &[String], after: &[String], context: usize) -> Vec<String> {
+    // Edit script via LCS dynamic programming (fine for typical file sizes;
+    // bail to a whole-file replacement diff for very large inputs).
+    let (n, m) = (before.len(), after.len());
+    if n.saturating_mul(m) > 4_000_000 {
+        let mut out = vec![format!("@@ -1,{n} +1,{m} @@")];
+        out.extend(before.iter().map(|l| format!("-{l}")));
+        out.extend(after.iter().map(|l| format!("+{l}")));
+        return out;
+    }
+    let mut lcs = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            lcs[i][j] = if before[i] == after[j] {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+    // (kind, line): ' ' context, '-' removed, '+' added.
+    let mut script: Vec<(char, String)> = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < n && j < m {
+        if before[i] == after[j] {
+            script.push((' ', before[i].clone()));
+            i += 1;
+            j += 1;
+        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+            script.push(('-', before[i].clone()));
+            i += 1;
+        } else {
+            script.push(('+', after[j].clone()));
+            j += 1;
+        }
+    }
+    while i < n {
+        script.push(('-', before[i].clone()));
+        i += 1;
+    }
+    while j < m {
+        script.push(('+', after[j].clone()));
+        j += 1;
+    }
+    // (before_index, after_index) per script entry for @@ ranges.
+    let (mut bi, mut ai) = (0usize, 0usize);
+    let positions: Vec<(usize, usize)> = script
+        .iter()
+        .map(|(kind, _)| {
+            let pos = (bi, ai);
+            match kind {
+                '-' => bi += 1,
+                '+' => ai += 1,
+                _ => {
+                    bi += 1;
+                    ai += 1;
+                }
+            }
+            pos
+        })
+        .collect();
+    // Group changes into hunks with `context` lines of padding.
+    let mut out: Vec<String> = Vec::new();
+    let mut idx = 0usize;
+    while idx < script.len() {
+        if script[idx].0 == ' ' {
+            idx += 1;
+            continue;
+        }
+        let start = idx.saturating_sub(context);
+        let mut end = idx;
+        loop {
+            let mut look = end;
+            while look < script.len() && (script[look].0 != ' ' || look - end < context) {
+                look += 1;
+            }
+            if look < script.len() && script[look].0 != ' ' && look - end <= context * 2 {
+                end = look + 1;
+            } else {
+                end = (end + context).min(script.len());
+                break;
+            }
+            if end >= script.len() {
+                break;
+            }
+        }
+        let (b0, a0) = positions[start];
+        let (mut bcount, mut acount) = (0usize, 0usize);
+        let mut body: Vec<String> = Vec::new();
+        for (kind, line) in &script[start..end] {
+            match kind {
+                '-' => {
+                    bcount += 1;
+                    body.push(format!("-{line}"));
+                }
+                '+' => {
+                    acount += 1;
+                    body.push(format!("+{line}"));
+                }
+                _ => {
+                    bcount += 1;
+                    acount += 1;
+                    body.push(format!(" {line}"));
+                }
+            }
+        }
+        out.push(format!("@@ -{},{} +{},{} @@", b0 + 1, bcount, a0 + 1, acount));
+        out.extend(body);
+        idx = end;
+    }
+    out
 }
 
 /// Detects an `@token` ending at the cursor: the `@` must be at the start of
@@ -11853,6 +12041,31 @@ mod command_policy_tests {
 
         let multiline = wrap_input("a\nb", 10);
         assert_eq!(multiline, vec!["> a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn unified_diff_emits_git_style_hunks() {
+        let before: Vec<String> = (1..=10).map(|i| format!("line{i}")).collect();
+        let mut after = before.clone();
+        after[2] = "line3 changed".to_string();
+        after.remove(7);
+        let diff = unified_diff(&before, &after, 3);
+        let text = diff.join("
+");
+        assert!(text.contains("@@"), "missing hunk header: {text}");
+        assert!(text.contains("-line3"), "{text}");
+        assert!(text.contains("+line3 changed"), "{text}");
+        assert!(text.contains("-line8"), "{text}");
+        // context lines present
+        assert!(diff.iter().any(|l| l.starts_with(' ')), "{text}");
+        // A pure insertion produces only + lines.
+        let ins = unified_diff(
+            &vec!["a".to_string()],
+            &vec!["a".to_string(), "b".to_string()],
+            3,
+        );
+        assert!(ins.iter().any(|l| l == "+b"), "{ins:?}");
+        assert!(!ins.iter().any(|l| l.starts_with('-')), "{ins:?}");
     }
 
     #[test]
