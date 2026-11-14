@@ -1767,6 +1767,25 @@ fn apply_cli_session_overrides(
     {
         runtime.set_bypass_permissions_disabled(true);
     }
+
+    // sandbox.failIfUnavailable — a managed-settings hard gate: error out
+    // when sandboxing was requested but can't start (reference).
+    if clawedcode_tools::sandbox::is_active() == false
+        && clawedcode_tools::sandbox::unavailable_reason().is_some()
+    {
+        let reason = clawedcode_tools::sandbox::unavailable_reason().unwrap();
+        let fail = runtime
+            .compatibility()
+            .settings
+            .pointer("/sandbox/failIfUnavailable")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if fail {
+            anyhow::bail!("Sandbox is required but unavailable: {reason}");
+        } else {
+            eprintln!("[warning] Sandbox enabled but unavailable: {reason} — commands run unsandboxed");
+        }
+    }
     // settings permissions.defaultMode applies when no flag overrides it.
     if cli.permission_mode.is_none() && !cli.dangerously_skip_permissions {
         let mode_str = runtime

@@ -444,6 +444,8 @@ impl Runtime {
         mode: PermissionMode,
         provider: BoxedProvider,
     ) -> Self {
+        clawedcode_tools::sandbox::configure(&compatibility.settings);
+
         let mut tool_instances: HashMap<String, Box<dyn Tool>> = builtin_tool_instances()
             .into_iter()
             .map(|t| (t.name().to_string(), t))
@@ -2592,7 +2594,16 @@ impl Runtime {
 
     fn tool_policy(&self, tool_name: &str) -> Option<(bool, bool)> {
         if let Some(tool) = self.tool_instances.get(tool_name) {
-            return Some((tool.needs_approval(), is_write_like(tool_name)));
+            let needs_approval = if tool_name == "shell"
+                && clawedcode_tools::sandbox::auto_allow_active()
+            {
+                // Reference autoAllowBashIfSandboxed: sandboxed commands
+                // don't prompt (isolation replaces the approval).
+                false
+            } else {
+                tool.needs_approval()
+            };
+            return Some((needs_approval, is_write_like(tool_name)));
         }
 
         match tool_name {

@@ -1,3 +1,5 @@
+pub mod sandbox;
+
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Component, Path, PathBuf},
@@ -273,7 +275,13 @@ impl Tool for Shell {
             );
             format!("{}\n{}", trap, command)
         };
+        let disable_sandbox = input
+            .get("dangerouslyDisableSandbox")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let spec = shell_command_spec(&wrapped, bash_is_available());
+        let (program, args) = sandbox::wrap_spec(&spec.program, &spec.args, cwd, disable_sandbox);
+        let spec = ShellCommandSpec { program, args };
         let output = build_shell_command(&spec, cwd).output();
 
         match output {
@@ -766,6 +774,11 @@ pub fn builtin_tools() -> Vec<ToolSpec> {
                     "run_in_background": {
                         "type": "boolean",
                         "description": "Run the command in the background without blocking (default: false)",
+                        "default": false
+                    },
+                    "dangerouslyDisableSandbox": {
+                        "type": "boolean",
+                        "description": "Run this command outside the sandbox (only honored when sandbox.allowUnsandboxedCommands is not false)",
                         "default": false
                     }
                 },

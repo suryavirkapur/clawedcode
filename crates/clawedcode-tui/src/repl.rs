@@ -611,6 +611,7 @@ const BUILTIN_COMMANDS: &[&str] = &[
     "/btw",
     "/copy",
     "/diff",
+    "/sandbox",
     "/files",
     "/doctor",
     "/stickers",
@@ -7321,26 +7322,6 @@ fn handle_slash_command(
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
-                "/branch" => {
-                    let branch = std::process::Command::new("git")
-                        .args(["branch", "--show-current"])
-                        .current_dir(&ctx.session().cwd)
-                        .output()
-                        .ok()
-                        .and_then(|o| {
-                            if o.status.success() {
-                                String::from_utf8(o.stdout).ok()
-                            } else {
-                                None
-                            }
-                        })
-                        .map(|b| b.trim().to_string())
-                        .filter(|b| !b.is_empty())
-                        .unwrap_or_else(|| "(not a git repository or detached HEAD)".to_string());
-                    handler.show_panel("Branch".to_string(), vec![branch]);
-                    let _ = ctx.save_session();
-                    return Ok(true);
-                }
                 "/cost" => {
                     // Alias of /usage — the reference tracks cost where billing
                     // exists; this clone reports token usage instead.
@@ -7701,6 +7682,14 @@ PR number: {args}"#
                 "/diff" => {
                     let lines = session_diff_lines(ctx.session());
                     handler.show_panel("Session changes".to_string(), lines);
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
+                "/sandbox" => {
+                    handler.show_panel(
+                        "Sandbox status".to_string(),
+                        clawedcode_tools::sandbox::status_lines(),
+                    );
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
@@ -8426,6 +8415,11 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
             source: CommandSource::BuiltIn,
         },
         CommandEntry {
+            name: "/sandbox".to_string(),
+            description: "Show sandbox status".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
             name: "/branch".to_string(),
             description: "Branch the current conversation into a new session".to_string(),
             source: CommandSource::BuiltIn,
@@ -8513,6 +8507,11 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
         CommandEntry {
             name: "/env".to_string(),
             description: "Show environment info".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/sandbox".to_string(),
+            description: "Show sandbox status".to_string(),
             source: CommandSource::BuiltIn,
         },
         CommandEntry {
