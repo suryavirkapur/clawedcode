@@ -1072,7 +1072,27 @@ fn execute_plugin_install(cli: &Cli, spec: &str, scope: &str) -> Result<()> {
     }
     std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
     println!("Installed '{plugin_name}' from '{market_name}' to {}", dest.display());
+    // Reference PluginTrustWarning — fixed disclaimer plus an optional
+    // org-level pluginTrustMessage from managed settings.
+    print_plugin_trust_warning();
     Ok(())
+}
+
+/// The warning shown after plugin installs/updates in the reference,
+/// extended by the managed-settings `pluginTrustMessage` when set.
+fn print_plugin_trust_warning() {
+    let custom = compat::policy_settings()
+        .get("pluginTrustMessage")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_default();
+    let suffix = if custom.is_empty() { String::new() } else { format!(" {custom}") };
+    eprintln!(
+        "⚠ Make sure you trust a plugin before installing, updating, or using it. \
+         Anthropic does not control what MCP servers, files, or other software are \
+         included in plugins and cannot verify that they will work as intended or \
+         that they won't change.{suffix}"
+    );
 }
 
 fn execute_plugin_uninstall(cli: &Cli, spec: &str, scope: &str, keep_data: bool) -> Result<()> {
@@ -1141,6 +1161,7 @@ fn execute_plugin_update(cli: &Cli, spec: &str) -> Result<()> {
     std::fs::remove_dir_all(&dest)?;
     copy_dir_recursive(&plugin_dir, &dest)?;
     println!("Updated '{plugin_name}' from '{market_name}'");
+    print_plugin_trust_warning();
     Ok(())
 }
 
