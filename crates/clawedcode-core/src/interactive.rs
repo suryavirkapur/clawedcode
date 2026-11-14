@@ -457,12 +457,21 @@ impl TuiContext {
         self.runtime.set_permission_mode(mode);
     }
 
-    /// Claude Code-style shift+tab cycle: default → accept edits → plan → default.
+    /// Claude Code-style shift+tab cycle: default → accept edits → plan →
+    /// (bypass, when the launch flags made it available) → default.
     pub fn cycle_permission_mode(&mut self) -> PermissionMode {
+        let bypass_ok = self.runtime.bypass_permissions_available()
+            && !self.runtime.bypass_permissions_disabled();
         let next = match self.runtime.permission_mode() {
             PermissionMode::Default => PermissionMode::AcceptEdits,
             PermissionMode::AcceptEdits => PermissionMode::Plan,
-            PermissionMode::Plan => PermissionMode::Default,
+            PermissionMode::Plan => {
+                if bypass_ok {
+                    PermissionMode::Bypass
+                } else {
+                    PermissionMode::Default
+                }
+            }
             PermissionMode::Bypass => PermissionMode::Default,
         };
         self.runtime.set_permission_mode(next);
@@ -720,6 +729,23 @@ mod tests {
             PathBuf::from("/tmp"),
             PathBuf::from("/tmp/sessions"),
         )
+    }
+
+    #[test]
+    fn cycle_includes_bypass_only_when_available() {
+        let mut ctx = make_context();
+        // Default cycle never reaches Bypass.
+        ctx.set_permission_mode(PermissionMode::Plan);
+        assert_eq!(ctx.cycle_permission_mode(), PermissionMode::Default);
+        // With --allow/--dangerously-skip-permissions it joins the cycle.
+        ctx.runtime.set_bypass_permissions_available(true);
+        ctx.set_permission_mode(PermissionMode::Plan);
+        assert_eq!(ctx.cycle_permission_mode(), PermissionMode::Bypass);
+        assert_eq!(ctx.cycle_permission_mode(), PermissionMode::Default);
+        // The disable kill-switch removes it again.
+        ctx.runtime.set_bypass_permissions_disabled(true);
+        ctx.set_permission_mode(PermissionMode::Plan);
+        assert_eq!(ctx.cycle_permission_mode(), PermissionMode::Default);
     }
 
     #[derive(Default)]

@@ -40,6 +40,11 @@ pub struct PermissionEngine {
     /// `permissions.disableBypassPermissionsMode: "disable"` — Bypass can
     /// never be entered, from flags, settings, hooks, or mode cycling.
     bypass_disabled: std::cell::Cell<bool>,
+    /// `--dangerously-skip-permissions`/`--allow-dangerously-skip-permissions`
+    /// — the launch-time opt-in that makes Bypass reachable via the
+    /// shift+tab mode cycle, like the reference's
+    /// isBypassPermissionsModeAvailable.
+    bypass_available: std::cell::Cell<bool>,
 }
 
 impl PermissionEngine {
@@ -47,6 +52,7 @@ impl PermissionEngine {
         Self {
             mode: std::cell::Cell::new(mode),
             bypass_disabled: std::cell::Cell::new(false),
+            bypass_available: std::cell::Cell::new(false),
         }
     }
 
@@ -57,6 +63,14 @@ impl PermissionEngine {
     /// Whether bypassPermissions mode is disabled by settings.
     pub fn bypass_disabled(&self) -> bool {
         self.bypass_disabled.get()
+    }
+
+    pub fn bypass_available(&self) -> bool {
+        self.bypass_available.get()
+    }
+
+    pub fn set_bypass_available(&self, available: bool) {
+        self.bypass_available.set(available);
     }
 
     pub fn set_bypass_disabled(&self, disabled: bool) {

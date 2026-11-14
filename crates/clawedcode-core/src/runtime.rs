@@ -869,6 +869,16 @@ impl Runtime {
         self.permission_engine.bypass_disabled()
     }
 
+    /// Whether the launch flags opted into Bypass availability — the
+    /// reference's isBypassPermissionsModeAvailable gate for cycling.
+    pub fn bypass_permissions_available(&self) -> bool {
+        self.permission_engine.bypass_available()
+    }
+
+    pub fn set_bypass_permissions_available(&self, available: bool) {
+        self.permission_engine.set_bypass_available(available);
+    }
+
     /// Apply a hook-provided `updatedPermissions` entry — `session`/`cliArg`
     /// destinations land on the session, file destinations rewrite the
     /// matching settings file like the reference.

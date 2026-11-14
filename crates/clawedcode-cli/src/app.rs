@@ -1793,6 +1793,9 @@ fn apply_cli_session_overrides(
             runtime.set_permission_mode(parsed);
         }
     }
+    if cli.dangerously_skip_permissions || cli.allow_dangerously_skip_permissions {
+        runtime.set_bypass_permissions_available(true);
+    }
     if cli.dangerously_skip_permissions && cli.permission_mode.is_none() {
         runtime.set_permission_mode(PermissionMode::Bypass);
     }

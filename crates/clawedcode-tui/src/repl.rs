@@ -2024,6 +2024,9 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                     match key.code {
                         KeyCode::Char('y') | KeyCode::Char('Y') => {
                             let _ = clawedcode_core::compat::persist_bypass_acceptance();
+                            ctx.set_permission_mode(
+                                clawedcode_core::permissions::PermissionMode::Bypass,
+                            );
                             handler.bypass_confirm = false;
                             handler.push_overlay(
                                 "[info] Bypass permissions on — acceptance recorded".to_string(),
@@ -2368,9 +2371,19 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                             // Reference confirm:cycleMode — Shift+Tab cycles the
                             // permission mode from inside file permission dialogs.
                             let mode = ctx.cycle_permission_mode();
+                            if mode == clawedcode_core::permissions::PermissionMode::Bypass
+                                && !clawedcode_core::compat::bypass_dialog_accepted(
+                                    &ctx.session().cwd,
+                                )
+                            {
+                                ctx.set_permission_mode(
+                                    clawedcode_core::permissions::PermissionMode::Default,
+                                );
+                                handler.bypass_confirm = true;
+                            }
                             handler.push_overlay(format!(
                                 "[info] {} (shift+tab to cycle)",
-                                permission_mode_label(mode)
+                                permission_mode_label(ctx.permission_mode())
                             ));
                         }
                         KeyCode::Tab => {
@@ -2983,6 +2996,17 @@ fn run_loop(mut terminal: DefaultTerminal, ctx: &mut TuiContext) -> Result<()> {
                     }
                     KeyCode::BackTab if key.modifiers.contains(KeyModifiers::SHIFT) => {
                         ctx.cycle_permission_mode();
+                        if ctx.permission_mode()
+                            == clawedcode_core::permissions::PermissionMode::Bypass
+                            && !clawedcode_core::compat::bypass_dialog_accepted(
+                                &ctx.session().cwd,
+                            )
+                        {
+                            ctx.set_permission_mode(
+                                clawedcode_core::permissions::PermissionMode::Default,
+                            );
+                            handler.bypass_confirm = true;
+                        }
                         handler.push_overlay(format!(
                             "[info] {} (shift+tab to cycle)",
                             permission_mode_label(ctx.permission_mode())
