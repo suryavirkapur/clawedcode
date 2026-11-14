@@ -1720,6 +1720,9 @@ fn apply_cli_config_overrides(config: &mut AppConfig, cli: &Cli) {
             );
         }
     }
+    if cli.verbose {
+        unsafe { std::env::set_var("CLAWEDCODE_VERBOSE", "1") };
+    }
     if let Some(turns) = cli.max_turns {
         config.runtime.max_turns = turns;
     }
@@ -2267,10 +2270,16 @@ where
                         in_thinking = false;
                     }
                     eprintln!("\n[tool] {} {}", tool_use.name, tool_use.id);
+                    if std::env::var_os("CLAWEDCODE_VERBOSE").is_some() {
+                        eprintln!("  input: {}", tool_use.input);
+                    }
                 }
                 ApiEvent::ToolResult { tool_result } => {
                     let status = if tool_result.is_error { "error" } else { "ok" };
                     eprintln!("[tool_result:{}] {}", status, tool_result.tool_use_id);
+                    if std::env::var_os("CLAWEDCODE_VERBOSE").is_some() {
+                        eprintln!("  {}", tool_result.content.replace('\n', "\n  "));
+                    }
                 }
                 ApiEvent::Usage { usage } => {
                     eprintln!(

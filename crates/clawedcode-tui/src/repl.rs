@@ -4719,6 +4719,18 @@ fn render_question_dialog(
     );
 }
 
+/// `--verbose` / globalConfig.verbose — tool results render expanded by
+/// default like the reference's verbose mode. Cached: it reads a file.
+fn verbose_mode() -> bool {
+    static VERBOSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VERBOSE.get_or_init(|| {
+        std::env::var_os("CLAWEDCODE_VERBOSE").is_some()
+            || clawedcode_core::compat::global_config_value("verbose")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+    })
+}
+
 /// Reference `TURN_COMPLETION_VERBS` — past-tense verbs for the post-turn
 /// "Cooked for 5s" transcript line.
 const TURN_COMPLETION_VERBS: &[&str] = &[
@@ -5812,7 +5824,7 @@ fn render_tool_result(
     is_error: bool,
     expanded_tools: &std::collections::HashSet<String>,
 ) -> Vec<Line<'static>> {
-    let is_expanded = expanded_tools.contains(tool_use_id);
+    let is_expanded = expanded_tools.contains(tool_use_id) || verbose_mode();
     let body_color = if is_error { pal().err_fg } else { pal().dim };
     let hook_color = if is_error { pal().err_fg } else { pal().muted };
 
@@ -7802,8 +7814,37 @@ PR number: {args}"#
                     return Ok(true);
                 }
                 "/keybindings" => {
-                    let panel = help_panel(ctx);
-                    handler.show_panel(panel.title, panel.lines);
+                    // Reference: creates ~/.claude/keybindings.json from a
+                    // template when missing, then opens it in $VISUAL/$EDITOR.
+                    let Some(home) = clawedcode_core::compat::claude_home() else {
+                        handler.push_overlay(
+                            "[error] Could not resolve ~/.claude".to_string(),
+                        );
+                        return Ok(true);
+                    };
+                    let path = home.join("keybindings.json");
+                    let existed = path.exists();
+                    if !existed {
+                        let _ = std::fs::create_dir_all(&home);
+                        if let Err(err) = std::fs::write(&path, KEYBINDINGS_TEMPLATE) {
+                            handler.push_overlay(format!(
+                                "[error] Could not create {}: {err}",
+                                display_path(&path)
+                            ));
+                            return Ok(true);
+                        }
+                    }
+                    let verb = if existed { "Opened" } else { "Created" };
+                    match open_path_in_editor(&path) {
+                        Ok(()) => handler.push_overlay(format!(
+                            "[info] {verb} {} in your editor.",
+                            display_path(&path)
+                        )),
+                        Err(err) => handler.push_overlay(format!(
+                            "[info] {verb} {}. Could not open in editor: {err}",
+                            display_path(&path)
+                        )),
+                    }
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
@@ -7949,33 +7990,111 @@ PR number: {args}"#
                     return Ok(true);
                 }
                 "/doctor" => {
+                    let install = clawedcode_core::update::detect_install_method();
+                    let install_label = match install {
+                        clawedcode_core::update::InstallMethod::Cargo => "cargo",
+                        clawedcode_core::update::InstallMethod::Npm => "npm",
+                        clawedcode_core::update::InstallMethod::LocalBuild => {
+                            "local build"
+                        }
+                        clawedcode_core::update::InstallMethod::Unknown => "unknown",
+                    };
+                    let updates_disabled = std::env::var("DISABLE_AUTOUPDATER")
+                        .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+                        .unwrap_or(false);
+                    let channel = ctx
+                        .runtime
+                        .compatibility()
+                        .settings
+                        .get("autoUpdatesChannel")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("latest");
                     let mut lines = vec![
-                        format!("ClawedCode v{}", env!("CARGO_PKG_VERSION")),
-                        format!("Model: {} · {}", ctx.model_name(), provider_label()),
+                        "Installation".to_string(),
+                        format!("  Version: {}", env!("CARGO_PKG_VERSION")),
+                        format!("  Install method: {install_label}"),
+                        format!("  Model: {} · {}", ctx.model_name(), provider_label()),
+                        format!("  Working dir: {}", display_path(&ctx.session().cwd)),
                         format!(
-                            "Config: {}",
-                            clawedcode_core::config::default_config_path()
-                                .map(|p| display_path(&p))
-                                .unwrap_or_else(|| "(none)".to_string())
-                        ),
-                        format!("Working dir: {}", display_path(&ctx.session().cwd)),
-                        format!(
-                            "Git repo: {}",
+                            "  Git repo: {}",
                             if ctx.session().cwd.join(".git").exists() {
                                 "yes"
                             } else {
                                 "no"
                             }
                         ),
-                        format!("Sessions: {}", display_path(&ctx.sessions_dir)),
+                        String::new(),
+                        "Updates".to_string(),
+                        format!(
+                            "  Auto-updates: {}",
+                            if updates_disabled {
+                                "disabled (DISABLE_AUTOUPDATER)"
+                            } else if matches!(
+                                install,
+                                clawedcode_core::update::InstallMethod::LocalBuild
+                            ) {
+                                "unsupported (local build)"
+                            } else {
+                                "enabled"
+                            }
+                        ),
+                        format!("  Auto-update channel: {channel}"),
+                        String::new(),
+                        "Settings".to_string(),
                     ];
+                    let files = &ctx.runtime.compatibility().settings_files;
+                    if files.is_empty() {
+                        lines.push("  (no settings files found)".to_string());
+                    } else {
+                        for file in files {
+                            lines.push(format!("  {}", display_path(file)));
+                        }
+                    }
+                    let managed = clawedcode_core::compat::managed_settings_paths();
+                    if !managed.is_empty() {
+                        for file in managed {
+                            lines.push(format!("  {} (managed)", display_path(&file)));
+                        }
+                    }
+                    lines.push(String::new());
+                    let servers = &ctx.runtime.compatibility().mcp_servers;
+                    lines.push(format!("MCP servers: {}", servers.len()));
+                    for name in servers.keys() {
+                        lines.push(format!("  {name}"));
+                    }
+                    lines.push(String::new());
+                    let sandbox = &ctx
+                        .runtime
+                        .compatibility()
+                        .settings
+                        .get("sandbox")
+                        .cloned()
+                        .unwrap_or_default();
+                    let sandbox_enabled = sandbox
+                        .get("enabled")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    lines.push(format!(
+                        "Sandbox: {}",
+                        if sandbox_enabled {
+                            if clawedcode_tools::sandbox::is_available() {
+                                "enabled (bwrap available)"
+                            } else {
+                                "enabled but bubblewrap unavailable"
+                            }
+                        } else {
+                            "disabled"
+                        }
+                    ));
                     let key_env = ctx.provider_api_key_env().to_string();
                     let key_status = if std::env::var(&key_env).is_ok() {
                         "set"
                     } else {
                         "not set"
                     };
-                    lines.push(format!("API key env {key_env}: {key_status}"));
+                    lines.push(String::new());
+                    lines.push("Environment".to_string());
+                    lines.push(format!("  API key env {key_env}: {key_status}"));
                     handler.show_panel("Doctor".to_string(), lines);
                     let _ = ctx.save_session();
                     return Ok(true);
@@ -10379,6 +10498,50 @@ fn apply_theme_choice(ctx: &mut TuiContext, handler: &mut ReplHandler, theme: &s
     );
     handler.push_overlay(format!("[info] Theme set to {theme}"));
 }
+
+/// Template for ~/.claude/keybindings.json — mirrors the reference's
+/// generateKeybindingsTemplate shape (context blocks of key → action).
+const KEYBINDINGS_TEMPLATE: &str = r#"{
+  "$schema": "https://www.schemastore.org/claude-code-keybindings.json",
+  "$docs": "https://code.claude.com/docs/en/keybindings",
+  "bindings": [
+    {
+      "context": "Global",
+      "bindings": {
+        "ctrl+c": "app:interrupt",
+        "ctrl+d": "app:exit",
+        "ctrl+l": "app:redraw",
+        "ctrl+t": "app:toggleTodos",
+        "ctrl+o": "app:toggleTranscript",
+        "ctrl+r": "history:search"
+      }
+    },
+    {
+      "context": "Chat",
+      "bindings": {
+        "escape": "chat:cancel",
+        "ctrl+x ctrl+k": "chat:killAgents",
+        "shift+tab": "chat:cycleMode",
+        "meta+p": "chat:modelPicker",
+        "meta+o": "chat:fastMode",
+        "meta+t": "chat:thinkingToggle",
+        "enter": "chat:submit",
+        "up": "history:previous",
+        "down": "history:next",
+        "ctrl+b": "chat:background"
+      }
+    },
+    {
+      "context": "Transcript",
+      "bindings": {
+        "ctrl+o": "transcript:toggle",
+        "ctrl+r": "transcript:search",
+        "shift+up": "transcript:messageActions"
+      }
+    }
+  ]
+}
+"#;
 
 const SECURITY_REVIEW_TEMPLATE: &str = r#"You are a senior security engineer conducting a focused security review of the changes on this branch.
 
