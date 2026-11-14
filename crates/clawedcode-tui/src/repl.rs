@@ -612,6 +612,7 @@ const BUILTIN_COMMANDS: &[&str] = &[
     "/copy",
     "/diff",
     "/sandbox",
+    "/sandbox-toggle",
     "/files",
     "/doctor",
     "/stickers",
@@ -674,7 +675,6 @@ const UNSUPPORTED_COMMANDS: &[&str] = &[
     "/install-github-app",
     "/install-slack-app",
     "/privacy-settings",
-    "/sandbox-toggle",
     "/remote-env",
     "/remote-setup",
     "/thinkback",
@@ -7693,6 +7693,74 @@ PR number: {args}"#
                     let _ = ctx.save_session();
                     return Ok(true);
                 }
+                "/sandbox-toggle" => {
+                    // Reference commands/sandbox-toggle: bare → settings
+                    // panel; `exclude <pattern>` appends to
+                    // sandbox.excludedCommands in local settings.
+                    let args = prompt
+                        .strip_prefix("/sandbox-toggle")
+                        .map(str::trim)
+                        .unwrap_or_default();
+                    if let Some(pattern) = args.strip_prefix("exclude").map(str::trim)
+                        && !pattern.is_empty()
+                    {
+                        let clean = pattern.trim_matches(|c| c == '"' || c == '\'');
+                        let settings_path = ctx
+                            .session()
+                            .cwd
+                            .join(".claude")
+                            .join("settings.local.json");
+                        let mut json: serde_json::Value = std::fs::read_to_string(&settings_path)
+                            .ok()
+                            .and_then(|t| serde_json::from_str(&t).ok())
+                            .unwrap_or_else(|| serde_json::json!({}));
+                        if !json.is_object() {
+                            json = serde_json::json!({});
+                        }
+                        let list = json
+                            .pointer_mut("/sandbox/excludedCommands")
+                            .and_then(|v| v.as_array_mut());
+                        let list = match list {
+                            Some(l) => l,
+                            None => {
+                                json["sandbox"] = serde_json::json!({"excludedCommands": []});
+                                json.pointer_mut("/sandbox/excludedCommands")
+                                    .and_then(|v| v.as_array_mut())
+                                    .unwrap()
+                            }
+                        };
+                        if !list.iter().any(|v| v.as_str() == Some(clean)) {
+                            list.push(serde_json::Value::String(clean.to_string()));
+                        }
+                        let _ = std::fs::create_dir_all(settings_path.parent().unwrap());
+                        match std::fs::write(&settings_path, serde_json::to_string_pretty(&json).unwrap()) {
+                            Ok(()) => {
+                                // Re-apply sandbox settings so the exclusion
+                                // takes effect this session.
+                                let mut settings = ctx.runtime.compatibility().settings.clone();
+                                if let serde_json::Value::Object(map) = &mut settings {
+                                    map.insert("sandbox".to_string(), json["sandbox"].clone());
+                                }
+                                clawedcode_tools::sandbox::configure(&settings);
+                                handler.push_overlay(format!(
+                                    "[info] Added `{clean}` to excluded commands in .claude/settings.local.json"
+                                ));
+                            }
+                            Err(e) => handler.push_overlay(format!("[error] {e}")),
+                        }
+                    } else if args.starts_with("exclude") {
+                        handler.push_overlay(
+                            "[info] Usage: /sandbox-toggle exclude <pattern>".to_string(),
+                        );
+                    } else {
+                        handler.show_panel(
+                            "Sandbox settings".to_string(),
+                            clawedcode_tools::sandbox::status_lines(),
+                        );
+                    }
+                    let _ = ctx.save_session();
+                    return Ok(true);
+                }
                 "/files" => {
                     // Files the model has read this session, like the
                     // reference's `/files` context listing.
@@ -8420,6 +8488,11 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
             source: CommandSource::BuiltIn,
         },
         CommandEntry {
+            name: "/sandbox-toggle".to_string(),
+            description: "Manage sandbox settings (exclude <pattern>)".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
             name: "/branch".to_string(),
             description: "Branch the current conversation into a new session".to_string(),
             source: CommandSource::BuiltIn,
@@ -8512,6 +8585,11 @@ fn all_command_entries(ctx: &TuiContext) -> Vec<CommandEntry> {
         CommandEntry {
             name: "/sandbox".to_string(),
             description: "Show sandbox status".to_string(),
+            source: CommandSource::BuiltIn,
+        },
+        CommandEntry {
+            name: "/sandbox-toggle".to_string(),
+            description: "Manage sandbox settings (exclude <pattern>)".to_string(),
             source: CommandSource::BuiltIn,
         },
         CommandEntry {

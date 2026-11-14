@@ -280,7 +280,8 @@ impl Tool for Shell {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let spec = shell_command_spec(&wrapped, bash_is_available());
-        let (program, args) = sandbox::wrap_spec(&spec.program, &spec.args, cwd, disable_sandbox);
+        let (program, args) =
+            sandbox::wrap_spec(&spec.program, &spec.args, cwd, disable_sandbox, command);
         let spec = ShellCommandSpec { program, args };
         let output = build_shell_command(&spec, cwd).output();
 

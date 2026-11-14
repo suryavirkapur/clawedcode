@@ -24,6 +24,8 @@ pub struct SandboxConfig {
     /// Undocumented passthrough: `enabledPlatforms` restricts platforms
     /// (e.g. ["macos"]). None means every supported platform.
     pub enabled_platforms: Option<Vec<String>>,
+    /// `excludedCommands` — command patterns that skip the sandbox.
+    pub excluded_commands: Vec<String>,
 }
 
 impl Default for SandboxConfig {
@@ -36,6 +38,7 @@ impl Default for SandboxConfig {
             allow_write: Vec::new(),
             deny_write: Vec::new(),
             enabled_platforms: None,
+            excluded_commands: Vec::new(),
         }
     }
 }
@@ -93,6 +96,11 @@ pub fn configure(settings: &Value) {
     };
     cfg.allow_write = paths("allowWrite");
     cfg.deny_write = paths("denyWrite");
+    cfg.excluded_commands = sandbox
+        .get("excludedCommands")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
     // The reference deny-writes the project's own settings + skills inside
     // the sandbox so a sandboxed agent can't rewrite its permissions.
     cfg.deny_write.push(PathBuf::from(".claude/settings.json"));
@@ -184,6 +192,115 @@ pub fn status_lines() -> Vec<String> {
     lines
 }
 
+/// `sandbox.excludedCommands` — the reference's shouldUseSandbox check:
+/// split compound commands, strip env-var/wrapper prefixes, then match
+/// each subcommand against `name:*` prefix, exact, or `*` wildcard
+/// patterns. Convenience only, not a security boundary.
+pub fn is_command_excluded(command: &str) -> bool {
+    let cfg = config();
+    if cfg.excluded_commands.is_empty() {
+        return false;
+    }
+    for sub in split_compound(command) {
+        for cand in stripped_candidates(&sub) {
+            for pattern in &cfg.excluded_commands {
+                if pattern_matches_command(pattern, &cand) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn split_compound(command: &str) -> Vec<String> {
+    command
+        .split(|c| matches!(c, ';' | '|'))
+        .flat_map(|seg| seg.split("&&"))
+        .map(|seg| seg.trim().to_string())
+        .filter(|seg| !seg.is_empty())
+        .collect()
+}
+
+/// Strip leading `VAR=value` pairs and wrapper prefixes (`timeout N`,
+/// `sudo`, `env`, `nice`, `nohup`) to a fixed point — like the reference's
+/// candidates loop.
+fn stripped_candidates(sub: &str) -> Vec<String> {
+    let mut out = vec![sub.to_string()];
+    let mut idx = 0;
+    while idx < out.len() {
+        let cand = out[idx].clone();
+        idx += 1;
+        let mut words = cand.split_whitespace().peekable();
+        // env vars
+        while let Some(w) = words.peek() {
+            if w.contains('=') && !w.starts_with('-') {
+                words.next();
+            } else {
+                break;
+            }
+        }
+        // wrappers
+        loop {
+            match words.peek().copied() {
+                Some("sudo") | Some("nohup") | Some("nice") | Some("env") => {
+                    words.next();
+                }
+                Some("timeout") => {
+                    words.next();
+                    words.next(); // duration
+                }
+                _ => break,
+            }
+        }
+        let stripped: Vec<&str> = words.collect();
+        let stripped = stripped.join(" ");
+        if !stripped.is_empty() && stripped != cand && !out.contains(&stripped) {
+            out.push(stripped);
+        }
+    }
+    out
+}
+
+fn pattern_matches_command(pattern: &str, command: &str) -> bool {
+    if let Some(prefix) = pattern.strip_suffix(":*") {
+        return command == prefix || command.starts_with(&format!("{prefix} "));
+    }
+    if pattern.contains('*') {
+        return wildcard_match(pattern, command);
+    }
+    pattern == command
+}
+
+/// Glob matcher where `*` spans any characters (incl. spaces) — like the
+/// reference's matchWildcardPattern on the whole command string.
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star_p, mut star_t) = (usize::MAX, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_p = pi;
+            star_t = ti;
+            pi += 1;
+        } else if star_p != usize::MAX {
+            pi = star_p + 1;
+            star_t += 1;
+            ti = star_t;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
 /// Wrap a shell spec in `bwrap` when the sandbox is active and the caller
 /// didn't legitimately disable it. Returns the (possibly rewritten)
 /// program + args.
@@ -192,8 +309,9 @@ pub fn wrap_spec(
     args: &[String],
     cwd: &Path,
     dangerously_disable_sandbox: bool,
+    raw_command: &str,
 ) -> (String, Vec<String>) {
-    if !is_active() {
+    if !is_active() || is_command_excluded(raw_command) {
         return (program.to_string(), args.to_vec());
     }
     let cfg = config();
@@ -288,6 +406,7 @@ mod tests {
             &["-lc".to_string(), "echo hi".to_string()],
             Path::new("/tmp"),
             false,
+            "echo hi",
         );
         assert_eq!(program, "bash");
         assert_eq!(args.len(), 2);
