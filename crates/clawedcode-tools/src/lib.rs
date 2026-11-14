@@ -199,7 +199,17 @@ impl Tool for ReadFile {
 /// Runs a shell command in cwd.
 pub struct Shell;
 
-const SHELL_MAX_OUTPUT_BYTES: usize = 128 * 1024; // 128 KB
+const SHELL_MAX_OUTPUT_BYTES_DEFAULT: usize = 128 * 1024; // 128 KB
+
+/// BASH_MAX_OUTPUT_LENGTH overrides the shell output cap like the
+/// reference's shell outputLimits.
+fn shell_max_output_bytes() -> usize {
+    std::env::var("BASH_MAX_OUTPUT_LENGTH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(SHELL_MAX_OUTPUT_BYTES_DEFAULT)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ShellCommandSpec {
@@ -294,13 +304,13 @@ impl Tool for Shell {
                 let (stdout, new_cwd) = extract_cwd_sentinel(&stdout, cwd);
 
                 if !stdout.is_empty() {
-                    content.push_str(&truncate(&stdout, SHELL_MAX_OUTPUT_BYTES));
+                    content.push_str(&truncate(&stdout, shell_max_output_bytes()));
                 }
                 if !stderr.is_empty() {
                     if !content.is_empty() {
                         content.push_str("\n--- stderr ---\n");
                     }
-                    content.push_str(&truncate(&stderr, SHELL_MAX_OUTPUT_BYTES));
+                    content.push_str(&truncate(&stderr, shell_max_output_bytes()));
                 }
                 if content.is_empty() {
                     content = format!("(exit {})", out.status.code().unwrap_or(-1));

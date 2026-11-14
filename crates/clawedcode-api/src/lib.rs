@@ -231,9 +231,15 @@ pub struct TimeoutConfig {
 
 impl Default for TimeoutConfig {
     fn default() -> Self {
-        Self {
-            per_request: Duration::from_secs(60),
-        }
+        // API_TIMEOUT_MS overrides the per-request deadline like the
+        // reference's client timeout (default 10m there).
+        let per_request = std::env::var("API_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| Duration::from_secs(60));
+        Self { per_request }
     }
 }
 
