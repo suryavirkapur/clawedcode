@@ -112,6 +112,20 @@ pub fn plan_self_update() -> Result<UpdatePlan> {
 
 pub fn run_self_update() -> Result<UpdateOutcome> {
     let plan = plan_self_update()?;
+    // settings.minimumVersion: skip the update when the resolved target
+    // version is below the managed minimum, like the reference's
+    // shouldSkipVersion in the native installer.
+    if plan.method == InstallMethod::Npm {
+        if let Some(min) = minimum_version_setting() {
+            if let Some(target) = resolve_npm_target_version(&plan) {
+                if version_lt(&target, &min) {
+                    bail!(
+                        "update to {target} skipped — below minimumVersion {min}"
+                    );
+                }
+            }
+        }
+    }
     let command = render_update_command(&plan.program, &plan.args);
     let status = Command::new(&plan.program)
         .args(&plan.args)
@@ -133,6 +147,56 @@ pub fn run_self_update() -> Result<UpdateOutcome> {
         method: plan.method,
         command,
     })
+}
+
+/// `settings.minimumVersion` from the user settings file.
+fn minimum_version_setting() -> Option<String> {
+    let home = crate::compat::claude_home()?;
+    let text = std::fs::read_to_string(home.join("settings.json")).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    json.get("minimumVersion")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// Ask npm which version `clawedcode@<tag>` resolves to — the version the
+/// install would fetch. `npm view <spec> version` prints it on stdout.
+fn resolve_npm_target_version(plan: &UpdatePlan) -> Option<String> {
+    let spec = plan
+        .args
+        .iter()
+        .find(|a| a.starts_with("clawedcode@"))?
+        .clone();
+    let out = Command::new(&plan.program)
+        .args(["view", &spec, "version"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(out.stdout).ok()?;
+    text.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
+}
+
+/// Numeric semver-ish compare: `a < b` on dot-separated numeric components.
+fn version_lt(a: &str, b: &str) -> bool {
+    let parse = |v: &str| -> Vec<u64> {
+        v.trim_start_matches('v')
+            .split(&['.', '-'][..])
+            .filter_map(|p| p.parse::<u64>().ok())
+            .collect()
+    };
+    let (a, b) = (parse(a), parse(b));
+    for i in 0..a.len().max(b.len()) {
+        let (x, y) = (a.get(i).copied().unwrap_or(0), b.get(i).copied().unwrap_or(0));
+        if x != y {
+            return x < y;
+        }
+    }
+    false
 }
 
 fn update_channel_from_settings() -> Option<String> {
@@ -237,6 +301,16 @@ mod tests {
         );
 
         unsafe { std::env::remove_var("CLAWEDCODE_INSTALL_METHOD") };
+    }
+
+    #[test]
+    fn version_lt_compares_numeric_components() {
+        assert!(version_lt("1.2.3", "1.2.4"));
+        assert!(version_lt("1.2", "1.2.1"));
+        assert!(version_lt("0.9.9", "1.0.0"));
+        assert!(!version_lt("1.2.4", "1.2.3"));
+        assert!(!version_lt("1.2.3", "1.2.3"));
+        assert!(version_lt("v1.2.3", "1.2.4"));
     }
 
     #[test]
