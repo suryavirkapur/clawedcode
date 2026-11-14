@@ -117,6 +117,10 @@ pub fn settings_file_paths(cwd: &Path) -> Vec<PathBuf> {
         paths.push(cwd.join(".claude").join("settings.local.json"));
     }
     paths.extend(extra);
+    // Managed (policy) settings come last — highest precedence.
+    if wants("managed") {
+        paths.extend(crate::compat::managed_settings_paths());
+    }
     paths
 }
 
@@ -127,7 +131,18 @@ pub fn load_hooks(cwd: &Path) -> HooksConfig {
         config.disabled = true;
         return config;
     }
-    for path in settings_file_paths(cwd) {
+    // allowManagedHooksOnly (managed settings): only managed-settings hooks
+    // load — user/project/local/flag hook definitions are ignored.
+    let managed_only = crate::compat::policy_settings()
+        .get("allowManagedHooksOnly")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let paths = if managed_only {
+        crate::compat::managed_settings_paths()
+    } else {
+        settings_file_paths(cwd)
+    };
+    for path in paths {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
@@ -1570,6 +1585,43 @@ mod tests {
             PreHookOutcome::Allow => {}
             _ => panic!("expected allow"),
         }
+    }
+
+    #[test]
+    fn managed_hooks_only_ignores_local_settings() {
+        let _guard = crate::test_support::env_lock();
+        let base = std::env::temp_dir().join(format!(
+            "clawed_managed_hooks_{}",
+            std::process::id()
+        ));
+        let fake_home = base.join("home");
+        let managed = base.join("managed");
+        let dir = base.join("proj");
+        std::fs::create_dir_all(&fake_home).unwrap();
+        std::fs::create_dir_all(&managed).unwrap();
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        unsafe {
+            std::env::set_var("HOME", &fake_home);
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+            std::env::set_var("CLAUDE_CODE_MANAGED_SETTINGS_PATH", &managed);
+        }
+        // Local settings define a hook that must be ignored.
+        std::fs::write(
+            dir.join(".claude/settings.local.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"exit 2"}]}]}}"#,
+        )
+        .unwrap();
+        // Managed settings enable the gate and provide the only hook.
+        std::fs::write(
+            managed.join("managed-settings.json"),
+            r#"{"allowManagedHooksOnly":true,"hooks":{"PreToolUse":[{"matcher":"read_file","hooks":[{"type":"command","command":"exit 2"}]}]}}"#,
+        )
+        .unwrap();
+        let config = load_hooks(&dir);
+        assert_eq!(config.hooks.len(), 1);
+        assert_eq!(config.hooks[0].matcher.as_deref(), Some("read_file"));
+        unsafe { std::env::remove_var("CLAUDE_CODE_MANAGED_SETTINGS_PATH") };
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

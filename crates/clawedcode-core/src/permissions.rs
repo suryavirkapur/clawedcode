@@ -215,7 +215,18 @@ pub fn load_permission_rules(cwd: &std::path::Path) -> PermissionRules {
     if std::env::var_os("CLAWEDCODE_SIMPLE").is_some() {
         return rules;
     }
-    for path in crate::hooks::settings_file_paths(cwd) {
+    // allowManagedPermissionRulesOnly (managed settings): only managed
+    // permission rules apply — user/project/local rules are ignored.
+    let managed_only = crate::compat::policy_settings()
+        .get("allowManagedPermissionRulesOnly")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let paths = if managed_only {
+        crate::compat::managed_settings_paths()
+    } else {
+        crate::hooks::settings_file_paths(cwd)
+    };
+    for path in paths {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };

@@ -56,6 +56,7 @@ pub fn bypass_dialog_accepted(cwd: &Path) -> bool {
     if let Some(flag) = std::env::var_os("CLAWEDCODE_SETTINGS") {
         paths.push(PathBuf::from(flag));
     }
+    paths.extend(managed_settings_paths());
     paths.iter().any(|path| {
         std::fs::read_to_string(path)
             .ok()
@@ -149,6 +150,59 @@ pub fn set_global_config_value(key: &str, value: Value) -> Result<()> {
     Ok(())
 }
 
+/// Managed-settings directory — the reference's getManagedFilePath:
+/// CLAUDE_CODE_MANAGED_SETTINGS_PATH override, else the platform path.
+fn managed_settings_dir() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("CLAUDE_CODE_MANAGED_SETTINGS_PATH") {
+        return Some(PathBuf::from(path));
+    }
+    if cfg!(target_os = "macos") {
+        Some(PathBuf::from("/Library/Application Support/ClaudeCode"))
+    } else if cfg!(windows) {
+        Some(PathBuf::from("C:\\Program Files\\ClaudeCode"))
+    } else {
+        Some(PathBuf::from("/etc/claude-code"))
+    }
+}
+
+/// Managed settings files in merge order: `managed-settings.json` first,
+/// then `managed-settings.d/*.json` alphabetically (drop-ins override base).
+pub fn managed_settings_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let Some(dir) = managed_settings_dir() else {
+        return paths;
+    };
+    let base = dir.join("managed-settings.json");
+    if base.exists() {
+        paths.push(base);
+    }
+    let drop_in = dir.join("managed-settings.d");
+    if let Ok(entries) = std::fs::read_dir(&drop_in) {
+        let mut jsons: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "json") && p.is_file())
+            .collect();
+        jsons.sort();
+        paths.extend(jsons);
+    }
+    paths
+}
+
+/// Merged view of just the managed (policy) settings files — used by the
+/// `allowManaged*Only` policy gates and trusted-source checks.
+pub fn policy_settings() -> Value {
+    let mut merged = Value::Object(Map::new());
+    for path in managed_settings_paths() {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                deep_merge(&mut merged, value);
+            }
+        }
+    }
+    merged
+}
+
 fn discover_settings(cwd: &Path) -> Result<(Vec<PathBuf>, Value)> {
     let mut files = Vec::new();
     let mut merged = Value::Object(Map::new());
@@ -159,6 +213,12 @@ fn discover_settings(cwd: &Path) -> Result<(Vec<PathBuf>, Value)> {
             deep_merge(&mut merged, value);
             files.push(path);
         }
+    }
+    // Policy settings merge last — highest precedence in the reference.
+    for path in managed_settings_paths() {
+        let value = read_json_file(&path)?;
+        deep_merge(&mut merged, value);
+        files.push(path);
     }
 
     Ok((files, merged))
@@ -1601,6 +1661,14 @@ fn discover_mcp_servers(cwd: &Path, settings: &Value) -> Result<BTreeMap<String,
 
     // Enterprise policy: deniedMcpServers blocks by name/command/URL;
     // allowedMcpServers whitelists when present — deny wins over allow.
+    // allowManagedMcpServersOnly (managed settings): the allowlist is read
+    // exclusively from managed settings; denylists still merge from all
+    // sources, like the reference's getMcpAllowlistSettings/getMcpDenylistSettings.
+    let managed_allowlist_only = policy_settings()
+        .get("allowManagedMcpServersOnly")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let managed_paths = managed_settings_paths();
     let mut denied: Vec<Value> = Vec::new();
     let mut allowed: Option<Vec<Value>> = None;
     for path in crate::hooks::settings_file_paths(cwd) {
@@ -1612,6 +1680,9 @@ fn discover_mcp_servers(cwd: &Path, settings: &Value) -> Result<BTreeMap<String,
         };
         if let Some(arr) = value.get("deniedMcpServers").and_then(|v| v.as_array()) {
             denied.extend(arr.iter().cloned());
+        }
+        if managed_allowlist_only && !managed_paths.contains(&path) {
+            continue;
         }
         if let Some(arr) = value.get("allowedMcpServers").and_then(|v| v.as_array()) {
             allowed.get_or_insert_with(Vec::new).extend(arr.iter().cloned());
