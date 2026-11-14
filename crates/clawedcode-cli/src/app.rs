@@ -1520,6 +1520,14 @@ fn execute_update() -> Result<()> {
     {
         anyhow::bail!("self-update is disabled (DISABLE_AUTOUPDATER)");
     }
+    // CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC — the reference's
+    // essential-traffic privacy level suppresses auto-updates too.
+    if std::env::var("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")
+        .map(|v| !v.is_empty() && v != "0" && v != "false")
+        .unwrap_or(false)
+    {
+        anyhow::bail!("self-update is disabled (CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC)");
+    }
     let outcome = clawedcode_core::update::run_self_update()?;
     println!(
         "Updated clawedcode via {:?} using `{}`",
